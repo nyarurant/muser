@@ -2,7 +2,7 @@
 // redrawn); the live part below is diffed line by line (incrementalRendering), so streaming,
 // spinners and typing do not flicker. The caret is placed with useCursor so IME composes in place.
 import React, {useEffect, useRef, useState, useSyncExternalStore} from 'react';
-import {render, Box, Text, Static, useInput, usePaste, useCursor, useBoxMetrics, useWindowSize} from 'ink';
+import {render, Box, Text, Static, useInput, usePaste, useCursor, useWindowSize} from 'ink';
 import {createRequire} from 'node:module';
 import path from 'node:path';
 import {Controller, COMMANDS} from './controller.mjs';
@@ -217,13 +217,34 @@ function Chips({list}) {
   return h(Box, {marginTop: 1, paddingX: 1}, ...list.map((a, i) => h(Text, {key: i}, h(Text, {backgroundColor: '#2d2d34', color: ACCENT}, ' ▣ ' + t('画像 {n}', {n: i + 1}) + ' '), h(Text, {color: GRAY}, ' ' + a.name + ' · ' + kb(a.size) + '   '))),
     h(Text, {color: DIM}, t('空の入力で backspace → 外す')));
 }
+// Where the input box sits, for the IME caret. Ink's useBoxMetrics re-measured in a microtask
+// after every commit and set state from there; on a user's PC (2026-11-01, not reproduced here)
+// that chained into React's "Maximum update depth exceeded" and killed muser. This measures after
+// the box's own renders on a timer, never inside a commit, and stops following a box that keeps
+// moving (over 20 moves in a second) instead of re-rendering without end.
+function useBoxPosition(ref) {
+  const [pos, setPos] = useState(null), moves = useRef([]);
+  useEffect(() => {
+    const id = setTimeout(() => {
+      const l = ref.current?.yogaNode?.getComputedLayout();
+      const next = l ? {left: l.left, top: l.top} : null;
+      setPos(p => {
+        if (p === next || (p && next && p.left === next.left && p.top === next.top)) return p;
+        const now = Date.now(); moves.current = moves.current.filter(t => now - t < 1000); moves.current.push(now);
+        return moves.current.length > 20 ? p : next;
+      });
+    }, 0);
+    return () => clearTimeout(id);
+  });
+  return pos;
+}
 function Prompt({s, W}) {
-  const ref = useRef(null), box = useBoxMetrics(ref), {setCursorPosition} = useCursor();
+  const ref = useRef(null), box = useBoxPosition(ref), {setCursorPosition} = useCursor();
   const reason = !!s.reasonFor, bang = !reason && s.text.startsWith('!'), head = reason ? t('理由 ') : '❯ ', inner = W - 4 - width(head);
   const {lines, cur} = layout(s.text, s.pos, inner);
   // Set during render, not in an effect: Ink applies it to the frame being written, while an
   // effect lands one frame late and leaves the caret on the previous position.
-  if (box.hasMeasured) setCursorPosition({x: box.left + 2 + width(head) + cur.col, y: box.top + 1 + cur.row});
+  if (box) setCursorPosition({x: box.left + 2 + width(head) + cur.col, y: box.top + 1 + cur.row});
   const placeholder = reason ? t('Muse に伝えること（空なら理由なしで断る）') : s.busy ? t('Muse が作業中（送った文は次のターンになります）') : t('何をしますか？   / でコマンド');
   return h(Box, {ref, flexDirection: 'column', borderStyle: 'round', borderColor: reason || bang ? '#e6be64' : s.busy ? '#3c3c44' : DIM, paddingX: 1, width: W, marginTop: 1},
     ...lines.map((l, i) => h(Box, {key: i}, h(Text, {color: reason ? '#e6be64' : ACCENT}, i ? ' '.repeat(width(head)) : head),
