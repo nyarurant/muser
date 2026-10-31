@@ -19,6 +19,7 @@ const {decide} = require('./policy');
 const sessions = require('./sessions');
 const agentTypes = require('./agent-types');
 const {Shells} = require('./shells');
+const {t} = require('./i18n');
 
 const DEVICE_NAME = os.hostname() + ' CLI (muser)';
 const INSTRUCTION_FILES = ['AGENTS.md', 'CLAUDE.md', 'MUSE.md', '.muser/instructions.md'];
@@ -123,7 +124,7 @@ function consumeToolCall(turn, limit) {
   return turn.toolCalls > limit;
 }
 function toolLimitMessage(limit) {
-  return 'ツール呼び出しの上限（' + limit + '回/ターン）に達しました。作業をまとめて最終返信をしてください。';
+  return t('ツール呼び出しの上限（{limit}回/ターン）に達しました。作業をまとめて最終返信をしてください。', {limit});
 }
 function resolveMaxToolCallsPerTurn(option, envValue = process.env.MUSER_MAX_TOOL_CALLS_PER_TURN) {
   for (const v of [option, envValue]) {
@@ -225,7 +226,7 @@ class Agent extends EventEmitter {
     this.retryTimer.unref?.();
   }
   // Commands are fixed at link.register, so a change in MCP servers re-registers the device.
-  async reconnectDevice() { if (this.busy) throw new Error('作業中は切り替えられません'); await this.connectDevice(); }
+  async reconnectDevice() { if (this.busy) throw new Error(t('作業中は切り替えられません')); await this.connectDevice(); }
 
   // Which chat a device invoke belongs to: its agent tag, else the only one working, else main.
   // Outside any running turn nothing is done: the call may come from another chat, and the user is not watching.
@@ -303,11 +304,13 @@ class Agent extends EventEmitter {
     return this.toolEnd(w, {...call, declined: true}, {ok: false, error: 'The user declined this' + (answer.reason ? ': ' + answer.reason : '.') + ' Do not retry it unless the user asks.'});
   }
   toolStart(w, call) {
+    if (w.turn) (w.turn.calls ||= []).push({id: call.id, start: Date.now(), end: null}); // see muse-steps duringToolCall
     if (w.main) this.emit('tool-start', call);
     else { w.lastTool = (call.kind === 'mcp' ? 'MCP ' : '') + call.command.replace(/^code\./, '') + (call.summary ? ' ' + call.summary : ''); this.update(w); }
   }
   toolEnd(w, call, result) {
     const done = {...call, ok: result.ok, ...(result.ok ? {} : {error: result.error})};
+    if (w.turn) { const c = (w.turn.calls ||= []).find(x => x.id === call.id && x.end === null); if (c) c.end = Date.now(); else w.turn.calls.push({id: call.id, start: Date.now(), end: Date.now()}); }
     if (w.turn?.log && w.turn.log.tools.length < 300) w.turn.log.tools.push({command: call.command, summary: String(call.summary || '').slice(0, 200), ok: !!result.ok, ...(result.ok ? {} : {error: String(result.error || '').slice(0, 300)})});
     if (w.main) this.emit('tool-end', done); else this.emit('agent-tool', done);
     return result;
@@ -352,7 +355,7 @@ class Agent extends EventEmitter {
   // Muse's own tool calls, read from its activity feed (src/muse-steps.js).
   onMuseStep({worker: w, step, running}) {
     if (!w) return;
-    if (step && w.turn?.log && w.turn.log.steps.length < 100) w.turn.log.steps.push({title: step.title, ...(step.detail ? {detail: step.detail} : {}), ...(step.failed ? {failed: true} : {})});
+    for (const s of step ? (step.items || [step]) : []) if (w.turn?.log && w.turn.log.steps.length < 100) w.turn.log.steps.push({title: s.title, ...(s.detail ? {detail: s.detail} : {}), ...(s.failed ? {failed: true} : {})});
     if (w.main) { if (step) this.emit('muse-step', step); if (running !== undefined) this.emit('muse-running', running); }
     else if (step || running) { w.lastTool = (step ? step.title : running) + ' (Muse)'; this.update(w); }
   }
@@ -360,13 +363,13 @@ class Agent extends EventEmitter {
   // One turn of one worker's chat.
   async runTurn(w, text, {attachments = [], display} = {}) {
     display ??= text;
-    if (w.turn) throw new Error('Muse が作業中です。');
+    if (w.turn) throw new Error(t('Muse が作業中です。'));
     try { await this.ensureConnected(); }
     catch (e) {
-      if (this.client.status === 'auth_required') throw new Error('muse.ai のログインが切れています。/login でログインし直してください。');
-      throw new Error('この PC の CLI 端末が Muse に接続していません（再接続に失敗: ' + e.message + '）。');
+      if (this.client.status === 'auth_required') throw new Error(t('muse.ai のログインが切れています。/login でログインし直してください。'));
+      throw new Error(t('この PC の CLI 端末が Muse に接続していません（再接続に失敗: {error}）。', {error: e.message}));
     }
-    if (w.turn) throw new Error('Muse が作業中です。'); // another send got in while reconnecting
+    if (w.turn) throw new Error(t('Muse が作業中です。')); // another send got in while reconnecting
     if (w.main) this.spawnedThisTurn = 0; // the per-task agent count starts over with each task
     const first = !w.session.turns;
     const mcpNames = this.mcp ? [...this.mcp.servers.values()].filter(s => s.status === 'connected').map(s => s.name) : [];
@@ -382,7 +385,7 @@ class Agent extends EventEmitter {
         // failed history fetch on a non-first turn aborts the turn instead of guessing.
         let history;
         try { history = await this.client.history(w.session.id); }
-        catch (e) { throw new Error('履歴の取得に失敗したためターンを開始できませんでした。少し待ってからもう一度送信してください。（' + e.message + '）'); }
+        catch (e) { throw new Error(t('履歴の取得に失敗したためターンを開始できませんでした。少し待ってからもう一度送信してください。（{error}）', {error: e.message})); }
         for (const ev of history?.chat_events || []) { const m = messageFromEvent(ev); if (m) turn.baseline.add(m.id); }
       }
       waiting = waitForReply({client: this.client, sessionId: w.session.id, baseline: turn.baseline, signal: turn.controller.signal, timeoutMs: 3 * 3600 * 1000});
@@ -402,7 +405,7 @@ class Agent extends EventEmitter {
     } catch (e) {
       const aborted = e.name === 'AbortError';
       Object.assign(w, {state: aborted ? 'stopped' : 'failed', error: aborted ? '' : e.message, ended: Date.now()});
-      if (w.main && turn.sent) this.record(w, turn, display, {error: aborted ? '中断しました' : e.message});
+      if (w.main && turn.sent) this.record(w, turn, display, {error: aborted ? t('中断しました') : e.message});
       if (w.main) this.emit('turn-end', {ok: false, error: e.message, aborted, ms: Date.now() - turn.started}); else this.emit('agent-done', w.snapshot());
       throw e;
     } finally { this.steps.finish(turn, w, false).catch(() => {}); if (w.turn === turn) w.turn = null; }
@@ -425,13 +428,13 @@ class Agent extends EventEmitter {
   types() { return agentTypes.load(this.cwd); }
   spawn(task, {title, by = 'user', type = 'general'} = {}) {
     pruneCollectedWorkers(this.workers);
-    if (!task.trim()) throw new Error('タスクが空です');
+    if (!task.trim()) throw new Error(t('タスクが空です'));
     const types = this.types(), typeName = String(type || 'general').toLowerCase();
-    if (!types[typeName]) throw new Error('知らないエージェントの型: ' + typeName + '（' + Object.keys(types).join(' / ') + '）');
+    if (!types[typeName]) throw new Error(t('知らないエージェントの型: {type}（{types}）', {type: typeName, types: Object.keys(types).join(' / ')}));
     const running = [...this.workers.values()].filter(w => !w.main && w.turn).length;
     const {concurrent, perTurn} = this.agentLimits;
-    if (concurrent && running >= concurrent) throw new Error('並列エージェントは同時に ' + concurrent + ' つまでです（変更: --max-agents / MUSER_MAX_AGENTS / ~/.muser/config.json の maxAgents）');
-    if (perTurn && this.spawnedThisTurn >= perTurn) throw new Error('この作業で起動できる並列エージェントは ' + perTurn + ' つまでです。今いるエージェントで続けてください（変更: --max-agents-total / MUSER_MAX_AGENTS_TOTAL / maxAgentsTotal）');
+    if (concurrent && running >= concurrent) throw new Error(t('並列エージェントは同時に {n} つまでです（変更: --max-agents / MUSER_MAX_AGENTS / ~/.muser/config.json の maxAgents）', {n: concurrent}));
+    if (perTurn && this.spawnedThisTurn >= perTurn) throw new Error(t('この作業で起動できる並列エージェントは {n} つまでです。今いるエージェントで続けてください（変更: --max-agents-total / MUSER_MAX_AGENTS_TOTAL / maxAgentsTotal）', {n: perTurn}));
     this.spawnedThisTurn++;
     const tag = 'a' + this.nextTag++;
     const session = {...sessions.create(this.cwd), parent: this.session.id};

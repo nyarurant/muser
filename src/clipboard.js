@@ -4,6 +4,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const {execFile} = require('node:child_process');
+const {t} = require('./i18n');
 
 const IMAGE_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp'};
 const MAX = 10 * 1024 * 1024;
@@ -63,10 +64,10 @@ function attachment(file, temporary = false) {
   // without first loading all of it into memory.
   if (fs.statSync(file).size > MAX) {
     if (temporary) { pendingClipboardTemps.delete(file); try { fs.unlinkSync(file); } catch {} }
-    throw new Error(path.basename(file) + ' は 10 MB を超えています');
+    throw new Error(t('{file} は 10 MB を超えています', {file: path.basename(file)}));
   }
   const data = fs.readFileSync(file);
-  if (data.length > MAX) throw new Error(path.basename(file) + ' は 10 MB を超えています');
+  if (data.length > MAX) throw new Error(t('{file} は 10 MB を超えています', {file: path.basename(file)}));
   const name = temporary ? 'clipboard.png' : path.basename(file);
   if (temporary) { pendingClipboardTemps.delete(file); try { fs.unlinkSync(file); } catch {} }
   return {name, type: IMAGE_TYPES[path.extname(file).toLowerCase()] || 'image/png', size: data.length, data: data.toString('base64')};

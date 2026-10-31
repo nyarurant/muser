@@ -1,5 +1,9 @@
 'use strict';
 // Shared by the local renderer and tests; never execute markup from Muse.
+// i18n may be absent in the non-Node contexts this file was once shared with; then the
+// Japanese text is used as-is (placeholders still filled).
+let t=(s,vars)=>{let out=String(s);if(vars)out=out.replace(/\{(\w+)\}/g,(m,k)=>(Object.prototype.hasOwnProperty.call(vars,k)?String(vars[k]):m));return out;};
+try{t=require('../i18n').t;}catch{}
 function messageFromEvent(event) {
   const p=event.payload||event;
   const name=event.event_name||event.event||'';
@@ -56,10 +60,10 @@ function localMessageView(message) {
       try {
         const call=JSON.parse(json);
         if(call.tool==='done')return typeof call.summary==='string'?call.summary:'';
-        const labels={run:'コマンド実行',read:'ファイル読み取り',list:'フォルダー確認',write:'ファイル書き込み',edit:'ファイル編集'};
+        const labels={run:t('コマンド実行'),read:t('ファイル読み取り'),list:t('フォルダー確認'),write:t('ファイル書き込み'),edit:t('ファイル編集')};
         if(!labels[call.tool])return block;
-        const target=String(call.command||call.path||'作業フォルダー').replace(/[\r\n`]/g,' ').slice(0,160);
-        return `PC操作: ${labels[call.tool]} — \`${target}\``;
+        const target=String(call.command||call.path||t('作業フォルダー')).replace(/[\r\n`]/g,' ').slice(0,160);
+        return t('PC操作: {label} — `{target}`', {label: labels[call.tool], target});
       }catch{return block;}
     });
   }

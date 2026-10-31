@@ -1,156 +1,157 @@
 # muser
 
-[Muse](https://muse.ai) のための、ターミナルで動く**非公式**コーディングエージェントです。
-この PC を Muse の「端末」として登録し、Muse がこの PC のファイルを読み書きしたりコマンドを実行したりしながら、対話形式で作業を進めます。見た目と操作は Claude Code / Codex CLI に近づけています。
+[日本語](README.ja.md) | **English**
 
-> **非公式です。** muser は Meta / Muse とは関係のない個人のプロジェクトです。Muse の Web 版が使っている非公開の通信方式を使っているため、Muse 側の変更でいつでも動かなくなる可能性があり、利用規約に照らしてアカウントに影響が出る可能性もゼロではありません。ご自身の判断で使ってください。
+An **unofficial** terminal coding agent for [Muse](https://muse.ai).
+It registers this PC as a Muse "device", so Muse can read and edit files and run commands here while you work together in a conversation. The look and feel follow Claude Code / Codex CLI.
 
-*English: an unofficial terminal coding agent for Muse (muse.ai). It registers this Windows PC as a Muse device so Muse can read and edit files and run commands here, Claude Code style. Not affiliated with Meta; it relies on Muse's private web protocol and may break or conflict with its terms at any time.*
+> **Unofficial.** muser is a personal project with no affiliation with Meta / Muse. It speaks the private protocol the Muse web app uses, so a change on Muse's side can break it at any time, and it may sit uneasily with the terms of service — use it at your own discretion.
 
-## 動作環境
+## Requirements
 
 - Windows 10 / 11
-- Node.js 22 以上
-- Microsoft Edge（ログインの窓に使います）
-- [ripgrep](https://github.com/BurntSushi/ripgrep)（`rg`。コード検索に使います: `winget install BurntSushi.ripgrep.MSVC`）
-- Muse（muse.ai）のアカウント
+- Node.js 22 or newer
+- Microsoft Edge (used for the login window)
+- [ripgrep](https://github.com/BurntSushi/ripgrep) (`rg`, used for code search: `winget install BurntSushi.ripgrep.MSVC`)
+- A Muse (muse.ai) account
 
-## インストール
+## Install
 
 ```powershell
 npm install -g muser-cli
 ```
 
-コマンド名は `muser` です。
+The command name is `muser`.
 
-## はじめかた
+## Getting started
 
-**作業したいフォルダーで**起動します（ホームフォルダーやドライブ直下で起動すると、検索がフォルダー全体に広がります）。
+Start it **in the folder you want to work in** (starting in your home folder or a drive root makes searches span the whole tree).
 
 ```powershell
 cd C:\path\to\project
 muser
 ```
 
-初回は、その場で準備をします。
+The first run sets things up on the spot. It first asks for the UI language (English / 日本語); your choice is saved to `~/.muser/config.json`, can be changed any time with `/lang`, and the `MUSER_LANG=en|ja` environment variable overrides it.
 
-1. **muse.ai にログイン** — Edge の小さい窓が開きます。Muse（Meta アカウント）でログインしてください。パスワードは muser には渡りません。
-2. **この PC を Muse の端末として登録** — メールアドレスに届く認証コードで登録します。Muse の 設定 › デバイス に「<PC 名> CLI (muser)」として出ます。
+1. **Sign in to muse.ai** — a small Edge window opens. Sign in with your Muse (Meta) account. Your password never reaches muser.
+2. **Register this PC as a Muse device** — done with a verification code sent to your email address. The PC appears in Muse under Settings › Devices as "<PC name> CLI (muser)".
 
-準備の流れは `muser demo login` で、実際にはログインせずに見られます。
+You can watch the whole setup flow without signing in with `muser demo login`.
 
-## 使い方
+## Using it
 
-入力欄に頼みたいことを書いて Enter。Muse がこの PC で作業し、その様子が流れます。
+Type what you want done and press Enter. Muse works on this PC and you see it happen.
 
-- `⏺ Read(src/app.js)` などは muser がこの PC で行った操作です。
-- `⏺ Found 18 web results for … (Muse)` は Muse 自身の作業（Web 検索・メモリー検索など）です。回答の下には出典も出ます。
-- 画面下部に承認モード、接続状態、Muse の週の使用量（`週 8%`）が出ます。
+- Lines like `⏺ Read(src/app.js)` are actions muser performed on this PC.
+- Lines like `⏺ Found 18 web results for … (Muse)` are Muse's own work (web search, memory search, …). Sources are shown under the answer too.
+- The footer shows the approval mode, the connection state, and Muse's weekly usage (e.g. `week 8%`).
 
-| キー / 入力 | 動き |
+| Key / input | What it does |
 |---|---|
-| Enter / `\`+Enter または Ctrl+J | 送信 / 改行 |
-| Esc | 作業を中断 |
-| Shift+Tab | 承認モードを切り替え |
-| `@ファイル` | ファイルを添付（Tab で補完） |
-| `!コマンド` | Muse を通さず PowerShell で実行し、出力を次のメッセージで渡す（`&` を付けると裏で実行） |
-| Alt+V / Ctrl+V | クリップボードの画像を添付 |
-| ↑↓ | 入力履歴（次回起動後も残ります） |
+| Enter / `\`+Enter or Ctrl+J | Send / newline |
+| Esc | Interrupt the work |
+| Shift+Tab | Cycle the approval mode |
+| `@file` | Attach a file (Tab completes) |
+| `!command` | Run in PowerShell directly, without Muse, and pass the output with your next message (prefix `&` to run it in the background) |
+| Alt+V / Ctrl+V | Attach the clipboard image |
+| ↑↓ | Input history (kept across restarts) |
 
-主なスラッシュコマンド: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/login` `/status` `/init` `/exit`
+Main slash commands: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/lang` `/login` `/status` `/init` `/exit`
 
-## コマンド
+## Commands
 
-| コマンド | 説明 |
+| Command | What it does |
 |---|---|
-| `muser` / `muser "指示"` | 対話モードで開始（最初の指示も渡せます） |
-| `muser -c` / `--continue` | このフォルダーの直前の会話を再開 |
-| `muser resume [ID]` | 会話を再開（ID なしで一覧） |
-| `muser exec "指示"` | 1回だけ実行して、最後の返事を標準出力へ（確認が必要な操作は断ります） |
-| `muser login` / `muser logout` | muse.ai へのログイン / ログアウト |
-| `muser pc-login` | この PC を端末として登録し直す |
-| `muser usage` | Muse の利用状況と muser の記録 |
-| `muser doctor` | 接続の確認 |
-| `muser demo` / `muser demo login` | Muse につながずに画面 / ログインまわりを試す |
+| `muser` / `muser "instructions"` | Start interactively (optionally with a first instruction) |
+| `muser -c` / `--continue` | Resume this folder's latest conversation |
+| `muser resume [ID]` | Resume a conversation (list when no ID) |
+| `muser exec "instructions"` | Run once and print the final reply to stdout (anything needing approval is declined) |
+| `muser login` / `muser logout` | Sign in to / out of muse.ai |
+| `muser pc-login` | Register this PC as a device again |
+| `muser usage` | Muse usage and muser's own record |
+| `muser doctor` | Check the connection |
+| `muser demo` / `muser demo login` | Try the UI / the login flow without connecting to Muse |
 
-| オプション | 説明 |
+| Option | What it does |
 |---|---|
-| `--mode <m>` | 承認モード（下表）。付けないときは、そのフォルダーで前回選んだモード |
-| `--cd <dir>` | 作業フォルダー（既定: 今のフォルダー） |
-| `--max-agents <n>` | 並列エージェントを同時に動かす数の上限（既定 4、0 で無制限） |
-| `--max-agents-total <n>` | 1回の作業で起動できる並列エージェントの数の上限（既定 0 = 無制限） |
+| `--mode <m>` | Approval mode (table below). When omitted, the mode last chosen in this folder |
+| `--cd <dir>` | Working folder (default: the current folder) |
+| `--max-agents <n>` | Cap on parallel agents running at once (default 4, 0 = unlimited) |
+| `--max-agents-total <n>` | Cap on parallel agents started per task (default 0 = unlimited) |
+## Approval modes
 
-## 承認モード
-
-| モード | 表示 | 挙動 |
+| Mode | Label | Behaviour |
 |---|---|---|
-| `default` | 毎回確認 | 読むのは自動。編集とコマンドは毎回確認 |
-| `auto-edit` | 編集は自動 | 作業フォルダー内の編集は自動。コマンドは確認 |
-| `plan` | 読み取り専用 | 読むだけ。編集と変更系のコマンドは断る |
-| `bypass` | すべて自動 | 全部確認なしで実行 |
+| `default` | Ask every time | Reads are automatic. Edits and commands ask every time |
+| `auto-edit` | Edits are automatic | Edits inside the working folder are automatic. Commands ask |
+| `plan` | Read-only | Reading only. Edits and state-changing commands are refused |
+| `bypass` | Everything automatic | Everything runs without asking |
 
-- 承認モードと、確認で「このフォルダーでは … を聞かない」を選んだものは、**フォルダーごとに保存**され、次回も引き継がれます（`~/.muser/permissions.json`。bypass も含む）。`/permissions` で一覧・消去できます。
-- 読み取り専用と判定するコマンドは、git / rg / npm の安全と確かめられたサブコマンドとフラグだけです（許可リスト方式）。分からないものは確認に回ります。
-- 作業フォルダーの外への編集は、bypass 以外では必ず確認します。
+- The approval mode, and anything you marked "don't ask again in this folder" at a prompt, are **saved per folder** and carry over to the next run (`~/.muser/permissions.json`, bypass included). `/permissions` lists and clears them.
+- A command counts as read-only only if it is on the allowlist of verified-safe git / rg / npm subcommands and flags. Anything unrecognised goes to a prompt.
+- Edits outside the working folder always ask, except in bypass.
 
-## 並列エージェント
+## Parallel agents
 
-Muse は独立したサブタスクを並列エージェントに任せられます（`/agent <タスク>` で自分から任せることもできます）。各エージェントは Muse の別のサイドチャットで、同じフォルダー・同じツールを使って動きます。
+Muse can hand independent subtasks to parallel agents (and you can too, with `/agent <task>`). Each agent runs in its own Muse side chat, in the same folder, with the same tools.
 
-| 型 | 内容 |
+| Type | What it does |
 |---|---|
-| `general` | 何でもやる（既定） |
-| `explore` / `plan` / `review` | 調べる / 計画を立てる / レビューする（読み取り専用） |
-| `test` | テストを流して、落ちたら直す |
+| `general` | Does anything (default) |
+| `explore` / `plan` / `review` | Explores / plans / reviews (read-only) |
+| `test` | Runs the tests and fixes failures |
 
-カスタムの型は `~/.muser/agents/*.md` か `<プロジェクト>/.muser/agents/*.md` に置けます（Claude Code 形式。frontmatter: `name` `description` `tools` `readonly`）。
-エージェントは Muse の使用量を多く使うので、数は `--max-agents` / `--max-agents-total`、環境変数 `MUSER_MAX_AGENTS` / `MUSER_MAX_AGENTS_TOTAL`、`~/.muser/config.json` の `{"maxAgents": 4, "maxAgentsTotal": 8}` で制限できます。
+Custom types live in `~/.muser/agents/*.md` or `<project>/.muser/agents/*.md` (Claude Code format; frontmatter: `name` `description` `tools` `readonly`).
+Agents use a lot of your Muse allowance, so cap them with `--max-agents` / `--max-agents-total`, the `MUSER_MAX_AGENTS` / `MUSER_MAX_AGENTS_TOTAL` environment variables, or `{"maxAgents": 4, "maxAgentsTotal": 8}` in `~/.muser/config.json`.
 
 ## MCP
 
-`~/.muser/mcp.json` に書くか、`/mcp` から Claude Code（`~/.claude.json`）や Codex（`~/.codex/config.toml`）の設定を取り込めます。
+Write `~/.muser/mcp.json`, or import settings from Claude Code (`~/.claude.json`) or Codex (`~/.codex/config.toml`) from `/mcp`.
 
 ```json
 { "mcpServers": { "name": { "command": "...", "args": [], "env": {}, "enabled": true } } }
 ```
 
-有効にしたサーバーのツールは `mcp.<サーバー>.<ツール>` として Muse に渡ります。`env` / `headers` の値は保存時に暗号化した保管庫へ移り、`mcp.json` には参照だけが残ります。
+Tools of enabled servers are given to Muse as `mcp.<server>.<tool>`. `env` / `headers` values are moved into an encrypted vault when saved; only references stay in `mcp.json`.
 
-## 利用状況
+## Usage
 
-`/usage`・`muser usage`・画面下部に、muse.ai と同じ **Muse の週の使用量（%）、リセット時刻、追加分の残り**を出します。作業が終わるたびに取り直し、増えていれば「この作業で +2%」と知らせます。トークン数そのものは Muse が公開していないため出せません。
+`/usage`, `muser usage` and the footer show the same numbers as muse.ai: **Muse's weekly usage (%), when it resets, and how much add-on credit is left**. They are refetched after every task, and if the number went up you are told, e.g. "this task used +2%". Token counts themselves are not published by Muse, so they cannot be shown.
 
-## データの置き場所
+## Where data lives
 
-| 場所 | 中身 |
+| Place | Contents |
 |---|---|
-| `%LOCALAPPDATA%\muser\*.enc` | ログイン情報・端末の認証（Windows DPAPI で暗号化） |
-| `%LOCALAPPDATA%\muser\sessions.json` | 会話の一覧 |
-| `%LOCALAPPDATA%\muser\transcripts\*.jsonl` | 会話の記録（再開時の表示に使い、足りない分だけ Muse から読み込みます） |
-| `~/.muser/` | 設定（`mcp.json`、`config.json`、`permissions.json`、`agents/`）、入力履歴、使用量の記録 |
+| `%LOCALAPPDATA%\muser\*.enc` | Login and device credentials (encrypted with Windows DPAPI) |
+| `%LOCALAPPDATA%\muser\sessions.json` | The conversation list |
+| `%LOCALAPPDATA%\muser\transcripts\*.jsonl` | Conversation transcripts (used to show resumed chats; only the missing part is fetched from Claude) |
+| `~/.muser/` | Settings (`mcp.json`, `config.json`, `permissions.json`, `agents/`), input history, usage records |
 
-`muser logout` でログイン情報を消せます。
+`muser logout` deletes the login credentials.
 
-## 安全のための仕組み
+## Safety mechanisms
 
-- `.env`、秘密鍵（`*.pem` `*.key` `id_rsa` など）、`credentials.json`・`secrets.json` などの認証情報ファイル、`.ssh` / `.aws` / `.gnupg` は、muser のファイル読み取り・検索では読めません。
-- 検索（`code.grep` / `code.glob`）は 30 秒で打ち切ります。OneDrive フォルダー（クラウドのみのファイルを読むとダウンロードが始まるため）と、ホームから検索するときの AppData は、`path` でその中を指したときだけ検索します。
-- 1ターンのツール呼び出しは 250 回まで（`MUSER_MAX_TOOL_CALLS_PER_TURN`）。
-- 接続が切れても（スリープ・回線断）、自動でつなぎ直します。作業中に切れても、5 分以内に戻れば作業は続きます。
+- `.env` files, private keys (`*.pem`, `*.key`, `id_rsa`, …), credential files such as `credentials.json` / `secrets.json`, and `.ssh` / `.aws` / `.gnupg` cannot be read through muser's file reading or searching.
+- Searches (`code.grep` / `code.glob`) stop after 30 seconds. OneDrive folders (reading a cloud-only file would start a download) and, when searching from your home folder, AppData are only searched when a `path` points inside them.
+- Tool calls per turn are capped at 250 (`MUSER_MAX_TOOL_CALLS_PER_TURN`).
+- If the connection drops (sleep, network), it reconnects by itself. If it comes back within 5 minutes mid-task, the work continues.
 
-## 開発
+## Development
 
 ```powershell
 git clone https://github.com/nyarurant/muser
 cd muser
 npm install
 npm link
-npm test        # 単体テスト
-npm run check   # 構文チェック
+npm test        # unit tests
+npm run check   # syntax check
 ```
 
-`scripts/roundtrip*.js` は本物の Muse につないで確かめるスクリプトです（実行すると Muse に「テストです」の会話ができ、使用量も使います）。
+`scripts/roundtrip*.js` are scripts that verify against a real Muse (running one creates a "test" conversation in Muse and uses your allowance).
 
-## ライセンス
+The UI is bilingual (English / Japanese): UI strings are written in Japanese in the code and translated through the table in `src/i18n/en.js` when the language is English — see `src/i18n.js`.
+
+## License
 
 MIT

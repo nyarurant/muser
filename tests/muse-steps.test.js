@@ -36,9 +36,36 @@ test('Muse steps: only this turn\'s actions, device calls hidden unless failed, 
     action(5, 'FAILED', 'Device command failed: code.read on package.json', 'Device homelink-0a1b2c was offline'),
   ]);
   await s.finish(w.turn, w);
-  assert.deepEqual(steps.map(x => x.title), ['Found 0 memory results for Node.js', 'Found 16 web results for Node.js 26', 'Device command failed: code.read on package.json']);
-  assert.ok(steps[2].failed);
+  // The reply is on screen by now: the late ones come as one "+N" line, each still listed in it.
+  assert.equal(steps.length, 2);
+  assert.match(steps[1].title, /\+2/);
+  assert.deepEqual(steps[1].items.map(x => x.title), ['Found 16 web results for Node.js 26', 'Device command failed: code.read on package.json']);
+  assert.ok(steps[1].items[1].failed);
   assert.equal(s.timer, null, 'stops polling when no turn is followed');
+});
+
+test('Muse steps: a single late step is shown as itself', async () => {
+  const client = {request: async () => feed([action(1, 'SUCCESS', 'Found 3 web results for X', '')])};
+  const steps = [];
+  const s = new MuseSteps(client, e => { if (e.step) steps.push(e.step); });
+  const w = {turn: {}};
+  s.note(w, {agent_id: 'AG1', message_id: 'MSG1'});
+  await s.finish(w.turn, w);
+  assert.deepEqual(steps.map(x => x.title), ['Found 3 web results for X']);
+});
+
+test('Muse steps: an action stamped while muser ran a tool call is that call again, not shown', async () => {
+  const now = Date.now(), iso = ms => new Date(ms).toISOString();
+  const during = {...action(1, 'SUCCESS', 'Ran npm test and git status', 'exit 0'), created_at: iso(now - 30000)};
+  const apart = {...action(2, 'SUCCESS', 'Found 5 web results for Y', ''), created_at: iso(now - 120000)};
+  const failedDuring = {...action(3, 'FAILED', 'Harness run failed', 'exit 1'), created_at: iso(now - 29000)};
+  const client = {request: async () => feed([during, apart, failedDuring])};
+  const steps = [];
+  const s = new MuseSteps(client, e => { if (e.step) steps.push(e.step); });
+  const w = {turn: {calls: [{start: now - 31000, end: now - 25000}]}};
+  s.note(w, {agent_id: 'AG1', message_id: 'MSG1'});
+  await s.read();
+  assert.deepEqual(steps.map(x => x.title), ['Found 5 web results for Y', 'Harness run failed'], 'failures are still shown');
 });
 
 test('citations: http(s) sources with their domain', () => {

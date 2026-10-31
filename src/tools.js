@@ -8,6 +8,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const {spawn, spawnSync} = require('node:child_process');
 const {runOnce} = require('./shells');
+const {t} = require('./i18n');
 
 const MAX_READ_LINES = 2000, MAX_LINE = 2000, MAX_OUT = 60000;
 const MAX_READ_BYTES = 10 * 1024 * 1024, MAX_GLOB_RESULTS = 2000;
@@ -43,14 +44,14 @@ function isSensitivePath(p) {
   return false;
 }
 function assertNotSensitive(file) {
-  if (isSensitivePath(file)) throw new Error('機密ファイルのため読み取りを拒否しました: ' + file + '（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）');
+  if (isSensitivePath(file)) throw new Error(t('機密ファイルのため読み取りを拒否しました: {file}（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）', {file}));
 }
 function readText(file) {
   assertNotSensitive(file);
   let st; try { st = fs.statSync(file); } catch { /* let readFileSync raise the real error */ }
-  if (st && st.size > MAX_READ_BYTES) throw new Error('ファイルが大きすぎるため読み取りを拒否しました: ' + file + '（' + st.size + ' バイト; 上限は 10MB / ' + MAX_READ_BYTES + ' バイトです）');
+  if (st && st.size > MAX_READ_BYTES) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（{size} バイト; 上限は 10MB / {max} バイトです）', {file, size: st.size, max: MAX_READ_BYTES}));
   const buf = fs.readFileSync(file);
-  if (buf.length > MAX_READ_BYTES) throw new Error('ファイルが大きすぎるため読み取りを拒否しました: ' + file + '（上限は 10MB です）');
+  if (buf.length > MAX_READ_BYTES) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（上限は 10MB です）', {file}));
   if (buf.includes(0)) throw new Error('Binary file; use system.run to inspect it');
   return buf.toString('utf8');
 }
@@ -71,7 +72,7 @@ function assertNotStale(ctx, file) {
   const m = statsMap(ctx); const prev = m?.get(file); if (!prev) return;
   let cur = null;
   try { const st = fs.statSync(file); cur = {mtimeMs: st.mtimeMs, size: st.size, hash: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}; } catch { return; }
-  if (cur.size !== prev.size || cur.hash !== prev.hash) throw new Error('File changed on disk since it was read（読み取り後にファイルが変更されています）: ' + file + ' — re-read it with code.read before writing/editing');
+  if (cur.size !== prev.size || cur.hash !== prev.hash) throw new Error(t('File changed on disk since it was read（読み取り後にファイルが変更されています）: {file} — re-read it with code.read before writing/editing', {file}));
 }
 // Edits keep the file's own line endings; Muse always works in \n.
 function eol(text) { return text.includes('\r\n') ? '\r\n' : '\n'; }
@@ -185,7 +186,7 @@ function rg(args, cwd, {timeoutMs = RG_TIMEOUT_MS} = {}) {
     try { child = spawn('rg', args, {cwd, windowsHide: true}); } catch { return finish(new Error('ripgrep (rg) is not available')); }
     timer = setTimeout(() => {
       try { child.kill(); } catch {}
-      finish(new Error('検索が ' + timeoutMs / 1000 + ' 秒で終わらなかったので止めました。path や glob で範囲を絞ってください（search timed out: narrow path / glob）。'));
+      finish(new Error(t('検索が {seconds} 秒で終わらなかったので止めました。path や glob で範囲を絞ってください（search timed out: narrow path / glob）。', {seconds: timeoutMs / 1000})));
     }, timeoutMs);
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', d => {
@@ -244,7 +245,7 @@ function planPatch(p, ctx) {
     const after = applyHunks(before, o.hunks, o.path);
     const dest = o.moveTo ? resolve(ctx, o.moveTo) : file;
     if (o.moveTo) {
-      if (dest !== file && fs.existsSync(dest)) throw new Error('Move destination already exists（移動先が既に存在します）: ' + o.moveTo);
+      if (dest !== file && fs.existsSync(dest)) throw new Error(t('Move destination already exists（移動先が既に存在します）: {path}', {path: o.moveTo}));
       if (dest !== file && dests.has(dest)) throw new Error('Move destination is written twice by this patch: ' + o.moveTo);
     }
     dests.add(dest);

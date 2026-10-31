@@ -32,14 +32,22 @@ class MuseSteps {
     if (this.timer) return;
     this.timer = setInterval(() => void this.read(), POLL_MS); this.timer.unref?.();
   }
-  // At the end of a turn: one last read, then whatever was not shown yet (still running or not).
-  // A failed or stopped turn just stops following (show = false).
+  // At the end of a turn: one last read, then whatever was not shown yet. The reply is already on
+  // screen by then, so more than one late step becomes a single "+N steps" line (all of them still
+  // go to the transcript). A failed or stopped turn just stops following (show = false).
   async finish(turn, worker, show = true) {
     if (!this.turns.has(turn)) return;
+    turn.muse.finishing = true; // the last read collects instead of showing one by one
     if (show) { try { await this.read(); } catch {} }
     this.turns.delete(turn);
     if (!this.turns.size) { clearInterval(this.timer); this.timer = null; }
-    if (show) for (const a of turn.muse.pending || []) this.show(turn, worker, a, true);
+    if (!show) return;
+    const late = (turn.muse.pending || []).map(a => this.prepare(turn, a, true)).filter(Boolean);
+    if (late.length === 1) this.onStep({worker, step: late[0]});
+    else if (late.length > 1) {
+      const {t} = require('./i18n');
+      this.onStep({worker, step: {title: t('Muse 側の手順 +{n} 件', {n: late.length}), detail: late.slice(0, 3).map(s => s.title).join(' · ') + (late.length > 3 ? ' …' : ''), late: true, items: late}});
+    }
   }
   read() {
     return this.reading ??= this.fetch().finally(() => { this.reading = null; });
@@ -48,7 +56,10 @@ class MuseSteps {
     const turns = [...this.turns].filter(t => t.muse?.agentId && t.muse.messageId);
     if (!turns.length) return;
     let feed;
-    try { feed = await this.client.request('GET', '/activity', {limit: 10, capabilities: CAPS}); } catch { return; }
+    // 30, not 10: during a long turn, parallel agents and other chats (a companion checking in every
+    // few minutes) push the turn's own item out of the newest ten, and its steps then only showed
+    // up, all at once, after the reply.
+    try { feed = await this.client.request('GET', '/activity', {limit: 30, capabilities: CAPS}); } catch { return; }
     const items = (feed?.days || []).flatMap(d => d.activities || []);
     for (const t of turns) {
       const actions = items.filter(x => x.details?.activity_thread_agent_id === t.muse.agentId)
@@ -57,18 +68,34 @@ class MuseSteps {
       t.muse.pending = actions.filter(a => !t.muse.shown.has(a.id));
       const running = t.muse.pending.find(a => !TERMINAL.has(String(a.status).toUpperCase()));
       t.muse.running = running ? clean(running.title).replace(/^Running:\s*/i, '') : '';
-      for (const a of t.muse.pending) if (TERMINAL.has(String(a.status).toUpperCase())) this.show(t, t.worker, a, false);
+      if (!t.muse.finishing) for (const a of t.muse.pending) if (TERMINAL.has(String(a.status).toUpperCase())) this.show(t, t.worker, a, false);
       this.onStep({worker: t.worker, running: t.muse.running});
     }
   }
   show(turn, worker, a, unfinished) {
-    if (turn.muse.shown.has(a.id)) return;
+    const step = this.prepare(turn, a, unfinished);
+    if (step) this.onStep({worker, step});
+  }
+  // The step to show for an action, or null: already shown, or Muse's own record of a call to this
+  // PC, which repeats muser's tool line. Those are told by name (DEVICE) and, since Muse titles
+  // them freely ("Ran npm test and git status"), by time: created while muser ran a tool call.
+  prepare(turn, a, unfinished) {
+    if (turn.muse.shown.has(a.id)) return null;
     turn.muse.shown.add(a.id);
     const failed = /^(FAILED|ERROR)$/i.test(a.status), title = clean(a.title).replace(/^Running:\s*/i, ''), subtitle = clean(a.subtitle);
-    if (!failed && DEVICE.test(title + ' ' + subtitle)) return;
+    if (!failed && (DEVICE.test(title + ' ' + subtitle) || duringToolCall(turn, a.created_at))) return null;
     const detail = subtitle && subtitle !== '処理中' && !title.toLowerCase().includes(subtitle.toLowerCase()) ? subtitle : '';
-    this.onStep({worker, step: {title, detail, failed, unfinished: unfinished && !TERMINAL.has(String(a.status).toUpperCase()), report: String(a.report || '')}});
+    return {title, detail, failed, unfinished: unfinished && !TERMINAL.has(String(a.status).toUpperCase()), report: String(a.report || '')};
   }
+}
+
+// turn.calls: [{start, end}] of the tool calls muser ran for this turn (Agent.toolStart / toolEnd).
+// Muse stamps an action when it issues the call; allow a few seconds for clocks and latency.
+const SLACK_MS = 4000;
+function duringToolCall(turn, createdAt) {
+  const at = Date.parse(createdAt || '');
+  if (!Number.isFinite(at)) return false;
+  return (turn.calls || []).some(c => at >= c.start - SLACK_MS && at <= (c.end ?? Date.now()) + SLACK_MS);
 }
 
 // Sources Muse cited in a reply (delta.message_done resources of kind "citation").

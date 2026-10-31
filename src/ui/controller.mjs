@@ -24,11 +24,13 @@ const usage = require('../usage.js');
 const transcript = require('../transcript.js');
 const permissions = require('../permissions.js');
 const {TOOLS: LOCAL} = require('../tools.js');
+const i18n = require('../i18n.js');
+const {t} = i18n;
 
 export const COMMANDS = [
   ['/help', 'コマンドとキー操作（!コマンド・@ファイル も）'], ['/permissions', '承認モード（権限）を選ぶ'], ['/mode', '承認モードを選ぶ（/mode bypass で直接）'],
   ['/new', '新しい会話を始める'], ['/clear', '画面を消して新しい会話'], ['/resume', 'このフォルダーの過去の会話を再開'],
-  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/exit', '終了'],
+  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/exit', '終了'],
 ];
 
 let nextId = 1;
@@ -57,7 +59,7 @@ export class Controller {
     // Started from the home folder or a drive root, every search without a path walks all of it.
     const cwd = path.resolve(agent.cwd || '.');
     if (cwd.toLowerCase() === path.resolve(os.homedir()).toLowerCase() || cwd === path.parse(cwd).root) {
-      this.note(['作業フォルダーが ' + cwd + ' です（ホームかドライブ直下）。検索がフォルダー全体に広がるので、作業するフォルダーで起動するか muser --cd <フォルダー> を使ってください。']);
+      this.note([t('作業フォルダーが {cwd} です（ホームかドライブ直下）。検索がフォルダー全体に広がるので、作業するフォルダーで起動するか muser --cd <フォルダー> を使ってください。', {cwd})]);
     }
   }
   // ---- store ----
@@ -75,19 +77,19 @@ export class Controller {
     a.approver = call => this.ask(call);
     a.on('device', d => this.set({deviceOk: !!d.connected}));
     a.on('connection', c => {
-      if (c.state === 'connecting') this.flash('Muse に接続しています…', 60000);
-      else if (c.state === 'reconnecting') this.flash('Muse に再接続しています…', 60000);
-      else if (c.state === 'connected') { this.flash(c.first ? '' : 'Muse に再接続しました'); if (this.s.loginNeeded) this.set({loginNeeded: false}); }
+      if (c.state === 'connecting') this.flash(t('Muse に接続しています…'), 60000);
+      else if (c.state === 'reconnecting') this.flash(t('Muse に再接続しています…'), 60000);
+      else if (c.state === 'connected') { this.flash(c.first ? '' : t('Muse に再接続しました')); if (this.s.loginNeeded) this.set({loginNeeded: false}); }
       else if (c.state === 'auth') {
         // Once per lapse (the background connect and a send both report it): offer to log in here.
         this.flash('');
         if (this.s.loginNeeded) return;
         this.set({loginNeeded: true});
-        this.openMenu({loginOffer: true, title: 'muse.ai のログインが切れています', hint: 'muser を閉じずにログインし直せます',
-          options: [{value: 'login', label: 'ログインし直す', desc: 'Edge の窓が開きます。ログインすると、そのまま接続します'}, {value: 'later', label: 'あとで', desc: '/login でいつでも'}],
+        this.openMenu({loginOffer: true, title: t('muse.ai のログインが切れています'), hint: t('muser を閉じずにログインし直せます'),
+          options: [{value: 'login', label: t('ログインし直す'), desc: t('Edge の窓が開きます。ログインすると、そのまま接続します')}, {value: 'later', label: t('あとで'), desc: t('/login でいつでも')}],
           index: 0, pick: v => { if (v === 'login') this.login(); }});
       }
-      else this.flash('再接続できませんでした（自動で再試行します）: ' + c.error, 10000);
+      else this.flash(t('再接続できませんでした（自動で再試行します）: {error}', {error: c.error}), 10000);
     });
     a.on('text', e => this.onText(e));
     a.on('message-done', e => this.endMessage(e.id));
@@ -123,11 +125,11 @@ export class Controller {
       if (e.sources?.length) this.push({type: 'sources', items: e.sources});
       this.push({type: 'end', ...e});
       // Local tally heads-up: today's turns reached the daily limit (if one is set).
-      try { const lim = usage.limits(); if (e.ok && lim.dailyTurns > 0 && !this.usageWarned && usage.summary().today.turns >= lim.dailyTurns) { this.usageWarned = true; this.note('今日のターン上限（' + lim.dailyTurns + '）に達しました'); } } catch {}
+      try { const lim = usage.limits(); if (e.ok && lim.dailyTurns > 0 && !this.usageWarned && usage.summary().today.turns >= lim.dailyTurns) { this.usageWarned = true; this.note(t('今日のターン上限（{n}）に達しました', {n: lim.dailyTurns})); } } catch {}
       // The real weekly usage, refreshed after every turn; say how much this turn moved it.
       const before = this.planAtTurn;
       this.refreshPlan().then(p => {
-        if (p && before !== null && before !== undefined && p.percentUsed > before) this.note('Muse の週の使用量 ' + before + '% → ' + p.percentUsed + '%（この作業で +' + (p.percentUsed - before) + '%）');
+        if (p && before !== null && before !== undefined && p.percentUsed > before) this.note(t('Muse の週の使用量 {before}% → {after}%（この作業で +{diff}%）', {before, after: p.percentUsed, diff: p.percentUsed - before}));
       });
       if (this.queue.length) this.submit(this.queue.shift());
     });
@@ -146,7 +148,7 @@ export class Controller {
     // is append-only (<Static>), so a rewrite cannot be edited in place: mark it and re-emit the
     // revised text below the marker.
     if (clean.length < st.done || clean.slice(0, st.done) !== st.emitted) {
-      if (st.done > 0 || st.started) this.push({type: 'note', lines: ['（Muse が返信を書き直しました — 以下が新しい内容です）']});
+      if (st.done > 0 || st.started) this.push({type: 'note', lines: [t('（Muse が返信を書き直しました — 以下が新しい内容です）')]});
       this.md = createMd();
       st = {id, done: 0, partial: '', started: false, emitted: '', raw: ''};
     }
@@ -183,10 +185,10 @@ export class Controller {
     else if (tool.preview) { try { preview = tool.preview(call.params, this.agent.ctx); } catch (e) { preview = {error: e.message}; } }
     const word = String(call.params?.command || '').trim().split(/\s+/)[0] || '';
     const options = call.kind === 'mcp'
-      ? [{label: 'はい', allow: true}, {label: 'はい、このフォルダーでは ' + call.mcp.tool + ' を聞かない', allow: true, always: alwaysKey('mcp', call.params, call.command)}, {label: 'いいえ（Muse に伝えることを入力）', allow: false}]
+      ? [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは {tool} を聞かない', {tool: call.mcp.tool}), allow: true, always: alwaysKey('mcp', call.params, call.command)}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}]
       : call.kind === 'edit'
-      ? [{label: 'はい', allow: true}, {label: 'はい、このフォルダーでは編集を自動に（承認モード「編集は自動」）', allow: true, autoEdit: true}, {label: 'いいえ（Muse に伝えることを入力）', allow: false}]
-      : [{label: 'はい', allow: true}, {label: 'はい、このフォルダーでは ' + word + ' を聞かない', allow: true, always: alwaysKey('exec', call.params)}, {label: 'いいえ（Muse に伝えることを入力）', allow: false}];
+      ? [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは編集を自動に（承認モード「編集は自動」）'), allow: true, autoEdit: true}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}]
+      : [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは {word} を聞かない', {word}), allow: true, always: alwaysKey('exec', call.params)}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}];
     const targets = tool.target ? [].concat(tool.target(call.params, this.agent.ctx) || []) : [];
     const outside = targets.some(t => path.relative(this.agent.cwd, t).startsWith('..'));
     process.stdout.write('\x07');
@@ -214,26 +216,26 @@ export class Controller {
     const a = this.agent, hub = a.mcp, cfg = mcpConfig.load(), found = mcpConfig.discover();
     const options = Object.entries(cfg.mcpServers || {}).map(([name, s]) => {
       const live = hub?.servers.get(name);
-      const state = live?.status === 'connected' ? '● ' + live.tools.length + ' ツール' : live?.status === 'error' ? '✗ ' + live.error : s.enabled ? '… 接続待ち' : '○ オフ';
+      const state = live?.status === 'connected' ? '● ' + t('{n} ツール', {n: live.tools.length}) : live?.status === 'error' ? '✗ ' + live.error : s.enabled ? t('… 接続待ち') : t('○ オフ');
       return {value: {toggle: name, on: !s.enabled}, label: name, desc: state + (s.url ? '  ' + s.url : '  ' + [s.command, ...(s.args || [])].join(' ')), current: s.enabled ? {toggle: name} : null};
     });
-    if (found.length) options.push({value: {import: true}, label: '取り込む（' + found.length + ' 件）', desc: found.map(f => f.name + ' (' + f.from + ')').join(', ')});
-    if (!options.length) return this.note(['MCP サーバーがありません。' + mcpConfig.FILE + ' に mcpServers を書くか、Claude Code / Codex に設定してください。']);
-    this.openMenu({title: 'MCP サーバー', hint: '選ぶとオン・オフ（' + mcpConfig.FILE + '）', options: options.map(o => ({...o, mark: o.current ? true : false})), pick: v => this.mcpPick(v)});
+    if (found.length) options.push({value: {import: true}, label: t('取り込む（{n} 件）', {n: found.length}), desc: found.map(f => f.name + ' (' + f.from + ')').join(', ')});
+    if (!options.length) return this.note([t('MCP サーバーがありません。{file} に mcpServers を書くか、Claude Code / Codex に設定してください。', {file: mcpConfig.FILE})]);
+    this.openMenu({title: t('MCP サーバー'), hint: t('選ぶとオン・オフ（{file}）', {file: mcpConfig.FILE}), options: options.map(o => ({...o, mark: o.current ? true : false})), pick: v => this.mcpPick(v)});
   }
   async mcpPick(v) {
     const a = this.agent;
-    if (!this.agent.mcp && !v.import) return this.note('このモードでは MCP を使えません。');
-    if (v.import) { mcpConfig.importServers(mcpConfig.discover()); this.note('取り込みました（すべてオフ）。使うものを選んでオンにしてください。'); return this.mcpMenu(); }
-    if (this.s.busy) return this.flash('作業中は切り替えられません');
+    if (!this.agent.mcp && !v.import) return this.note(t('このモードでは MCP を使えません。'));
+    if (v.import) { mcpConfig.importServers(mcpConfig.discover()); this.note(t('取り込みました（すべてオフ）。使うものを選んでオンにしてください。')); return this.mcpMenu(); }
+    if (this.s.busy) return this.flash(t('作業中は切り替えられません'));
     const cfg = mcpConfig.setEnabled(v.toggle, v.on), s = cfg.mcpServers[v.toggle];
     try {
-      if (v.on) { this.flash(v.toggle + ' に接続しています…', 15000); await a.mcp.connect(v.toggle, s); }
+      if (v.on) { this.flash(t('{name} に接続しています…', {name: v.toggle}), 15000); await a.mcp.connect(v.toggle, s); }
       else await a.mcp.disconnect(v.toggle);
       a.mcp.index(); await a.reconnectDevice();
       const live = a.mcp.servers.get(v.toggle);
       this.flash('');
-      this.note(v.on ? v.toggle + ': ' + live.tools.length + ' ツールを Muse に渡しました' : v.toggle + ' をオフにしました');
+      this.note(v.on ? t('{name}: {n} ツールを Muse に渡しました', {name: v.toggle, n: live.tools.length}) : t('{name} をオフにしました', {name: v.toggle}));
     } catch (e) { this.flash(''); this.note(v.toggle + ': ' + e.message); try { a.mcp.index(); await a.reconnectDevice(); } catch {} }
   }
   // A pick-one menu in place of the input box (/permissions, /resume).
@@ -263,13 +265,13 @@ export class Controller {
     this.insert(t.replace(/\r\n?/g, '\n'));
   }
   attach(file, temporary) {
-    try { const a = clip.attachment(file, temporary); this.set({attachments: [...this.s.attachments, a]}); this.flash('画像を添付: ' + a.name); }
+    try { const a = clip.attachment(file, temporary); this.set({attachments: [...this.s.attachments, a]}); this.flash(t('画像を添付: {name}', {name: a.name})); }
     catch (e) { this.flash(e.message); }
   }
   async pasteImage() {
-    this.flash('クリップボードを確認しています…', 5000);
+    this.flash(t('クリップボードを確認しています…'), 5000);
     const files = await clip.clipboardImages();
-    if (!files.length) return this.flash('クリップボードに画像がありません');
+    if (!files.length) return this.flash(t('クリップボードに画像がありません'));
     files.forEach(f => this.attach(f.path, f.temporary));
   }
   key(input, k) {
@@ -278,15 +280,15 @@ export class Controller {
     if (!k.tab) this.tabState = null;
     const {text, pos} = this.s;
     if (k.ctrl && input === 'c') {
-      if (this.s.busy) { this.agent.interrupt(); return this.flash('中断しています…'); }
+      if (this.s.busy) { this.agent.interrupt(); return this.flash(t('中断しています…')); }
       if (text) return this.setText('');
       if (Date.now() - this.exitArmed < 1500) return this.onExit();
-      this.exitArmed = Date.now(); return this.flash('もう一度 ctrl+c で終了');
+      this.exitArmed = Date.now(); return this.flash(t('もう一度 ctrl+c で終了'));
     }
     if (k.ctrl && input === 'd' && !text) return this.onExit();
     if (k.escape) {
       if (this.s.reasonFor) return this.submitReason('');
-      if (this.s.busy) { this.agent.interrupt(); return this.flash('中断しています…'); }
+      if (this.s.busy) { this.agent.interrupt(); return this.flash(t('中断しています…')); }
       if (text) this.setText('');
       return;
     }
@@ -374,8 +376,8 @@ export class Controller {
     if (text.startsWith('/')) return this.slash(text.trim());
     if (text.startsWith('!')) return this.bang(text.slice(1).trim());
     if (this.s.busy) {
-      if (this.queue.length >= MAX_QUEUE) { this.note('キューがいっぱいです（最大 ' + MAX_QUEUE + ' 件まで）。現在の作業が終わってから送ってください。'); return this.flash('キューがいっぱいです'); }
-      this.queue.push(text); return this.flash('作業中なので、終わったら送ります（キュー ' + this.queue.length + ' 件目）');
+      if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件まで）。現在の作業が終わってから送ってください。', {max: MAX_QUEUE})); return this.flash(t('キューがいっぱいです')); }
+      this.queue.push(text); return this.flash(t('作業中なので、終わったら送ります（キュー {n} 件目）', {n: this.queue.length}));
     }
     const attachments = this.s.attachments;
     // @path mentions go along with the message; ! command output since the last turn too.
@@ -390,7 +392,7 @@ export class Controller {
   // !command: the user's own shell command, run here without Muse or approval. Its output
   // goes to Muse with the next message, as in Claude Code's bash mode.
   async bang(cmd) {
-    if (!cmd) return this.note('使い方: !<コマンド>   （例: !git status · 裏で動かすなら !npm run dev &）');
+    if (!cmd) return this.note(t('使い方: !<コマンド>   （例: !git status · 裏で動かすなら !npm run dev &）'));
     if (/\s&$/.test(cmd)) {
       const command = cmd.replace(/\s&$/, '');
       try { const s = this.agent.shells.start(command, {cwd: this.agent.cwd}); this.push({type: 'tool', call: {id: 'bang-' + Date.now(), agent: 'main', command: 'system.run', params: {command}, kind: 'exec', summary: command, user: true, ok: true, view: {background: s.id, tail: []}}});
@@ -419,35 +421,35 @@ export class Controller {
     let res;
     try { res = await transcript.forResume(s, a.client); } catch { res = {turns: sessions.transcript(s.id), from: 'local'}; }
     const turns = res.turns, shown = turns.slice(-10);
-    if (!startup || turns.length) this.note('↺ 再開: ' + (s.title || s.id) + ' · ' + Math.max(s.turns || 0, turns.length) + ' ターン' +
-      (turns.length > shown.length || res.partial ? '（直近 ' + shown.length + ' ターンを表示）' : '') + (res.from === 'muse' ? ' · Muse から読み込み' : ''));
+    if (!startup || turns.length) this.note(t('↺ 再開: {title} · {n} ターン', {title: s.title || s.id, n: Math.max(s.turns || 0, turns.length)}) +
+      (turns.length > shown.length || res.partial ? t('（直近 {n} ターンを表示）', {n: shown.length}) : '') + (res.from === 'muse' ? t(' · Muse から読み込み') : ''));
     for (const t of shown) {
       this.push({type: 'user', text: t.user || ''});
       if (t.tools?.length || t.steps?.length) this.push({type: 'past', tools: t.tools || [], steps: t.steps || []});
       if (t.reply) { const md = createMd(); this.push({type: 'md', rows: sanitizeEmbeds(String(t.reply).trimEnd()).split('\n').map(l => md.row(l)), first: true}, {type: 'gap'}); }
       if (t.error) this.push({type: 'end', ok: false, error: t.error, ms: 0});
     }
-    if (!turns.length && (s.turns || 0) > 0) this.note('この会話の中身は読み込めませんでした（Muse に接続できないか、記録がありません）。続きは送れます。');
+    if (!turns.length && (s.turns || 0) > 0) this.note(t('この会話の中身は読み込めませんでした（Muse に接続できないか、記録がありません）。続きは送れます。'));
     const todos = turns[turns.length - 1]?.todos;
     if (Array.isArray(todos) && todos.length) { this.set({todos}); a.ctx.todos = todos; }
-    if (shown.length) this.note('── ここから続き ──');
+    if (shown.length) this.note(t('── ここから続き ──'));
   }
   // `muser login` without leaving the TUI: the Edge window, then the new cookies into the running
   // client, then connect.
   async login() {
     if (this.loggingIn) return;
     this.loggingIn = true;
-    this.flash('Edge の窓で muse.ai にログインしてください…', 300000);
+    this.flash(t('Edge の窓で muse.ai にログインしてください…'), 300000);
     try {
       const flow = this.agent.loginFlow || (o => require('../login.js').login(o)); // demo: a scripted stand-in
       await flow({log: s => this.flash(String(s).trim().replace(/^…\s*/, ''), 300000)});
       this.agent.reloadLogin?.(); usage.resetWeb?.();
-      this.flash('ログインしました。Muse に接続しています…', 60000);
+      this.flash(t('ログインしました。Muse に接続しています…'), 60000);
       await this.agent.ensureConnected();
       this.flash(''); this.set({loginNeeded: false, ...(this.s.menu?.loginOffer ? {menu: null} : {})});
-      this.note('muse.ai にログインし直して、接続しました。');
+      this.note(t('muse.ai にログインし直して、接続しました。'));
       this.refreshPlan();
-    } catch (e) { this.flash(''); this.note('ログインできませんでした: ' + e.message + '（/login でもう一度）'); }
+    } catch (e) { this.flash(''); this.note(t('ログインできませんでした: {error}（/login でもう一度）', {error: e.message})); }
     finally { this.loggingIn = false; }
   }
   // Muse's real plan usage (src/usage.js plan()); one request at a time, failures keep the old value.
@@ -461,76 +463,84 @@ export class Controller {
     if (cmd === '/help') return this.push({type: 'help'});
     if (cmd === '/login') return this.login();
     if (cmd === '/usage') {
-      this.flash('Muse の利用状況を確認しています…', 20000);
+      this.flash(t('Muse の利用状況を確認しています…'), 20000);
       return this.refreshPlan().then(p => {
         this.flash('');
-        this.note([...(p ? usage.formatPlan(p).split('\n') : ['Muse の利用状況を読み込めませんでした（muse.ai で確認できます）']), '', ...usage.formatSummary().split('\n')]);
+        this.note([...(p ? usage.formatPlan(p).split('\n') : [t('Muse の利用状況を読み込めませんでした（muse.ai で確認できます）')]), '', ...usage.formatSummary().split('\n')]);
+      });
+    }
+    if (cmd === '/lang') {
+      return this.openMenu({
+        title: t('表示言語'), hint: t('UI の表示言語'),
+        options: [{value: 'en', label: 'English', desc: t('英語で表示')}, {value: 'ja', label: '日本語', desc: t('日本語で表示')}],
+        index: i18n.lang() === 'en' ? 0 : 1, current: i18n.lang(),
+        pick: v => { i18n.setLang(v); this.set({}); this.note(t('言語を {lang} に切り替えました', {lang: v === 'en' ? 'English' : '日本語'})); },
       });
     }
     if (cmd === '/mode' || cmd === '/permissions' || cmd === '/perm') {
-      if (arg && !MODES.includes(arg)) return this.note('モードは ' + MODES.join(' / '));
-      if (arg) { this.setMode(arg); return this.note('承認モード: ' + LABELS[a.mode]); }
+      if (arg && !MODES.includes(arg)) return this.note(t('モードは {modes}', {modes: MODES.join(' / ')}));
+      if (arg) { this.setMode(arg); return this.note(t('承認モード: {label}', {label: t(LABELS[a.mode])})); }
       return this.openMenu({
-        title: '承認モード（権限）', hint: 'Muse がこの PC で何をするときに確認するか',
-        options: [...MODES.map(m => ({value: m, label: LABELS[m], desc: MODE_HELP[m], danger: m === 'bypass'})),
-          ...(a.allowAlways.size ? [{value: '__forget', label: '記憶した許可を消す', desc: a.allowAlways.size + ' 件: ' + [...a.allowAlways].map(k => k.replace(/^exec:/, '').replace(/^mcp:/, 'MCP ')).join(' · ').slice(0, 120)}] : [])],
+        title: t('承認モード（権限）'), hint: t('Muse がこの PC で何をするときに確認するか'),
+        options: [...MODES.map(m => ({value: m, label: t(LABELS[m]), desc: t(MODE_HELP[m]), danger: m === 'bypass'})),
+          ...(a.allowAlways.size ? [{value: '__forget', label: t('記憶した許可を消す'), desc: t('{n} 件: {list}', {n: a.allowAlways.size, list: [...a.allowAlways].map(k => k.replace(/^exec:/, '').replace(/^mcp:/, 'MCP ')).join(' · ').slice(0, 120)})}] : [])],
         index: MODES.indexOf(a.mode), current: a.mode,
         pick: m => {
-          if (m === '__forget') { a.allowAlways.clear(); permissions.clearAllow(a.cwd); return this.note('このフォルダーで記憶した許可を消しました。'); }
-          this.setMode(m); this.note('承認モード: ' + LABELS[m] + '（このフォルダーで覚えておきます）');
+          if (m === '__forget') { a.allowAlways.clear(); permissions.clearAllow(a.cwd); return this.note(t('このフォルダーで記憶した許可を消しました。')); }
+          this.setMode(m); this.note(t('承認モード: {label}（このフォルダーで覚えておきます）', {label: t(LABELS[m])}));
         },
       });
     }
     if (cmd === '/new' || cmd === '/clear') {
-      if (this.s.busy) return this.flash('作業中は切り替えられません');
+      if (this.s.busy) return this.flash(t('作業中は切り替えられません'));
       a.session = sessions.create(a.cwd); a.ctx.readFiles.clear(); // allowAlways belongs to the folder, not the chat
       this.set({todos: []});
       if (cmd === '/clear') return this.set({clearCount: this.s.clearCount + 1, entries: [{id: nextId++, type: 'banner'}]});
-      return this.note('新しい会話を始めます。');
+      return this.note(t('新しい会話を始めます。'));
     }
     if (cmd === '/resume') {
       // Switching chats under a running turn re-pointed that turn at the other chat (its reply
       // stopped streaming); until a turn can move to the background, wait for it.
-      if (this.s.busy) return this.flash('作業中は切り替えられません（終わってから、または esc で止めてから）');
+      if (this.s.busy) return this.flash(t('作業中は切り替えられません（終わってから、または esc で止めてから）'));
       const list = sessions.recent(a.cwd).filter(s => s.turns).slice(0, 9);
-      if (!list.length) return this.note('このフォルダーの過去の会話はありません。');
-      if (!arg) return this.openMenu({title: '会話を再開', hint: 'このフォルダーの過去の会話', options: list.map(s => ({value: s.id, label: s.title || s.id, desc: new Date(s.updated).toLocaleString() + ' · ' + s.turns + ' ターン'})),
+      if (!list.length) return this.note(t('このフォルダーの過去の会話はありません。'));
+      if (!arg) return this.openMenu({title: t('会話を再開'), hint: t('このフォルダーの過去の会話'), options: list.map(s => ({value: s.id, label: s.title || s.id, desc: new Date(s.updated).toLocaleString() + ' · ' + t('{n} ターン', {n: s.turns})})),
         pick: id => this.showResumed(sessions.find(id))});
       const s = list[Number(arg) - 1] || sessions.find(arg);
-      if (!s) return this.note('見つかりません: ' + arg);
+      if (!s) return this.note(t('見つかりません: {arg}', {arg}));
       return this.showResumed(s);
     }
     if (cmd === '/mcp') return this.mcpMenu();
     if (cmd === '/bg' || cmd === '/shells') {
       const [sub, id] = arg.split(/\s+/);
-      if (sub === 'kill' && id) { try { a.shells.kill(id); return this.note(id + ' を止めました'); } catch (e) { return this.note(e.message); } }
+      if (sub === 'kill' && id) { try { a.shells.kill(id); return this.note(t('{id} を止めました', {id})); } catch (e) { return this.note(e.message); } }
       const list = a.shells.all();
-      if (!list.length) return this.note('バックグラウンドの処理はありません。Muse に「開発サーバーを裏で起動して」と頼むか、!npm run dev & のように & を付けて実行します。');
-      return this.openMenu({title: 'バックグラウンドの処理', hint: '選ぶと出力を表示 · 止めるのは /bg kill <id>', options: list.map(x => ({value: x.id, label: x.id + '  ' + x.command.slice(0, 22), desc: (x.running ? '● 実行中 ' : '○ 終了 exit ' + x.exit + ' ') + (x.tail.filter(Boolean).pop() || '')})),
+      if (!list.length) return this.note(t('バックグラウンドの処理はありません。Muse に「開発サーバーを裏で起動して」と頼むか、!npm run dev & のように & を付けて実行します。'));
+      return this.openMenu({title: t('バックグラウンドの処理'), hint: t('選ぶと出力を表示 · 止めるのは /bg kill <id>'), options: list.map(x => ({value: x.id, label: x.id + '  ' + x.command.slice(0, 22), desc: (x.running ? t('● 実行中 ') : t('○ 終了 exit {exit} ', {exit: x.exit})) + (x.tail.filter(Boolean).pop() || '')})),
         pick: async id => { const r = await a.shells.output(id, {since: 0, maxChars: 4000}); this.push({type: 'shellout', id, running: r.running, exit: r.exit_code, lines: r.output.trimEnd().split('\n').slice(-30)}); }});
     }
     if (cmd === '/agent' || cmd === '/spawn') {
       const types = a.types();
-      if (!arg) return this.note(['使い方: /agent [型] <任せるタスク>   例: /agent explore 認証まわりの処理はどこ？', '型: ' + Object.entries(types).map(([k, v]) => k + '（' + v.description + '）').join('  ')]);
+      if (!arg) return this.note([t('使い方: /agent [型] <任せるタスク>   例: /agent explore 認証まわりの処理はどこ？'), t('型: {list}', {list: Object.entries(types).map(([k, v]) => k + '（' + t(v.description) + '）').join('  ')})]);
       const [first, ...words] = arg.split(/\s+/), typed = types[first.toLowerCase()] && words.length;
-      try { const w = a.spawn(typed ? words.join(' ') : arg, {by: 'user', type: typed ? first : 'general'}); return this.note('エージェント ' + w.tag + '（' + w.typeName + '）に任せました: ' + w.title); }
+      try { const w = a.spawn(typed ? words.join(' ') : arg, {by: 'user', type: typed ? first : 'general'}); return this.note(t('エージェント {tag}（{type}）に任せました: {title}', {tag: w.tag, type: w.typeName, title: w.title})); }
       catch (e) { return this.note(e.message); }
     }
     if (cmd === '/agents') {
       const list = a.agents();
-      if (!list.length) return this.note('並列エージェントはまだいません。/agent <タスク> で任せられます。');
-      return this.openMenu({title: '並列エージェント', hint: '選ぶと結果を表示（作業中なら停止）', options: list.map(x => ({value: x.tag, label: x.tag + ' ' + x.type + '  ' + x.title, desc: ({working: '作業中 ' + (x.lastTool || ''), done: '完了', failed: '失敗 ' + x.error, stopped: '停止'})[x.state] || x.state})),
-        pick: tag => { const x = a.agents().find(y => y.tag === tag); if (x?.state === 'working') { a.stopAgent(tag); this.note(tag + ' を止めています…'); } else if (x) this.push({type: 'agent', snap: x, full: true}); }});
+      if (!list.length) return this.note(t('並列エージェントはまだいません。/agent <タスク> で任せられます。'));
+      return this.openMenu({title: t('並列エージェント'), hint: t('選ぶと結果を表示（作業中なら停止）'), options: list.map(x => ({value: x.tag, label: x.tag + ' ' + x.type + '  ' + x.title, desc: ({working: t('作業中 {tool}', {tool: x.lastTool || ''}), done: t('完了'), failed: t('失敗 {error}', {error: x.error}), stopped: t('停止')})[x.state] || x.state})),
+        pick: tag => { const x = a.agents().find(y => y.tag === tag); if (x?.state === 'working') { a.stopAgent(tag); this.note(t('{tag} を止めています…', {tag})); } else if (x) this.push({type: 'agent', snap: x, full: true}); }});
     }
     if (cmd === '/image') {
       if (!arg) { this.pasteImage(); return; }
       const p = path.resolve(a.cwd, arg.replace(/^["']|["']$/g, ''));
-      if (!clip.isImage(p)) return this.note('画像ファイル（png / jpg / gif / webp / bmp）を指定してください');
+      if (!clip.isImage(p)) return this.note(t('画像ファイル（png / jpg / gif / webp / bmp）を指定してください'));
       return this.attach(p);
     }
     if (cmd === '/todos') return this.push({type: 'todos', todos: this.s.todos});
     if (cmd === '/status') return this.push({type: 'status'});
     if (cmd === '/init') return this.submit('このリポジトリを調べて、AGENTS.md を作ってください（ビルド・テスト方法、構成、規約、注意点を簡潔に）。既にあれば足りないところを更新してください。');
-    this.note('知らないコマンド: ' + cmd + '  （/help で一覧）');
+    this.note(t('知らないコマンド: {cmd}  （/help で一覧）', {cmd}));
   }
 }

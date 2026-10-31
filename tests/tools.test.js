@@ -97,7 +97,7 @@ test('write and edit refuse when the file changed on disk after the read', () =>
 });
 
 test('source files named after credentials or secrets are not treated as secrets', () => {
-  for (const p of ['lib/credentials_manager.js', 'src/secret_santa.js', 'docs/secrets-handling.md', 'C:\\Avatool\\lib\\booth_cookie_store.js']) assert.ok(!isSensitivePath(p), p);
+  for (const p of ['lib/credentials_manager.js', 'src/secret_santa.js', 'docs/secrets-handling.md', 'C:\\proj\\lib\\cookie_store.js']) assert.ok(!isSensitivePath(p), p);
   for (const p of ['credentials', 'credentials.json', 'secrets.json', 'secret.yaml', '.secrets']) assert.ok(isSensitivePath(p), p);
 });
 

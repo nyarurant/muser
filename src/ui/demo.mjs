@@ -6,10 +6,12 @@ import {run} from './view.mjs';
 const require = createRequire(import.meta.url);
 const {lineDiff} = require('../tools.js');
 const sessions = require('../sessions.js');
+const i18n = require('../i18n.js');
+const {t} = i18n;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const REPLY_1 = '了解、まず `src/math.js` を見ます。\n';
-const REPLY_2 = '原因は **割り算の端数処理** でした。\n\n## 直したところ\n- `Math.floor` を `Math.round` に変更\n- 0 で割ったときは `null` を返す\n\n```js\nexport const div = (a, b) => b === 0 ? null : Math.round(a / b);\n```\n\nテストも通りました。ほかに見るところはありますか？';
+const reply1 = () => t('了解、まず `src/math.js` を見ます。\n');
+const reply2 = () => t('原因は **割り算の端数処理** でした。\n\n## 直したところ\n- `Math.floor` を `Math.round` に変更\n- 0 で割ったときは `null` を返す\n\n```js\nexport const div = (a, b) => b === 0 ? null : Math.round(a / b);\n```\n\nテストも通りました。ほかに見るところはありますか？');
 
 class DemoAgent extends EventEmitter {
   static DEVICE = 'demo CLI (muser)';
@@ -23,7 +25,7 @@ class DemoAgent extends EventEmitter {
   }
   async stream(id, text) {
     let shown = '';
-    for (const ch of text) { if (this.stopped) throw Object.assign(new Error('中断'), {name: 'AbortError'}); shown += ch; this.emit('text', {id, text: shown}); await sleep(18); }
+    for (const ch of text) { if (this.stopped) throw Object.assign(new Error(t('中断しました')), {name: 'AbortError'}); shown += ch; this.emit('text', {id, text: shown}); await sleep(18); }
     this.emit('message-done', {id, text});
   }
   async tool(command, params, view, {ask, ms = 600} = {}) {
@@ -43,8 +45,8 @@ class DemoAgent extends EventEmitter {
     try {
       this.session.turns++;
       await sleep(900);
-      await this.stream('m1', REPLY_1);
-      const todos = [{content: '原因を調べる', status: 'in_progress'}, {content: '直す', status: 'pending'}, {content: 'テストを流す', status: 'pending'}];
+      await this.stream('m1', reply1());
+      const todos = [{content: t('原因を調べる'), status: 'in_progress'}, {content: t('直す'), status: 'pending'}, {content: t('テストを流す'), status: 'pending'}];
       this.emit('todos', todos); await this.tool('todo.write', {todos: ''}, {todos});
       await this.tool('code.read', {path: 'src/math.js'}, {lines: 42});
       await this.tool('code.grep', {pattern: 'Math\\.floor'}, {count: 3});
@@ -54,19 +56,21 @@ class DemoAgent extends EventEmitter {
       todos[1].status = 'completed'; todos[2].status = 'in_progress'; this.emit('todos', [...todos]);
       await this.tool('system.run', {command: 'npm test'}, {exit: 0, tail: ['> demo@1.0.0 test', '> node --test', '✔ div rounds (1.2ms)', '✔ div by zero (0.4ms)', 'ℹ pass 2  ℹ fail 0']}, {ask: true, ms: 300});
       todos[2].status = 'completed'; this.emit('todos', [...todos]);
-      await this.stream('m2', REPLY_2);
+      await this.stream('m2', reply2());
       this.emit('turn-end', {ok: true, ms: Date.now() - start});
-      return {text: REPLY_2};
+      return {text: reply2()};
     } catch (e) { this.emit('turn-end', {ok: false, aborted: e.name === 'AbortError', error: e.message, ms: Date.now() - start}); throw e; }
   }
   async interrupt() { this.stopped = true; }
   close() { this.shells.killAll(); }
 }
 
-export function demo({version}) {
+export async function demo({version}) {
+  // Like a real first run: ask for the language if none was picked yet (and keep the choice).
+  if (i18n.chosen() === null) await require('../tui/onboard.js').askLanguage();
   const agent = new DemoAgent(process.cwd());
   // The demo's approval previews come from the script instead of real files.
-  const app = run({agent, museName: 'Muse (デモ)', version});
+  const app = run({agent, museName: t('Muse (デモ)'), version});
   return app;
 }
 export {DemoAgent};
@@ -80,14 +84,14 @@ export class LoginDemoAgent extends DemoAgent {
     super(cwd);
     this.device = {connected: false}; this.client = {status: 'demo'}; this.expired = false; this.everConnected = false;
     this.loginFlow = async ({log}) => {
-      log('Edge でログインを待っています（デモ）'); await sleep(1800);
-      log('… ログインを確認、VM 情報を取得中'); await sleep(900);
-      log('… 接続用トークンを取得中'); await sleep(900);
+      log(t('Edge でログインを待っています（デモ）')); await sleep(1800);
+      log(t('… ログインを確認、VM 情報を取得中')); await sleep(900);
+      log(t('… 接続用トークンを取得中')); await sleep(900);
       this.expired = false;
     };
   }
   async ensureConnected() {
-    if (this.expired) { this.emit('connection', {state: 'auth', error: 'Muse にログインしてください。'}); throw new Error('Muse にログインしてください。'); }
+    if (this.expired) { this.emit('connection', {state: 'auth', error: t('Muse にログインしてください。')}); throw new Error(t('Muse にログインしてください。')); }
     if (this.device.connected) return;
     const first = !this.everConnected;
     this.emit('connection', {state: first ? 'connecting' : 'reconnecting'});
@@ -98,10 +102,10 @@ export class LoginDemoAgent extends DemoAgent {
   expireLogin() {
     this.expired = true; this.device = {connected: false};
     this.emit('device', {connected: false});
-    this.emit('connection', {state: 'auth', error: 'Muse にログインしてください。'});
+    this.emit('connection', {state: 'auth', error: t('Muse にログインしてください。')});
   }
   async send(text, opts) {
-    if (this.expired) throw new Error('muse.ai のログインが切れています。/login でログインし直してください。');
+    if (this.expired) throw new Error(t('muse.ai のログインが切れています。/login でログインし直してください。'));
     await this.ensureConnected();
     return super.send(text, opts);
   }
@@ -109,37 +113,41 @@ export class LoginDemoAgent extends DemoAgent {
 
 function demoRegister() {
   return async ui => {
-    await ui.busy('SDK トークンを確認しています', () => sleep(900));
-    await ui.confirm('SDK トークン「muser CLI」を発行します。利用規約に同意しますか？');
-    await ui.busy('準備しています', () => sleep(700));
-    await ui.ask('Muse にログインしているメールアドレス', {hint: 'デモ: 何を入れても送られません', placeholder: 'you@example.com'});
-    await ui.busy('認証コードを送っています', () => sleep(900));
-    await ui.ask('届いた認証コード', {hint: 'デモ: 何でも通ります', placeholder: '123456'});
-    await ui.busy('確認しています', () => sleep(900));
-    await ui.pick('どのアカウントで Muse を使っていますか？', [{label: 'Muse（デモのアカウント）'}, {label: 'もう一つのアカウント（デモ）'}]);
-    await ui.busy('確認しています', () => sleep(800));
+    await ui.busy(t('SDK トークンを確認しています'), () => sleep(900));
+    // As in pc-login: declining stops the registration and muser ends with 'Cancelled.'.
+    if (!(await ui.confirm(t('SDK トークン「muser CLI」を発行します。利用規約に同意しますか？')))) throw new Error(t('中止しました。'));
+    await ui.busy(t('準備しています'), () => sleep(700));
+    await ui.ask(t('Muse にログインしているメールアドレス'), {hint: t('デモ: 何を入れても送られません'), placeholder: 'you@example.com'});
+    await ui.busy(t('認証コードを送っています'), () => sleep(900));
+    await ui.ask(t('届いた認証コード'), {hint: t('デモ: 何でも通ります'), placeholder: '123456'});
+    await ui.busy(t('確認しています'), () => sleep(900));
+    await ui.pick(t('どのアカウントで Muse を使っていますか？'), [{label: t('Muse（デモのアカウント）')}, {label: t('もう一つのアカウント（デモ）')}]);
+    await ui.busy(t('確認しています'), () => sleep(800));
   };
 }
 
 export async function demoLogin({version}) {
-  const {onboard} = require('../tui/onboard.js');
+  const {onboard, askLanguage} = require('../tui/onboard.js');
   process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
+  // The first-run demo always starts with the language question; it changes the saved choice
+  // only when there is none yet.
+  await askLanguage({save: i18n.chosen() === null});
   await onboard({
     needLogin: true, needDevice: true,
     login: async progress => {
-      progress('Edge の窓でログインを待っています（デモ: 実際には開きません）'); await sleep(2000);
-      progress('ログインを確認、VM 情報を取得中'); await sleep(900);
-      progress('接続用トークンを取得中'); await sleep(900);
+      progress(t('Edge の窓でログインを待っています（デモ: 実際には開きません）')); await sleep(2000);
+      progress(t('ログインを確認、VM 情報を取得中')); await sleep(900);
+      progress(t('接続用トークンを取得中')); await sleep(900);
     },
     register: demoRegister(),
   });
   await sleep(1200);
   const agent = new LoginDemoAgent(process.cwd());
-  const app = run({agent, museName: 'Muse (デモ)', version, connect: async () => {
+  const app = run({agent, museName: t('Muse (デモ)'), version, connect: async () => {
     await agent.ensureConnected();
     // Then, a while later, the login lapses: the offer to log in again appears.
     setTimeout(() => agent.expireLogin(), 5000);
-    return 'Muse (デモ)';
+    return t('Muse (デモ)');
   }});
   return app;
 }

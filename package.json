@@ -1,6 +1,6 @@
 {
   "name": "muser-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Unofficial terminal coding agent for Muse (muse.ai): Muse works on your Windows PC through the CLI",
   "license": "MIT",
   "author": "nyarurant",
@@ -22,7 +22,7 @@
     "win32"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.js",
+    "test": "node --import ./tests/setup.mjs --test tests/*.test.js",
     "check": "node scripts/check-syntax.mjs"
   },
   "files": [

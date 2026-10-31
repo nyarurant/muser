@@ -2,6 +2,7 @@
 // HTTPS to muse.ai with the website login cookies from `muser login`, outside any browser.
 // Plays the role of Electron's session.defaultSession.fetch in muse-desktop-community.
 const store = require('./secure-store');
+const {t} = require('./i18n');
 
 const FILE = 'web.enc';
 
@@ -74,7 +75,7 @@ function createWeb(jar = loadJar()) {
       response = await fetch(url, {method, redirect: 'error', signal: AbortSignal.timeout(timeout),
         headers: {'Content-Type': 'application/json', ...(cookies ? {Cookie: cookieHeader(jar, url)} : {}), ...headers},
         ...(body !== undefined ? {body: JSON.stringify(body)} : {})});
-    } catch { throw Object.assign(new Error(new URL(url).hostname + ' に接続できません。'), {network: true}); }
+    } catch { throw Object.assign(new Error(t('{host} に接続できません。', {host: new URL(url).hostname})), {network: true}); }
     if (cookies && absorb(jar, url, response)) { try { saveJar(jar); } catch {} }
     return response;
   }
@@ -83,7 +84,7 @@ function createWeb(jar = loadJar()) {
     // muse.ai refuses /api/hatch/token (403) without the browser's Sec-Fetch headers.
     const r = await call('https://muse.ai' + route, {method: body ? 'POST' : 'GET', body,
       headers: {Origin: 'https://muse.ai', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty'}});
-    if (!r.ok) throw Object.assign(new Error('Muse のログインが必要です。`muser login` を実行してください。'), {status: r.status});
+    if (!r.ok) throw Object.assign(new Error(t('Muse のログインが必要です。`muser login` を実行してください。')), {status: r.status});
     return r.json();
   }
   // PcAuth's request: native auth services, bearer only, never cookies.
@@ -91,15 +92,15 @@ function createWeb(jar = loadJar()) {
     const root = scope === 'auth' ? 'https://hatch-api.meta.ai' : 'https://api.muse.ai';
     const r = await call(root + route, {method: body === undefined ? 'GET' : 'POST', body, cookies: false, timeout: 25000,
       headers: {'X-API-Version': '1.0.0', ...(bearer ? {Authorization: 'Bearer ' + bearer} : {})}});
-    let result; try { result = await r.json(); } catch { throw new Error('Muse の PC 認証応答を確認できません。'); }
-    if (!r.ok) throw Object.assign(new Error('PC の認証を完了できませんでした（HTTP ' + r.status + '）。'), {status: r.status});
+    let result; try { result = await r.json(); } catch { throw new Error(t('Muse の PC 認証応答を確認できません。')); }
+    if (!r.ok) throw Object.assign(new Error(t('PC の認証を完了できませんでした（HTTP {status}）。', {status: r.status})), {status: r.status});
     return result;
   }
   async function sdkRequest(method) {
     const r = await call('https://gadgets.muse.ai/api/sdk-tokens', {method, timeout: 20000,
       headers: {Origin: 'https://gadgets.muse.ai', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty'},
       ...(method === 'POST' ? {body: {label: 'muser CLI'}} : {})});
-    if (!r.ok) throw new Error('SDK トークンを準備できませんでした（HTTP ' + r.status + '）。');
+    if (!r.ok) throw new Error(t('SDK トークンを準備できませんでした（HTTP {status}）。', {status: r.status}));
     return r.json();
   }
   // muse.ai page text (HTML, JS chunks), used to look up a Next.js server action id.

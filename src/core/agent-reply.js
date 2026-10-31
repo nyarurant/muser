@@ -1,5 +1,6 @@
 'use strict';
 const {messageFromEvent}=require('./chat-model');
+const {t}=require('../i18n');
 
 const BUSY=new Set(['running','pending','queued','in_progress','started','waiting_for_approval']);
 const FAILED=new Set(['failed','error','errored','cancelled','canceled','stopped','interrupted']);
@@ -18,7 +19,7 @@ function waitForReply({client,sessionId,baseline=new Set(),signal,timeoutMs=6000
     client.off('event',onEvent);client.off('status',onStatus);signal?.removeEventListener('abort',onAbort);
   };
   const finish=(error,value)=>{if(ended)return;ended=true;cleanup();error?rejectReply(error):resolveReply(value);};
-  const cancel=()=>finish(Object.assign(new Error('PC の操作を停止しました。'),{name:'AbortError'}));
+  const cancel=()=>finish(Object.assign(new Error(t('PC の操作を停止しました。')),{name:'AbortError'}));
   const check=async()=>{
     if(ended||!accepted)return;
     if(checking){again=true;return;}
@@ -30,7 +31,7 @@ function waitForReply({client,sessionId,baseline=new Set(),signal,timeoutMs=6000
       pollFailures=0;
       if(ended)return;
       const status=String((detail?.session||detail)?.status||'').toLowerCase();
-      if(FAILED.has(status)){finish(new Error('Muse の作業が終了しました ('+status+')。PC 操作は続行しません。'));return;}
+      if(FAILED.has(status)){finish(new Error(t('Muse の作業が終了しました ({status})。PC 操作は続行しません。', {status})));return;}
       if(!status||BUSY.has(status))return;
       const byId=new Map();
       for(const event of history.chat_events||[]){
@@ -74,11 +75,11 @@ function waitForReply({client,sessionId,baseline=new Set(),signal,timeoutMs=6000
     // recovered into 'connecting' and then failed again was still timed from the
     // first drop, so the sticky timer could fire during the second outage.
     else if(status==='connecting'){clearTimeout(lost);lost=null;}
-    else if(status==='auth_required')finish(new Error('Muse のログインが切れたため、PC 操作を停止しました。'));
-    else lost??=setTimeout(()=>finish(new Error('Muse との接続が戻らないため、PC 操作を停止しました。')),reconnectGraceMs);
+    else if(status==='auth_required')finish(new Error(t('Muse のログインが切れたため、PC 操作を停止しました。')));
+    else lost??=setTimeout(()=>finish(new Error(t('Muse との接続が戻らないため、PC 操作を停止しました。'))),reconnectGraceMs);
   };
   const onAbort=()=>cancel();
-  const timeout=setTimeout(()=>finish(new Error('Muse の応答がタイムアウトしました。')),timeoutMs);
+  const timeout=setTimeout(()=>finish(new Error(t('Muse の応答がタイムアウトしました。'))),timeoutMs);
   // Self-scheduling poll with backoff: the interval starts at the caller's pollMs
   // and doubles per consecutive failed check, capped at 5s (never below pollMs for
   // callers that asked for a slower cadence); a successful check resets it.

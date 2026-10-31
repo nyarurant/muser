@@ -14,6 +14,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const store = require('./secure-store');
+const {t} = require('./i18n');
 
 const DIR = path.join(os.homedir(), '.muser');
 const FILE = path.join(DIR, 'mcp.json');
@@ -223,16 +224,16 @@ class McpHub {
         if (errStream) errStream.on('data', d => { entry.stderrTail = (entry.stderrTail + d.toString()).slice(-2000); });
       }
       client = new Client({name: 'muser', version: require('../package.json').version});
-      await withTimeout(client.connect(transport), CONNECT_TIMEOUT, '接続がタイムアウトしました');
+      await withTimeout(client.connect(transport), CONNECT_TIMEOUT, t('接続がタイムアウトしました'));
       if (stale()) { try { await client.close(); } catch {} return; }
       const tools = [], seenCursors = new Set();
       for (let cursor, pages = 0; ;) {
-        if (++pages > MAX_LIST_PAGES) throw new Error('ツール一覧のページ数が上限 (' + MAX_LIST_PAGES + ') を超えました');
-        const r = await withTimeout(client.listTools(cursor ? {cursor} : {}), CONNECT_TIMEOUT, 'ツール一覧がタイムアウトしました');
+        if (++pages > MAX_LIST_PAGES) throw new Error(t('ツール一覧のページ数が上限 ({max}) を超えました', {max: MAX_LIST_PAGES}));
+        const r = await withTimeout(client.listTools(cursor ? {cursor} : {}), CONNECT_TIMEOUT, t('ツール一覧がタイムアウトしました'));
         if (stale()) { try { await client.close(); } catch {} return; }
         tools.push(...r.tools);
         if (!r.nextCursor) break;
-        if (seenCursors.has(r.nextCursor)) throw new Error('ツール一覧のカーソルが繰り返されました: ' + r.nextCursor);
+        if (seenCursors.has(r.nextCursor)) throw new Error(t('ツール一覧のカーソルが繰り返されました: {cursor}', {cursor: r.nextCursor}));
         seenCursors.add(r.nextCursor);
         cursor = r.nextCursor;
       }

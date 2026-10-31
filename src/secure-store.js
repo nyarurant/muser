@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const {spawnSync} = require('node:child_process');
+const {t} = require('./i18n');
 
 const DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser');
 
@@ -15,9 +16,9 @@ function dpapi(op, input) {
     `[Console]::Out.Write([Convert]::ToBase64String($o))`;
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
     {input: input.toString('base64'), encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000});
-  if (r.error) throw new Error('Windows の暗号化ストレージを使えませんでした。' + (r.error.code === 'ETIMEDOUT' ? '（タイムアウトしました）' : '（' + r.error.message + '）'));
-  if (r.signal) throw new Error('Windows の暗号化ストレージを使えませんでした。（プロセスがシグナル ' + r.signal + ' で終了しました）');
-  if (r.status !== 0) throw new Error('Windows の暗号化ストレージを使えませんでした。' + (r.stderr ? '（' + String(r.stderr).trim().slice(-200) + '）' : ''));
+  if (r.error) throw new Error(r.error.code === 'ETIMEDOUT' ? t('Windows の暗号化ストレージを使えませんでした。（タイムアウトしました）') : t('Windows の暗号化ストレージを使えませんでした。（{message}）', {message: r.error.message}));
+  if (r.signal) throw new Error(t('Windows の暗号化ストレージを使えませんでした。（プロセスがシグナル {signal} で終了しました）', {signal: r.signal}));
+  if (r.status !== 0) throw new Error(t('Windows の暗号化ストレージを使えませんでした。{detail}', {detail: r.stderr ? '（' + String(r.stderr).trim().slice(-200) + '）' : ''}));
   return Buffer.from(r.stdout.trim(), 'base64');
 }
 
@@ -77,7 +78,7 @@ function load(name) {
     if (st) cache.set(name, {...st, json});
     return value;
   } catch (e) {
-    throw new Error('暗号化ファイル ' + target + ' を読み込めませんでした。ファイルが壊れているか、別の Windows ユーザーで作成された可能性があります。`muser login` でログインし直してください。（詳細: ' + e.message + '）');
+    throw new Error(t('暗号化ファイル {file} を読み込めませんでした。ファイルが壊れているか、別の Windows ユーザーで作成された可能性があります。`muser login` でログインし直してください。（詳細: {detail}）', {file: target, detail: e.message}));
   }
 }
 

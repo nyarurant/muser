@@ -8,6 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const {t} = require('./i18n');
 
 // MUSER_USAGE_FILE redirects the store (tests, portable installs).
 function file() {
@@ -91,7 +92,7 @@ function summary() {
     last7.inChars += b.inChars;
     last7.outChars += b.outChars;
   }
-  return {today, last7: withTokens(last7), note: 'トークン数は文字数 ÷ 4 の概算です。'};
+  return {today, last7: withTokens(last7), note: t('トークン数は文字数 ÷ 4 の概算です。')};
 }
 
 function limits() {
@@ -102,19 +103,19 @@ function limits() {
 }
 
 function bucketLine(b) {
-  return 'ターン ' + b.turns + ' / ツール ' + b.toolCalls + ' 回 / 約 ' + b.approxTokens +
-    ' tokens（入 ' + Math.round(b.inChars / 4) + ' / 出 ' + Math.round(b.outChars / 4) + '）';
+  return t('ターン {turns} / ツール {toolCalls} 回 / 約 {tokens} tokens（入 {input} / 出 {output}）',
+    {turns: b.turns, toolCalls: b.toolCalls, tokens: b.approxTokens, input: Math.round(b.inChars / 4), output: Math.round(b.outChars / 4)});
 }
 
 function formatSummary() {
   const s = summary();
   const lim = limits();
   return [
-    'muser の記録（この PC で数えた目安）',
-    '今日: ' + bucketLine(s.today),
-    '直近7日: ' + bucketLine(s.last7),
-    '上限: 1ターンのツール上限 ' + lim.perTurnTools + ' 回（MUSER_MAX_TOOL_CALLS_PER_TURN） / 1日のターン上限 ' +
-      (lim.dailyTurns ? String(lim.dailyTurns) : 'なし'),
+    t('muser の記録（この PC で数えた目安）'),
+    t('今日: {line}', {line: bucketLine(s.today)}),
+    t('直近7日: {line}', {line: bucketLine(s.last7)}),
+    t('上限: 1ターンのツール上限 {perTurn} 回（MUSER_MAX_TOOL_CALLS_PER_TURN） / 1日のターン上限 {daily}',
+      {perTurn: lim.perTurnTools, daily: lim.dailyTurns ? String(lim.dailyTurns) : t('なし')}),
   ].join('\n');
 }
 
@@ -136,7 +137,7 @@ async function findAction(web, maxChunks = 2000) {
     if (m) return m[1];
     for (const ref of text.matchAll(/static\/chunks\/([A-Za-z0-9_.-]+\.js)/g)) if (!seen.has(ref[1])) queue.push(ref[1]);
   }
-  throw new Error('Muse の利用状況の取得先が見つかりませんでした');
+  throw new Error(t('Muse の利用状況の取得先が見つかりませんでした'));
 }
 
 function parseSubscription(text) {
@@ -172,15 +173,15 @@ async function plan(web) {
     if (sub) return shapePlan(sub);
     id = null; // the cached id belongs to an older build: look it up again, once
   }
-  throw new Error('Muse の利用状況を読み込めませんでした');
+  throw new Error(t('Muse の利用状況を読み込めませんでした'));
 }
 
 function formatPlan(p) {
   const at = p.resetsAt ? new Date(p.resetsAt).toLocaleString('ja-JP', {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '?';
   return [
-    'Muse の利用状況（muse.ai と同じ値）',
-    (p.plan || 'プラン不明') + ' · 週の使用量 ' + (p.percentUsed ?? '?') + '%（' + at + ' にリセット）' + (p.quotaStatus && p.quotaStatus !== 'SUFFICIENT' ? ' · ' + p.quotaStatus : ''),
-    ...(p.topupValue ? ['追加分: ' + p.topupValue] : []),
+    t('Muse の利用状況（muse.ai と同じ値）'),
+    t('{plan} · 週の使用量 {percent}%（{at} にリセット）{quota}', {plan: p.plan || t('プラン不明'), percent: p.percentUsed ?? '?', at, quota: p.quotaStatus && p.quotaStatus !== 'SUFFICIENT' ? ' · ' + p.quotaStatus : ''}),
+    ...(p.topupValue ? [t('追加分: {value}', {value: p.topupValue})] : []),
   ].join('\n');
 }
 

@@ -8,6 +8,7 @@ const path = require('node:path');
 const {spawn, spawnSync} = require('node:child_process');
 const store = require('./secure-store');
 const web = require('./web');
+const {t} = require('./i18n');
 
 const EDGE = [
   path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Microsoft\\Edge\\Application\\msedge.exe'),
@@ -22,12 +23,12 @@ async function waitForPort(timeoutMs = 20000) {
     try { const port = Number(fs.readFileSync(portFile, 'utf8').split('\n')[0]); if (port) return port; } catch {}
     await new Promise(r => setTimeout(r, 250));
   }
-  throw new Error('Edge のログイン窓を開けませんでした。');
+  throw new Error(t('Edge のログイン窓を開けませんでした。'));
 }
 
 async function login({log = console.log, timeoutMs = 5 * 60 * 1000} = {}) {
   const edge = EDGE.find(p => fs.existsSync(p));
-  if (!edge) throw new Error('Microsoft Edge が見つかりません。');
+  if (!edge) throw new Error(t('Microsoft Edge が見つかりません。'));
   fs.mkdirSync(PROFILE, {recursive: true});
   try { fs.unlinkSync(path.join(PROFILE, 'DevToolsActivePort')); } catch {}
   const proc = spawn(edge, ['--user-data-dir=' + PROFILE, '--remote-debugging-port=0', '--no-first-run',
@@ -43,7 +44,7 @@ async function login({log = console.log, timeoutMs = 5 * 60 * 1000} = {}) {
     try { proc.kill(); } catch {}
     throw e;
   }
-  log('Edge の窓でログインを待っています');
+  log(t('Edge の窓でログインを待っています'));
   const until = Date.now() + timeoutMs;
   let last = '';
   try {
@@ -60,12 +61,12 @@ async function login({log = console.log, timeoutMs = 5 * 60 * 1000} = {}) {
           const session = await web.createWeb(jar).fetchJson('/api/session?vm_state=true');
           stage = session?.endpoint_url && session?.vm_id ? await web.probe(jar).catch(() => 'error') : 'session';
         } catch (e) { stage = e.network ? 'error' : 'waiting'; }
-        if (stage !== last) { last = stage; if (stage !== 'waiting') log('  … ' + ({session: 'ログインを確認、VM 情報を取得中', token: '接続用トークンを取得中', ready: '完了', error: '確認中'})[stage]); }
+        if (stage !== last) { last = stage; if (stage !== 'waiting') log('  … ' + ({session: t('ログインを確認、VM 情報を取得中'), token: t('接続用トークンを取得中'), ready: t('完了'), error: t('確認中')})[stage]); }
         if (stage === 'ready') { web.saveJar(jar); return true; }
       }
       await new Promise(r => setTimeout(r, 2000));
     }
-    throw new Error('ログインが完了する前に時間切れになりました。');
+    throw new Error(t('ログインが完了する前に時間切れになりました。'));
   } finally {
     // Closing over CDP really quits this Edge profile (killing the launcher pid does not).
     await browser.newBrowserCDPSession().then(s => s.send('Browser.close')).catch(() => {});

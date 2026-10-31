@@ -2,8 +2,13 @@
 // the Muse app; a terminal cannot render them, so assistant text is passed through here first.
 // sanitizeEmbeds swaps each token for one placeholder line; stripEmbeds removes them entirely
 // (for plain/exec output that should carry no trace of them).
+import {createRequire} from 'node:module';
+const {t} = createRequire(import.meta.url)('../i18n.js');
 
 export const WIDGET_PLACEHOLDER = '（🪟 ウィジェット — ターミナルでは表示できません）';
+// The placeholder text in the current UI language, resolved when text is sanitized
+// (display time), not when this module loads.
+const placeholder = () => t('（🪟 ウィジェット — ターミナルでは表示できません）');
 
 // [[<word>:<payload>]] — covers hatch_widget, hatch_letter and any future sibling token.
 const TOKEN = /\[\[[A-Za-z][\w-]*:[^\]\r\n]{1,300}?\]\]/g;
@@ -21,12 +26,13 @@ function mapLines(text, tokenReplacement) {
 }
 
 export function sanitizeEmbeds(text) {
-  let out = mapLines(text, WIDGET_PLACEHOLDER);
-  out = out.replace(TRAILING_PARTIAL, WIDGET_PLACEHOLDER);
+  const P = placeholder();
+  let out = mapLines(text, P);
+  out = out.replace(TRAILING_PARTIAL, P);
   // Collapse runs of placeholder-only lines (consecutive embed lines) into a single one.
   const lines = out.split('\n'), kept = [];
   for (const line of lines) {
-    if (line.trim() === WIDGET_PLACEHOLDER && kept.length && kept[kept.length - 1].trim() === WIDGET_PLACEHOLDER) continue;
+    if (line.trim() === P && kept.length && kept[kept.length - 1].trim() === P) continue;
     kept.push(line);
   }
   return kept.join('\n');

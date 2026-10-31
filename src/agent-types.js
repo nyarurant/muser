@@ -12,6 +12,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {t} = require('./i18n');
 
 const READ_TOOLS = ['code.read', 'code.grep', 'code.glob', 'system.run', 'todo.write', 'mcp.*'];
 const BUILTIN = {
@@ -31,7 +32,7 @@ function parse(file) {
   const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
   if (!m && text.startsWith('---') && !text.split('\n').slice(1).some(line => line.trim() === '---'))
-    throw new Error('frontmatter が閉じていません（終わりの --- がありません）');
+    throw new Error(t('frontmatter が閉じていません（終わりの --- がありません）'));
   const meta = {};
   if (m) for (const line of m[1].split('\n')) { const kv = /^(\w+)\s*:\s*(.*)$/.exec(line.trim()); if (kv) meta[kv[1].toLowerCase()] = kv[2].trim(); }
   const name = String(meta.name || path.basename(file, '.md')).toLowerCase().replace(/[^a-z0-9_-]/g, '');
@@ -47,13 +48,13 @@ function load(cwd) {
       const file = path.join(dir, f);
       let parsed;
       try { parsed = parse(file); } catch (e) {
-        console.error(`muser: エージェント定義を読み込めませんでした: ${file}: ${String(e?.message || e).replace(/\s*\n\s*/g, ' ')}`);
+        console.error(t('muser: エージェント定義を読み込めませんでした: {file}: {reason}', {file, reason: String(e?.message || e).replace(/\s*\n\s*/g, ' ')}));
         continue;
       }
       const {name, def} = parsed;
       if (!name) continue;
       if (Object.prototype.hasOwnProperty.call(BUILTIN, name))
-        console.error(`muser: 組み込みエージェント ${name} は ${file} で上書きされます`);
+        console.error(t('muser: 組み込みエージェント {name} は {file} で上書きされます', {name, file}));
       types[name] = def;
     }
   }
