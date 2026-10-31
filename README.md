@@ -59,7 +59,9 @@ Type what you want done and press Enter. Muse works on this PC and you see it ha
 | Alt+V / Ctrl+V | Attach the clipboard image |
 | ↑↓ | Input history (kept across restarts) |
 
-Main slash commands: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/lang` `/login` `/status` `/init` `/exit`
+Main slash commands: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/lang` `/login` `/update` `/status` `/init` `/exit`
+
+At every start muser checks npm for a newer version in the background and shows it in the footer (`⬆ v… · /update`); `/update` installs it with `npm install -g muser-cli@latest`. Nothing is installed without you. Turn the check off with `MUSER_NO_UPDATE_CHECK=1` or `{"updateCheck": false}` in `~/.muser/config.json`.
 
 ## Commands
 

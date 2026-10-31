@@ -484,4 +484,11 @@ module.exports = {
   'デスクトップ版の暗号鍵の形式が想定と違います。': 'The desktop app encryption key has an unexpected format.',
   'デスクトップ版の保存データの形式が想定と違います。': 'The desktop app saved data has an unexpected format.',
   'デスクトップ版に SDK トークンが見つかりません。': 'No SDK token was found in the desktop app.',
+  'muser を最新版に更新する（npm）': 'Update muser to the latest version (npm)',
+  'この muser は git から動いている開発用なので、/update では更新しません（git pull で更新してください）。': 'This muser runs from a git checkout (development), so /update leaves it alone (update it with git pull).',
+  'muser を更新しています（npm install -g muser-cli@latest）…': 'Updating muser (npm install -g muser-cli@latest)…',
+  '更新できませんでした:': 'The update failed:',
+  'muser を {version} に更新しました。いったん終了して muser -c で開き直すと、この会話の続きから新しい版で使えます。': 'Updated muser to {version}. Quit and reopen it with muser -c to continue this chat on the new version.',
+  '最新版': 'the latest version',
+  '更新を確認中…': 'Checking for updates…',
 };

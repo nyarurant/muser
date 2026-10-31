@@ -248,7 +248,8 @@ function Footer({s, ctrl, W}) {
   }
   return h(Box, {paddingX: 1, width: W, justifyContent: 'space-between'},
     s.flash ? h(Text, {color: '#e6be64'}, s.flash) : h(Text, null, h(Text, {color}, (m === 'default' ? '' : '⏵⏵ ') + t(LABELS[m])), h(Text, {color: DIM}, t('   shift+tab で切替'))),
-    h(Text, null, s.shells.some(x => x.running) ? h(Text, {color: ACCENT}, '⚙ ' + t('{n} 実行中', {n: s.shells.filter(x => x.running).length}) + '   ') : '', ...(s.loginNeeded ? [h(Text, {color: '#f06e6e'}, t('ログインが必要（/login）  '))] : []), h(Text, {color: s.deviceOk ? '#78cd82' : '#f06e6e'}, '● '), h(Text, {color: DIM}, ctrl.agent.constructor.DEVICE + ' · ' + ctrl.museName + (s.plan?.percentUsed != null ? ' · ' + t('週 {n}%', {n: s.plan.percentUsed}) : ''))));
+    h(Text, null, s.shells.some(x => x.running) ? h(Text, {color: ACCENT}, '⚙ ' + t('{n} 実行中', {n: s.shells.filter(x => x.running).length}) + '   ') : '',
+      ...(s.update?.checking ? [h(Text, {color: DIM}, t('更新を確認中…') + '   ')] : s.update?.latest ? [h(Text, {color: ACCENT}, '⬆ v' + s.update.latest + ' · /update   ')] : []), ...(s.loginNeeded ? [h(Text, {color: '#f06e6e'}, t('ログインが必要（/login）  '))] : []), h(Text, {color: s.deviceOk ? '#78cd82' : '#f06e6e'}, '● '), h(Text, {color: DIM}, ctrl.agent.constructor.DEVICE + ' · ' + ctrl.museName + (s.plan?.percentUsed != null ? ' · ' + t('週 {n}%', {n: s.plan.percentUsed}) : ''))));
 }
 function AgentCards({list}) {
   const n = useTick(list.some(x => x.state === 'working'));
@@ -315,6 +316,7 @@ export function run({agent, museName, version, initial, connect}) {
   if (connect) connect().then(name => { if (name && name !== ctrl.museName) { ctrl.museName = name; ctrl.set({}); } }).catch(() => {});
   if (agent.session.turns) ctrl.showResumed(agent.session, {startup: true}); // muser resume / -c
   if (initial) ctrl.submit(initial);
+  if (agent.client.status !== 'demo') ctrl.checkUpdate(); // right away, in the background (src/update.js)
   setTimeout(() => ctrl.refreshPlan(), 1500); // after the first frame: loading the login cookies blocks briefly
   return app;
 }

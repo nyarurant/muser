@@ -59,7 +59,9 @@ muser
 | Alt+V / Ctrl+V | クリップボードの画像を添付 |
 | ↑↓ | 入力履歴（次回起動後も残ります） |
 
-主なスラッシュコマンド: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/lang` `/login` `/status` `/init` `/exit`
+主なスラッシュコマンド: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/lang` `/login` `/update` `/status` `/init` `/exit`
+
+起動するたびに、裏で npm に新しい版があるかを確認し、あれば下の情報欄に出します（`⬆ v… · /update`）。`/update` で `npm install -g muser-cli@latest` を実行して更新します。勝手にインストールはしません。確認を止めるには、環境変数 `MUSER_NO_UPDATE_CHECK=1` か、`~/.muser/config.json` の `{"updateCheck": false}` を使います。
 
 ## コマンド
 

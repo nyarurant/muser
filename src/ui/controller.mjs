@@ -24,6 +24,7 @@ const usage = require('../usage.js');
 const transcript = require('../transcript.js');
 const permissions = require('../permissions.js');
 const skills = require('../skills.js');
+const update = require('../update.js');
 const {TOOLS: LOCAL} = require('../tools.js');
 const i18n = require('../i18n.js');
 const {t} = i18n;
@@ -31,7 +32,7 @@ const {t} = i18n;
 export const COMMANDS = [
   ['/help', 'コマンドとキー操作（!コマンド・@ファイル も）'], ['/permissions', '承認モード（権限）を選ぶ'], ['/mode', '承認モードを選ぶ（/mode bypass で直接）'],
   ['/new', '新しい会話を始める'], ['/clear', '画面を消して新しい会話'], ['/resume', 'このフォルダーの過去の会話を再開'],
-  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルの一覧とオン・オフ（Claude Code / Codex のスキルも読めます）'], ['/skill', 'スキルを使って頼む（/skill <名前> <頼みたいこと>）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/exit', '終了'],
+  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルの一覧とオン・オフ（Claude Code / Codex のスキルも読めます）'], ['/skill', 'スキルを使って頼む（/skill <名前> <頼みたいこと>）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/update', 'muser を最新版に更新する（npm）'], ['/exit', '終了'],
 ];
 
 let nextId = 1;
@@ -494,6 +495,26 @@ export class Controller {
   refreshPlan() {
     return this.planLoading ??= usage.plan().then(p => { this.set({plan: p}); return p; }).catch(() => null).finally(() => { this.planLoading = null; });
   }
+  // At every start (src/update.js): the footer says "checking for updates…", then shows a newer
+  // version until /update installs it. A failed check just clears the footer.
+  checkUpdate() {
+    if (!update.enabled()) return Promise.resolve(null);
+    this.set({update: {checking: true}});
+    return update.latest().then(v => { this.set({update: update.newer(v, this.version) ? {latest: v} : null}); return v; }, () => { this.set({update: null}); return null; });
+  }
+  async runUpdate() {
+    if (update.devCheckout()) return this.note(t('この muser は git から動いている開発用なので、/update では更新しません（git pull で更新してください）。'));
+    if (this.updating) return;
+    this.updating = true; this.flash(t('muser を更新しています（npm install -g muser-cli@latest）…'), 300000);
+    try {
+      const r = await update.install();
+      this.flash('');
+      if (!r.ok) return this.note([t('更新できませんでした:'), ...r.output.split('\n').slice(-6)]);
+      let v = ''; try { v = await update.latest(); } catch {}
+      this.set({update: null});
+      this.note(t('muser を {version} に更新しました。いったん終了して muser -c で開き直すと、この会話の続きから新しい版で使えます。', {version: v ? 'v' + v : t('最新版')}));
+    } finally { this.updating = false; }
+  }
   // /skills: every skill found (muser's own, the project's, Claude Code's, Codex's), each one a
   // toggle; whole sources can be switched off too. Changes apply to chats started afterwards.
   skillsMenu() {
@@ -521,6 +542,7 @@ export class Controller {
     if (cmd === '/exit' || cmd === '/quit') return this.onExit();
     if (cmd === '/help') return this.push({type: 'help'});
     if (cmd === '/login') return this.login();
+    if (cmd === '/update') return this.runUpdate();
     if (cmd === '/usage') {
       this.flash(t('Muse の利用状況を確認しています…'), 20000);
       return this.refreshPlan().then(p => {
