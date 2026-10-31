@@ -52,9 +52,45 @@ function expand(text, cwd, readFiles) {
   return {block: parts.length ? '[Files the user attached with @]\n' + parts.join('\n\n') : '', files, missing};
 }
 
+// How the last listFiles call went, for the UI: {source: 'rg' | 'walk' | 'none', error}.
+// The completion used to fail silently to an empty list whenever rg was missing or its
+// output overflowed, which read as "@ does not work"; now rg failure falls back to a
+// plain fs walk and the reason stays available here.
+let listDiag = {source: 'rg', error: ''};
 function listFiles(dir) {
   const r = spawnSync('rg', ['--files', '--sort', 'path'], {cwd: dir, encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 * 1024});
-  return r.status === 0 || r.status === 1 ? r.stdout.split('\n').filter(Boolean).map(f => f.replace(/\\/g, '/')) : [];
+  if (!r.error && (r.status === 0 || r.status === 1)) {
+    listDiag = {source: 'rg', error: ''};
+    return r.stdout.split('\n').filter(Boolean).map(f => f.replace(/\\/g, '/'));
+  }
+  const rgError = r.error ? String(r.error.code || r.error.message) : 'rg exit ' + r.status;
+  try {
+    const files = walkFiles(dir);
+    listDiag = {source: 'walk', error: rgError};
+    return files;
+  } catch (e) {
+    listDiag = {source: 'none', error: rgError + '; ' + e.message};
+    return [];
+  }
+}
+// Fallback when rg is unavailable: recursive walk with rg-like habits (hidden files and
+// node_modules / .git skipped, '/' separators, sorted). It does not read .gitignore, so
+// in a repo it can list files rg would have hidden; capped like the rg path in practice.
+const WALK_SKIP = new Set(['node_modules', '.git']);
+function walkFiles(dir) {
+  const out = [], stack = [''];
+  while (stack.length && out.length < 20000) {
+    const rel = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(rel ? path.join(dir, rel) : dir, {withFileTypes: true}); } catch { continue; }
+    for (const e of entries) {
+      if (e.name.startsWith('.') || WALK_SKIP.has(e.name)) continue;
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) stack.push(r);
+      else if (e.isFile()) { out.push(r); if (out.length >= 20000) break; }
+    }
+  }
+  return out.sort();
 }
 
 // @ completion: files and folders under cwd matching the typed fragment, best first.
@@ -94,4 +130,4 @@ function fragmentAt(text, pos) {
   return m ? {start: pos - m[2].length, fragment: m[2].replace(/^"/, '')} : null;
 }
 
-module.exports = {mentions, expand, complete, fragmentAt};
+module.exports = {mentions, expand, complete, fragmentAt, walkFiles, listDiag: () => listDiag};

@@ -55,7 +55,7 @@ export class Controller {
       approval: null, reasonFor: null, todos: [], flash: '', deviceOk: !!agent.device?.connected,
       text: '', pos: 0, mode: agent.mode, clearCount: 0, attachments: [], agents: [], shells: [],
     };
-    this.history = loadHistory(); this.hIndex = -1; this.draft = ''; this.exitArmed = 0; this.queue = []; this.tabState = null; this.md = null;
+    this.history = loadHistory(); this.hIndex = -1; this.draft = ''; this.exitArmed = 0; this.queue = []; this.tabState = null; this.md = null; this.atPick = {key: null, idx: 0};
     this.wire();
     // Started from the home folder or a drive root, every search without a path walks all of it.
     const cwd = path.resolve(agent.cwd || '.');
@@ -299,6 +299,14 @@ export class Controller {
     // Backspace on an empty input removes the last attachment.
     if (k.backspace && !text && this.s.attachments.length) return this.set({attachments: this.s.attachments.slice(0, -1)});
     if (k.tab && !k.shift) return this.completeTab(text, pos);
+    // Enter while the caret sits in an @fragment picks the highlighted candidate instead
+    // of sending: the footer shows the list, so Enter meaning "send" here surprised people
+    // into thinking @ selection did not exist. A second Enter (after the pick, caret past
+    // the completed path) sends as usual.
+    if (k.return && !k.shift && !k.meta) {
+      const ctx = this.atContext(text, pos);
+      if (ctx?.list.length) return this.applyAtPick(ctx.at, ctx.list[this.atIndex(ctx.at.fragment, ctx.list.length)]);
+    }
     if (k.return) {
       if (k.shift || k.meta) return this.insert('\n');
       if (text.slice(0, pos).endsWith('\\')) return this.setText(text.slice(0, pos - 1) + '\n' + text.slice(pos), pos);
@@ -319,6 +327,16 @@ export class Controller {
     if (k.ctrl && input === 'u') return this.setText(text.slice(pos), 0);
     if (k.ctrl && input === 'k') return this.setText(text.slice(0, pos), pos);
     if (k.ctrl && input === 'w') { const b = text.slice(0, pos).replace(/\S+\s*$/, ''); return this.setText(b + text.slice(pos), b.length); }
+    // ↑↓ while an @fragment is being typed moves in the candidate list the footer shows,
+    // not through history (history used to swallow the keys, so the list looked unselectable).
+    if (k.upArrow || k.downArrow) {
+      const ctx = this.atContext(text, pos);
+      if (ctx?.list.length) {
+        const idx = this.atIndex(ctx.at.fragment, ctx.list.length);
+        this.atPick.idx = (idx + (k.upArrow ? -1 : 1) + ctx.list.length) % ctx.list.length;
+        return;
+      }
+    }
     if ((k.upArrow || k.downArrow) && !text.includes('\n')) {
       if (!this.history.length) return;
       if (k.upArrow) {
@@ -332,6 +350,25 @@ export class Controller {
       return this.setText(this.history[this.hIndex]);
     }
     if (input && !k.ctrl && !k.meta) this.insert(input.replace(/\r\n?/g, '\n'));
+  }
+  // The @fragment at the caret plus its candidates — the same list (same limit) the footer
+  // draws, so the highlight there and the pick here never disagree.
+  atContext(text, pos) {
+    const at = mention.fragmentAt(text, pos);
+    return at ? {at, list: mention.complete(at.fragment, this.agent.cwd)} : null;
+  }
+  // The highlighted candidate for a fragment; resets whenever the fragment changes.
+  atIndex(fragment, n) {
+    if (this.atPick.key !== fragment) this.atPick = {key: fragment, idx: 0};
+    return n ? ((this.atPick.idx % n) + n) % n : 0;
+  }
+  applyAtPick(at, pick) {
+    const {text, pos} = this.s;
+    const q = /\s/.test(pick) ? '"' + pick + '"' : pick;
+    const ins = pick.endsWith('/') ? q : q + ' ';
+    const nt = text.slice(0, at.start) + ins + text.slice(pos);
+    this.tabState = null;
+    return this.setText(nt, at.start + ins.length);
   }
   // Tab completion for @files and /commands (the old code checked @ first and returned either
   // way, so the / branch below it never ran for most inputs, and nothing could cycle). Repeated

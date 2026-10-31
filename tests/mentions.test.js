@@ -21,6 +21,18 @@ test('@ mentions: files and folders go along, emails do not, missing are reporte
   assert.deepEqual(m.mentions('使わずに、@src/a.js の中身、x@y.com'), ['src/a.js']);
 });
 
+test('walkFiles fallback: skips hidden files and node_modules, sorted / paths', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-walk-'));
+  fs.mkdirSync(path.join(dir, 'src')); fs.mkdirSync(path.join(dir, 'node_modules', 'x'), {recursive: true}); fs.mkdirSync(path.join(dir, '.git'));
+  fs.writeFileSync(path.join(dir, 'src', 'b.js'), ''); fs.writeFileSync(path.join(dir, 'a.txt'), '');
+  fs.writeFileSync(path.join(dir, 'node_modules', 'x', 'c.js'), ''); fs.writeFileSync(path.join(dir, '.hidden'), ''); fs.writeFileSync(path.join(dir, '.git', 'config'), '');
+  assert.deepEqual(m.walkFiles(dir), ['a.txt', 'src/b.js']);
+  // After a completion the listing diagnostic always says which source produced it.
+  m.complete('a', dir);
+  assert.ok(['rg', 'walk'].includes(m.listDiag().source));
+  assert.equal(typeof m.listDiag().error, 'string');
+});
+
 test('@ mentions: files over 1 MB are referenced by name only, glob refs skip stat', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-at-big-'));
   fs.writeFileSync(path.join(dir, 'big.bin'), Buffer.alloc(1024 * 1024 + 1, 65));

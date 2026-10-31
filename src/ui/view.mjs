@@ -12,7 +12,7 @@ const require = createRequire(import.meta.url);
 const {c, width, truncate, pad} = require('../tui/term.js');
 const {logo} = require('../tui/logo.js');
 const {LABELS} = require('../policy.js');
-const {fragmentAt: mentionAt, complete: mentionComplete} = require('../mentions.js');
+const {fragmentAt: mentionAt, complete: mentionComplete, listDiag: mentionDiag} = require('../mentions.js');
 const {t} = require('../i18n.js');
 
 const h = React.createElement;
@@ -234,7 +234,12 @@ function Footer({s, ctrl, W}) {
   const at = mentionAt(s.text, s.pos);
   if (at) {
     const list = mentionComplete(at.fragment, ctrl.agent.cwd);
-    return h(Box, {flexDirection: 'column', paddingX: 2}, list.length ? list.map((f, i) => h(Line, {key: f}, (i === 0 ? c.accent('◇ ' + f) : c.gray('  ' + f)) + (i === 0 ? c.faint(t('   tab で補完')) : ''))) : h(Text, {color: DIM}, t('一致するファイルがありません')));
+    if (!list.length) {
+      const diag = mentionDiag();
+      return h(Box, {paddingX: 2}, h(Text, {color: DIM}, diag.source === 'none' ? t('ファイル一覧を取得できませんでした（{error}）', {error: diag.error}) : t('一致するファイルがありません')));
+    }
+    const sel = ctrl.atIndex(at.fragment, list.length);
+    return h(Box, {flexDirection: 'column', paddingX: 2}, list.map((f, i) => h(Line, {key: f}, (i === sel ? c.accent('◇ ' + f) : c.gray('  ' + f)) + (i === sel ? c.faint(t('   ↑↓ で選択 · enter / tab で補完')) : ''))));
   }
   if (s.text.startsWith('!')) return h(Box, {paddingX: 1}, h(Line, null, c.yellow(t('! シェルモード')) + c.faint(t('   PowerShell で今すぐ実行（Muse を通さない）· 出力は次のメッセージで Muse に渡ります'))));
   if (s.text.startsWith('/') && !s.text.includes(' ')) {

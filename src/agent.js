@@ -19,6 +19,7 @@ const {decide} = require('./policy');
 const sessions = require('./sessions');
 const agentTypes = require('./agent-types');
 const {Shells} = require('./shells');
+const {Relay} = require('./relay');
 const {t} = require('./i18n');
 
 const DEVICE_NAME = os.hostname() + ' CLI (muser)';
@@ -193,6 +194,8 @@ class Agent extends EventEmitter {
   }
   async connectDevice() {
     const vm = await this.auth.vm();
+    // Other muser windows on this PC hand over calls that Muse sent here but belong to their turns.
+    if (!this.relay && !this.closed) this.relay = new Relay({takes: p => !!this.route(p), run: (c, p, t, id) => this.execute(c, p, t, id, {forwarded: true})}).start();
     const old = this.device;
     const device = this.device = new NativeDevice({commands: this.commands(), displayName: DEVICE_NAME, invokes: this.invokes, execute: (c, p, t, id) => this.execute(c, p, t, id)});
     old?.disconnect();
@@ -236,10 +239,16 @@ class Agent extends EventEmitter {
   // Outside any running turn nothing is done: the call may come from another chat, and the user is not watching.
   route(params) { return routeFor(this.workers, params); }
 
-  async execute(command, rawParams, timeoutMs, id) {
+  async execute(command, rawParams, timeoutMs, id, {forwarded = false} = {}) {
     const {agent: _tag, ...params} = rawParams || {};
     const w = this.route(rawParams);
-    if (!w) return {ok: false, error: 'muser is idle: only a turn sent from this terminal may use this device.'};
+    if (!w) {
+      // Muse may have sent this to the wrong muser window on this PC (src/relay.js).
+      const r = !forwarded && this.relay ? await this.relay.forward(command, rawParams, timeoutMs, id).catch(() => null) : null;
+      if (r?.result) return r.result;
+      if (r?.takers > 1) return {ok: false, error: 'Several muser windows on this PC are working at once, and this call could not be matched to its window. Try the call again; if it keeps failing, tell the user to run one muser task at a time.'};
+      return {ok: false, error: 'muser is idle: only a turn sent from this terminal may use this device.'};
+    }
     if (command === 'agent.spawn' || command === 'agent.wait') return this.executeAgentTool(w, command, params);
     if (w.type && !agentTypes.allows(w.type, command)) {
       const error = command + ' is not available to the ' + w.typeName + ' agent type (allowed: ' + w.type.tools.join(', ') + ').';
@@ -460,7 +469,7 @@ class Agent extends EventEmitter {
     await this.client.cancel(this.session.id).catch(() => {});
   }
 
-  close() { this.closed = true; clearTimeout(this.retryTimer); this.shells.killAll(); this.device?.disconnect(); this.client.disconnect(false); this.mcp?.close(); }
+  close() { this.closed = true; clearTimeout(this.retryTimer); this.relay?.stop(); this.shells.killAll(); this.device?.disconnect(); this.client.disconnect(false); this.mcp?.close(); }
 }
 
 function safe(fn) { try { return fn(); } catch { return undefined; } }
