@@ -5,6 +5,8 @@
 [Muse](https://muse.ai) のための、ターミナルで動く**非公式**コーディングエージェントです。
 この PC を Muse の「端末」として登録し、Muse がこの PC のファイルを読み書きしたりコマンドを実行したりしながら、対話形式で作業を進めます。見た目と操作は Claude Code / Codex CLI に近づけています。
 
+https://github.com/user-attachments/assets/15b00680-02a7-4f61-8841-81b0cbcafa59
+
 > **非公式です。** muser は Meta / Muse とは関係のない個人のプロジェクトです。Muse の Web 版が使っている非公開の通信方式を使っているため、Muse 側の変更でいつでも動かなくなる可能性があり、利用規約に照らしてアカウントに影響が出る可能性もゼロではありません。ご自身の判断で使ってください。
 
 ## 動作環境
@@ -67,6 +69,8 @@ muser
 | `muser -c` / `--continue` | このフォルダーの直前の会話を再開 |
 | `muser resume [ID]` | 会話を再開（ID なしで一覧） |
 | `muser exec "指示"` | 1回だけ実行して、最後の返事を標準出力へ（確認が必要な操作は断ります） |
+| `muser exec --json "…"` | 同じことを JSON Lines で。PC 操作と Muse 側の手順が1行ずつ、最後の行が結果（会話 ID・返事・出典・週の使用量の前後）。失敗時は終了コード 1 |
+| `muser exec --session <ID> "…"` | その会話の続きとして実行（`--json` の結果の `session`） |
 | `muser login` / `muser logout` | muse.ai へのログイン / ログアウト |
 | `muser pc-login` | この PC を端末として登録し直す |
 | `muser usage` | Muse の利用状況と muser の記録 |
@@ -105,6 +109,12 @@ Muse は独立したサブタスクを並列エージェントに任せられま
 
 カスタムの型は `~/.muser/agents/*.md` か `<プロジェクト>/.muser/agents/*.md` に置けます（Claude Code 形式。frontmatter: `name` `description` `tools` `readonly`）。
 エージェントは Muse の使用量を多く使うので、数は `--max-agents` / `--max-agents-total`、環境変数 `MUSER_MAX_AGENTS` / `MUSER_MAX_AGENTS_TOTAL`、`~/.muser/config.json` の `{"maxAgents": 4, "maxAgentsTotal": 8}` で制限できます。
+
+## スキル
+
+`SKILL.md`（frontmatter の `name` と `description`、続けて手順）を置いたフォルダーを「スキル」として読みます。読む場所は、プロジェクトの `.muser/skills` と `.claude/skills`、`~/.muser/skills`、`~/.claude/skills`、`~/.codex/skills`、`~/.agents/skills` です。Claude Code や Codex で使っているスキルが、そのまま使えます（muser はそれらのフォルダーに書き込みません）。
+
+Muse には各スキルの名前と短い説明だけを渡し、必要になったら `skill.read` で中身を読ませます。`/skills` でスキル（や読み込み元ごと）のオン・オフ、`/skill <名前> <頼みたいこと>` でスキルを使った依頼ができます。オンのスキルは新しい会話の最初のメッセージに1行ずつ載るので、使わないものはオフにしてください。
 
 ## MCP
 

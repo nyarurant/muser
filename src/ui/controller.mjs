@@ -23,6 +23,7 @@ const mention = require('../mentions.js');
 const usage = require('../usage.js');
 const transcript = require('../transcript.js');
 const permissions = require('../permissions.js');
+const skills = require('../skills.js');
 const {TOOLS: LOCAL} = require('../tools.js');
 const i18n = require('../i18n.js');
 const {t} = i18n;
@@ -30,7 +31,7 @@ const {t} = i18n;
 export const COMMANDS = [
   ['/help', 'コマンドとキー操作（!コマンド・@ファイル も）'], ['/permissions', '承認モード（権限）を選ぶ'], ['/mode', '承認モードを選ぶ（/mode bypass で直接）'],
   ['/new', '新しい会話を始める'], ['/clear', '画面を消して新しい会話'], ['/resume', 'このフォルダーの過去の会話を再開'],
-  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/exit', '終了'],
+  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルの一覧とオン・オフ（Claude Code / Codex のスキルも読めます）'], ['/skill', 'スキルを使って頼む（/skill <名前> <頼みたいこと>）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/exit', '終了'],
 ];
 
 let nextId = 1;
@@ -456,6 +457,27 @@ export class Controller {
   refreshPlan() {
     return this.planLoading ??= usage.plan().then(p => { this.set({plan: p}); return p; }).catch(() => null).finally(() => { this.planLoading = null; });
   }
+  // /skills: every skill found (muser's own, the project's, Claude Code's, Codex's), each one a
+  // toggle; whole sources can be switched off too. Changes apply to chats started afterwards.
+  skillsMenu() {
+    const a = this.agent, all = skills.load(a.cwd);
+    if (!all.length) return this.note([t('スキルがありません。'), t('~/.muser/skills/<名前>/SKILL.md に置くか、Claude Code（~/.claude/skills）や Codex（~/.codex/skills）のスキルがあればそのまま読みます。')]);
+    const bySource = {};
+    for (const s of all) (bySource[s.source] ||= []).push(s);
+    const options = [
+      ...all.map(s => ({value: 'skill:' + s.name, label: (s.enabled ? '● ' : '○ ') + s.name, desc: '[' + s.source + '] ' + s.description})),
+      ...Object.entries(bySource).map(([src, list]) => {
+        const on = list.some(s => s.enabled);
+        return {value: 'source:' + src + ':' + (on ? 'off' : 'on'), label: t(on ? '{source} をまとめてオフ' : '{source} をまとめてオン', {source: src}), desc: t('{n} 件', {n: list.length})};
+      }),
+    ];
+    return this.openMenu({title: t('スキル'), hint: t('選ぶとオン・オフ（新しい会話から反映）'), options, index: 0, pick: v => {
+      const [kind, id, mode] = v.split(':');
+      if (kind === 'skill') { const s = skills.load(a.cwd).find(x => x.name === id); if (s) { skills.setEnabled(id, !s.enabled); this.note(t(s.enabled ? '{name} をオフにしました' : '{name} をオンにしました', {name: id})); } }
+      else { skills.setSourceEnabled(id, mode === 'on'); this.note(t(mode === 'on' ? '{source} のスキルをオンにしました' : '{source} のスキルをオフにしました', {source: id})); }
+      this.skillsMenu();
+    }});
+  }
   note(lines) { this.push({type: 'note', lines: [].concat(lines)}); }
   slash(line) {
     const [cmd, ...rest] = line.split(/\s+/), arg = rest.join(' '), a = this.agent;
@@ -539,6 +561,14 @@ export class Controller {
       return this.attach(p);
     }
     if (cmd === '/todos') return this.push({type: 'todos', todos: this.s.todos});
+    if (cmd === '/skills') return this.skillsMenu();
+    if (cmd === '/skill') {
+      const [name, ...rest] = arg.split(/\s+/);
+      const all = skills.load(a.cwd), s = all.find(x => x.name === String(name || '').toLowerCase());
+      if (!name || !s) return this.note([t('使い方: /skill <名前> <頼みたいこと>'), t('スキル: {list}', {list: all.filter(x => x.enabled).map(x => x.name).join(', ') || t('（ありません）')})]);
+      if (!s.enabled) return this.note(t('{name} はオフです（/skills でオンにできます）', {name: s.name}));
+      return this.submit('Use the skill "' + s.name + '" (read it with skill.read first). ' + (rest.join(' ') || ''));
+    }
     if (cmd === '/status') return this.push({type: 'status'});
     if (cmd === '/init') return this.submit('このリポジトリを調べて、AGENTS.md を作ってください（ビルド・テスト方法、構成、規約、注意点を簡潔に）。既にあれば足りないところを更新してください。');
     this.note(t('知らないコマンド: {cmd}  （/help で一覧）', {cmd}));

@@ -5,6 +5,8 @@
 An **unofficial** terminal coding agent for [Muse](https://muse.ai).
 It registers this PC as a Muse "device", so Muse can read and edit files and run commands here while you work together in a conversation. The look and feel follow Claude Code / Codex CLI.
 
+https://github.com/user-attachments/assets/93eb5d68-4bc8-4f50-9d2e-21bcf1118a4c
+
 > **Unofficial.** muser is a personal project with no affiliation with Meta / Muse. It speaks the private protocol the Muse web app uses, so a change on Muse's side can break it at any time, and it may sit uneasily with the terms of service — use it at your own discretion.
 
 ## Requirements
@@ -67,6 +69,8 @@ Main slash commands: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `
 | `muser -c` / `--continue` | Resume this folder's latest conversation |
 | `muser resume [ID]` | Resume a conversation (list when no ID) |
 | `muser exec "instructions"` | Run once and print the final reply to stdout (anything needing approval is declined) |
+| `muser exec --json "…"` | The same as JSON Lines: a line per tool call and Muse-side step, the last line is the result (session id, reply, sources, weekly usage before/after); exit code 1 on failure |
+| `muser exec --session <ID> "…"` | Continue that conversation (the `session` of a `--json` result) |
 | `muser login` / `muser logout` | Sign in to / out of muse.ai |
 | `muser pc-login` | Register this PC as a device again |
 | `muser usage` | Muse usage and muser's own record |
@@ -104,6 +108,12 @@ Muse can hand independent subtasks to parallel agents (and you can too, with `/a
 
 Custom types live in `~/.muser/agents/*.md` or `<project>/.muser/agents/*.md` (Claude Code format; frontmatter: `name` `description` `tools` `readonly`).
 Agents use a lot of your Muse allowance, so cap them with `--max-agents` / `--max-agents-total`, the `MUSER_MAX_AGENTS` / `MUSER_MAX_AGENTS_TOTAL` environment variables, or `{"maxAgents": 4, "maxAgentsTotal": 8}` in `~/.muser/config.json`.
+
+## Skills
+
+muser reads skills — folders with a `SKILL.md` (frontmatter `name` and `description`, then instructions) — from the project's `.muser/skills` and `.claude/skills`, and from `~/.muser/skills`, `~/.claude/skills`, `~/.codex/skills` and `~/.agents/skills`. Skills you already use with Claude Code or Codex work as they are; muser never writes to those folders.
+
+Muse sees only each skill's name and a short description, and reads a skill with the `skill.read` command when it needs it. `/skills` turns skills (or whole sources) on and off; `/skill <name> <request>` asks Muse to use one. Every enabled skill adds a line to a new conversation's first message, so turn off the ones you do not need.
 
 ## MCP
 

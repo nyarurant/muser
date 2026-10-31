@@ -18,7 +18,7 @@ const {t} = require('../i18n.js');
 const h = React.createElement;
 const ACCENT = '#b4a0ff', DIM = '#5f5f69', GRAY = '#8c8c96';
 const SPIN = ['✻', '✽', '✶', '✳', '✢', '·', '✢', '✳', '✶', '✽'];
-const TITLES = {'shell.output': 'Output', 'shell.kill': 'Kill', 'shell.list': 'Shells', 'code.read': 'Read', 'code.grep': 'Search', 'code.glob': 'Glob', 'code.edit': 'Update', 'code.write': 'Write', 'code.apply_patch': 'Patch', 'todo.write': 'Todo'};
+const TITLES = {'shell.output': 'Output', 'shell.kill': 'Kill', 'shell.list': 'Shells', 'code.read': 'Read', 'code.grep': 'Search', 'code.glob': 'Glob', 'code.edit': 'Update', 'code.write': 'Write', 'code.apply_patch': 'Patch', 'todo.write': 'Todo', 'skill.read': 'Skill'};
 const title = call => call.user ? '! ' + (call.params?.shell === 'cmd' ? 'Cmd' : 'PowerShell') : call.kind === 'agent' ? (call.command === 'agent.spawn' ? 'Agent' : 'Wait') : call.kind === 'mcp' ? 'MCP' : call.command === 'system.run' ? (call.params?.shell === 'cmd' ? 'Cmd' : 'PowerShell') : call.command === 'code.write' && call.view?.created ? 'Create' : TITLES[call.command] || call.command;
 const elapsed = ms => { const s = Math.floor(ms / 1000); return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's'; };
 const T = (props, ...kids) => h(Text, props, ...kids);
@@ -174,18 +174,27 @@ function Approval({a, ctrl, W}) {
       ...a.options.map((o, i) => h(Line, {key: 'o' + i}, i === a.index ? c.accent('❯ ') + c.bold((i + 1) + '. ' + o.label) : '  ' + (i + 1) + '. ' + o.label))),
     h(Text, {color: DIM}, t('  ↑↓ で選んで enter · 1-3 · esc で断る')));
 }
+const MENU_ROWS = 12;
 function Menu({m, W}) {
   return h(Box, {flexDirection: 'column', marginTop: 1},
     h(Box, {flexDirection: 'column', borderStyle: 'round', borderColor: ACCENT, paddingX: 1, width: W},
       h(Line, null, c.accent(c.bold(m.title)) + (m.hint ? c.faint('   ' + m.hint) : '')),
       h(Text, null, ' '),
-      // The label column fits the longest label (English ones run longer), within limits.
-      ...((labelW => m.options.map((o, i) => {
-        const on = i === m.index, mark = o.mark || o.value === m.current ? c.green(' ✓') : '';
-        const label = (i + 1) + '. ' + o.label, col = o.danger ? c.red : c.text;
-        return h(Box, {key: i}, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {width: labelW, flexShrink: 0}, h(Line, null, (on ? c.bold(col(label)) : col(label)) + mark)),
-          h(Box, {flexShrink: 1}, h(Text, {color: on ? GRAY : DIM, wrap: 'truncate-end'}, o.desc || '')));
-      }))(Math.min(Math.floor(W * 0.45), Math.max(28, ...m.options.map((o, i) => width((i + 1) + '. ' + o.label) + 4)))))),
+      // The label column fits the longest label (English ones run longer), within limits. Long
+      // lists (/skills) show a window of MENU_ROWS around the cursor, so the box fits the screen.
+      ...((labelW => {
+        const n = m.options.length, start = n <= MENU_ROWS ? 0 : Math.max(0, Math.min(m.index - Math.floor(MENU_ROWS / 2), n - MENU_ROWS)), end = Math.min(n, start + MENU_ROWS);
+        return [
+          ...(start > 0 ? [h(Text, {key: 'up', color: DIM}, '  ' + t('↑ ほか {n} 件', {n: start}))] : []),
+          ...m.options.slice(start, end).map((o, j) => {
+            const i = start + j, on = i === m.index, mark = o.mark || o.value === m.current ? c.green(' ✓') : '';
+            const label = (i + 1) + '. ' + o.label, col = o.danger ? c.red : c.text;
+            return h(Box, {key: i}, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {width: labelW, flexShrink: 0}, h(Line, null, (on ? c.bold(col(label)) : col(label)) + mark)),
+              h(Box, {flexShrink: 1}, h(Text, {color: on ? GRAY : DIM, wrap: 'truncate-end'}, o.desc || '')));
+          }),
+          ...(end < n ? [h(Text, {key: 'down', color: DIM}, '  ' + t('↓ ほか {n} 件', {n: n - end}))] : []),
+        ];
+      })(Math.min(Math.floor(W * 0.45), Math.max(28, ...m.options.map((o, i) => width((i + 1) + '. ' + o.label) + 4)))))),
     h(Text, {color: DIM}, t('  ↑↓ で選んで enter · 数字 · esc で閉じる')));
 }
 // Wraps the buffer by display cells so the caret position is exact.

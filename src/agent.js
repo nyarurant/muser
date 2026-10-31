@@ -78,6 +78,9 @@ function preamble(cwd, mcpNames, {tag, by, type, typeName, limits} = {}) {
     'Working directory: ' + cwd + ' (relative paths resolve there). OS: Windows. Today: ' + new Date().toISOString().slice(0, 10) + '.',
     'Read a file before editing it. Prefer code.edit / code.apply_patch over rewriting files. Use todo.write for multi-step work.',
     'Before saying a change is done, verify it at the layer the user will see: run the tests, and for UI changes run the project\'s UI / e2e tests when it has them (see its docs), adding one when practical. Say what you verified and what you did not.',
+    'Write and edit files only with code.write / code.edit / code.apply_patch, not with PowerShell (Set-Content, Out-File, Get-Content piped into a write): this PC runs Windows PowerShell 5.1, which has corrupted UTF-8 files before. A tool result with a "warning" field needs fixing before you go on.',
+    'Before reporting a change as done, read your whole diff (git diff) and re-read every file you wrote, then say what you verified and what you did not.',
+    'Change what was asked and nothing more. If a change would make the program refuse, ask about, hide, cap or drop something it handled before, say what it costs and ask first.',
     'The user may decline a command; then do not retry it, ask or adapt. Keep replies short; the terminal renders Markdown.',
     'This terminal cannot render embedded widgets: never emit tokens like [[hatch_widget:...]], [[hatch_letter:...]] or option-widget markup. Present choices as plain numbered text lists.',
   ];
@@ -91,6 +94,7 @@ function preamble(cwd, mcpNames, {tag, by, type, typeName, limits} = {}) {
     lines.push('For independent subtasks you can run ' + agentLimitText(limits || {concurrent: MAX_AGENTS, perTurn: 0}) + ': agent.spawn starts one in its own chat (type: ' + Object.entries(types).map(([k, v]) => k + ' = ' + v.description).join('; ') + '), agent.wait collects results. Your own commands need no agent tag.');
   }
   if (mcpNames?.length) lines.push('MCP tools from the user' + "'" + 's MCP servers are also on this device as mcp.<server>.<tool> (servers: ' + mcpNames.join(', ') + ').');
+  lines.push(...require('./skills').preambleLines(cwd));
   for (const {file, text} of projectInstructions(cwd)) lines.push('', 'Project instructions from ' + file + ':', text.trim());
   return lines.join('\n');
 }

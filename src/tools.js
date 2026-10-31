@@ -174,6 +174,17 @@ function applyHunks(text, hunks, name) {
   return lines.join('\n');
 }
 
+// UTF-8 text read as Shift-JIS/CP932 and saved again (Windows PowerShell 5.1's default) is full of
+// kanji that real text hardly uses (the code points below: from kana, from — … ' ", from arrows and
+// ⏺, from 日本語). They are not written out here, or reading this file would trip the check. Reads and
+// writes that show them carry a warning, so Muse notices a mangled file instead of shipping it.
+const MOJIBAKE = /[\u7e3a\u7e67\u7e5d\u7ab6\u7aca\u7ae2\u8b4c\u8b5b\u96b1]/g;
+function encodingWarning(text) {
+  return (String(text || '').match(MOJIBAKE) || []).length >= 2
+    ? {warning: 'This text looks double-encoded (UTF-8 read as Shift-JIS/CP932: e.g. "' + String.fromCharCode(0x7ab6, 0x30fb) + '" for an em dash, "' + String.fromCharCode(0x8b4c, 0xff65, 0x8b5b, 0xff6c, 0x96b1, 0x30fb) + '" for the word Japanese written in kanji). Fix the file before going on; write files with code.write / code.edit, not PowerShell.'}
+    : {};
+}
+
 // ripgrep runs as a child process, never synchronously: a search over the whole home folder
 // (OneDrive placeholders download when read, and Defender scans each one) once froze muser —
 // the device link and the keyboard — for ten minutes. A search is stopped after RG_TIMEOUT_MS
@@ -265,7 +276,7 @@ const TOOLS = {
       const start = Math.max(1, p.offset | 0 || 1), n = Math.min(MAX_READ_LINES, Math.max(1, p.limit | 0 || MAX_READ_LINES));
       const shown = all.slice(start - 1, start - 1 + n).map((l, i) => String(start + i).padStart(6) + '\t' + (l.length > MAX_LINE ? l.slice(0, MAX_LINE) + '…' : l));
       ctx.readFiles.add(file); recordRead(ctx, file);
-      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(start - 1 + n < all.length ? {next_offset: start + n} : {})}, view: {lines: shown.length}};
+      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(start - 1 + n < all.length ? {next_offset: start + n} : {}), ...encodingWarning(text)}, view: {lines: shown.length}};
     },
   },
   'code.write': {
@@ -285,7 +296,7 @@ const TOOLS = {
       writeText(file, toLf(p.content), exists ? eol(rawBefore) : (os.EOL === '\r\n' && /\r\n/.test(p.content) ? '\r\n' : '\n'));
       ctx.readFiles.add(file); recordRead(ctx, file);
       const diff = lineDiff(before, toLf(p.content));
-      return {payload: {path: file, created: !exists, ...stats(diff)}, view: {diff, created: !exists}};
+      return {payload: {path: file, created: !exists, ...stats(diff), ...encodingWarning(p.content)}, view: {diff, created: !exists}};
     },
   },
   'code.edit': {
@@ -300,7 +311,7 @@ const TOOLS = {
       const e = computeEdit(p, ctx);
       writeText(e.file, e.after, eol(e.raw)); recordRead(ctx, e.file);
       const diff = lineDiff(e.text, e.after);
-      return {payload: {path: e.file, replacements: e.count, ...stats(diff)}, view: {diff}};
+      return {payload: {path: e.file, replacements: e.count, ...stats(diff), ...encodingWarning(e.after)}, view: {diff}};
     },
   },
   'code.apply_patch': {
@@ -335,7 +346,7 @@ const TOOLS = {
         if (c.op === 'delete') { ctx.readFiles.delete(c.file); forgetRead(ctx, c.file); }
         else { ctx.readFiles.add(c.dest || c.file); recordRead(ctx, c.dest || c.file); if (c.dest && c.dest !== c.file) { ctx.readFiles.delete(c.file); forgetRead(ctx, c.file); } }
       }
-      return {payload: {files: files.map(({diff, ...f}) => f)}, view: {files}};
+      return {payload: {files: files.map(({diff, ...f}) => f), ...encodingWarning(plan.map(c => c.after || '').join('\n'))}, view: {files}};
     },
   },
   'code.grep': {
@@ -426,6 +437,16 @@ const TOOLS = {
     def: {description: 'List background shells with their status.', required: {}, optional: {}},
     summary: () => '',
     run(p, ctx) { const all = ctx.shells ? ctx.shells.all() : []; return {payload: {shells: all.map(({tail, ...s}) => s)}, view: {count: all.length}}; },
+  },
+  'skill.read': {
+    kind: 'read',
+    def: {description: 'Read one of the user\'s skills (listed in the session preamble): its SKILL.md and the list of its files, or with path one file inside the skill folder. Read a skill before following it.',
+      required: {name: {type: 'string', description: 'Skill name from the list.'}}, optional: {path: {type: 'string', description: 'A file inside the skill folder, relative to it (e.g. references/guide.md).'}}},
+    summary: p => String(p.name || '') + (p.path ? ' ' + p.path : ''),
+    run(p, ctx) {
+      const r = require('./skills').read(ctx.cwd, p);
+      return {payload: r, view: {name: r.name, path: r.path || '', lines: String(r.content || '').split('\n').length}};
+    },
   },
   'todo.write': {
     // 'read': it only updates muser's own task list on screen and touches nothing on the PC.

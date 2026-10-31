@@ -14,7 +14,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {t} = require('./i18n');
 
-const READ_TOOLS = ['code.read', 'code.grep', 'code.glob', 'system.run', 'todo.write', 'mcp.*'];
+const READ_TOOLS = ['code.read', 'code.grep', 'code.glob', 'skill.read', 'system.run', 'todo.write', 'mcp.*'];
 const BUILTIN = {
   general: {description: '何でもやる（既定）', readOnly: false, tools: null,
     prompt: 'You are a general-purpose agent. Complete the task end to end.'},

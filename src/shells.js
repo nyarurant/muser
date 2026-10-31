@@ -7,11 +7,17 @@ const {EventEmitter} = require('node:events');
 
 const MAX_BUFFER = 1024 * 1024, MAX_SHELLS = 8;
 
+// Windows PowerShell 5.1 reads and writes files in the ANSI code page by default (Shift-JIS on a
+// Japanese Windows): Get-Content of a UTF-8 file, written back, double-encodes it ("—" became
+// two kanji in a README). File cmdlets default to UTF-8 here (writes get a BOM, as 5.1's utf8 does).
+const PS_UTF8 = '[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;' +
+  ['Get-Content', 'Select-String', 'Set-Content', 'Add-Content', 'Out-File', 'Import-Csv', 'Export-Csv'].map(c => '$PSDefaultParameterValues["' + c + ':Encoding"]="UTF8";').join('');
+
 function launch(command, {shell, cwd}) {
   return shell === 'cmd'
     ? spawn('cmd.exe', ['/d', '/s', '/c', 'chcp 65001>nul & ' + command], {cwd, windowsHide: true, windowsVerbatimArguments: true})
     // -ExecutionPolicy Bypass for this process only, so npm.ps1 and friends run.
-    : spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '[Console]::OutputEncoding=[Text.Encoding]::UTF8;$OutputEncoding=[Text.Encoding]::UTF8;' + command], {cwd, windowsHide: true});
+    : spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', PS_UTF8 + command], {cwd, windowsHide: true});
 }
 function killTree(pid) { try { spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], {windowsHide: true}); } catch {} }
 

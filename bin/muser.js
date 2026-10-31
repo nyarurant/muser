@@ -12,6 +12,8 @@ const HELP_LINES = [
   '  muser -c, --continue      このフォルダーの直前の会話を再開',
   '  muser resume [ID]         会話を再開（ID なしで一覧）',
   '  muser exec "指示"         ヘッドレスで1回実行して、最後の返事を出力',
+  '    --json                  JSON Lines で出力（最後の行が結果。会話 ID・PC 操作・使用量の変化つき）',
+  '    --session <ID>          その会話の続きとして実行（--json の結果にある session）',
   '  muser login               muse.ai にログイン（Edge の窓が開きます）',
   '  muser pc-login            この PC の CLI を Muse の端末として登録',
   '  muser doctor              接続を確認',
@@ -30,7 +32,7 @@ const HELP_LINES = [
   '',
 ];
 
-const KNOWN_FLAGS = '--mode <m> / --cd <dir> / --max-agents <n> / --max-agents-total <n> / -c, --continue / -h, --help / -V, --version';
+const KNOWN_FLAGS = '--mode <m> / --cd <dir> / --max-agents <n> / --max-agents-total <n> / --json / --session <ID> / -c, --continue / -h, --help / -V, --version';
 function parse(argv) {
   const o = {_: [], mode: undefined, cwd: process.cwd()}; // mode: --mode, else the folder's remembered one
   for (let i = 0; i < argv.length; i++) {
@@ -45,6 +47,12 @@ function parse(argv) {
         if (!/^\d+$/.test(v)) throw new Error(t('{flag} には 0 以上の整数を指定してください（0 で無制限）。', {flag: a}));
         o[a === '--max-agents' ? 'maxAgents' : 'maxAgentsTotal'] = Number(argv[++i]);
       }
+    }
+    else if (a === '--json') o.json = true;
+    else if (a === '--session') {
+      const v = argv[i + 1];
+      if (v === undefined || v.startsWith('--')) throw new Error(t('{flag} には値が必要です。使い方: muser --help', {flag: a}));
+      o.resume = argv[++i];
     }
     else if (a === '-h' || a === '--help') o.help = true;
     else if (a === '-V' || a === '--version') o.version = true;
@@ -179,17 +187,51 @@ async function interactive(o, initial) {
 
 // Codex-style headless run: progress to stderr, final reply to stdout. Nothing interactive:
 // what the mode would ask about is declined, and Muse is told why.
+// --json: JSON Lines on stdout and nothing else, for scripts and other agents (like `codex exec
+// --json`): start, then a line per tool call and per Muse-side step, and last a result line
+// ({"type":"result","ok":…}). The session id it reports continues the chat with --session <id>.
 async function exec(o, prompt) {
-  if (!prompt) throw new Error(t('exec には指示が必要です。'));
-  const err = s => process.stderr.write(s + '\n');
-  const {agent} = await connect(o, s => err('· ' + s));
-  agent.approver = async call => { err(t('  ✗ 確認が必要なので断りました: {command} {summary}', {command: call.command, summary: call.summary || ''})); return {allow: false, reason: 'headless run; the user can allow this with --mode auto-edit or bypass'}; };
-  agent.on('tool-end', call => err((call.ok ? '  ✓ ' : '  ✗ ') + call.command + ' ' + String(call.summary || '').slice(0, 120)));
+  const json = !!o.json, t0 = Date.now();
+  const out = obj => process.stdout.write(JSON.stringify(obj) + '\n');
+  const err = s => { if (!json) process.stderr.write(s + '\n'); };
+  if (!prompt) {
+    if (json) { out({type: 'result', ok: false, error: t('exec には指示が必要です。')}); process.exitCode = 1; return; }
+    throw new Error(t('exec には指示が必要です。'));
+  }
+  const usage = require('../src/usage');
+  const planBefore = json ? usage.plan().catch(() => null) : null;
+  let agent;
+  try {
+    ({agent} = await connect(o, s => err('· ' + s)));
+  } catch (e) {
+    if (!json) throw e;
+    out({type: 'result', ok: false, error: e.message, duration_ms: Date.now() - t0}); process.exitCode = 1; return;
+  }
+  agent.approver = async call => {
+    err(t('  ✗ 確認が必要なので断りました: {command} {summary}', {command: call.command, summary: call.summary || ''}));
+    return {allow: false, reason: 'headless run; the user can allow this with --mode auto-edit or bypass'};
+  };
+  const tool = call => {
+    err((call.ok ? '  ✓ ' : '  ✗ ') + call.command + ' ' + String(call.summary || '').slice(0, 120));
+    if (json) out({type: 'tool', agent: call.agent || 'main', command: call.command, summary: call.summary || '', ok: !!call.ok, ...(call.ok ? {} : {error: String(call.error || ''), ...(call.declined ? {declined: true} : {})})});
+  };
+  agent.on('tool-end', tool);
+  agent.on('agent-tool', tool);
+  agent.on('muse-step', s => { if (json) for (const x of s.items || [s]) out({type: 'muse_step', title: x.title, ...(x.detail ? {detail: x.detail} : {}), ...(x.failed ? {failed: true} : {})}); });
+  if (json) out({type: 'start', session: agent.session.id, cwd: agent.cwd, mode: agent.mode});
+  let sources = [];
+  agent.on('turn-end', e => { if (e?.sources) sources = e.sources; });
   try {
     const reply = await agent.send(prompt);
     let text = reply.text;
     try { const {stripEmbeds} = await import('../src/ui/sanitize.mjs'); text = stripEmbeds(text); } catch {}
-    process.stdout.write(text.trim() + '\n');
+    if (!json) { process.stdout.write(text.trim() + '\n'); return; }
+    const [before, after] = await Promise.all([planBefore, usage.plan().catch(() => null)]);
+    out({type: 'result', ok: true, session: agent.session.id, reply: text.trim(), sources: sources.map(s => ({label: s.label, uri: s.uri})),
+      duration_ms: Date.now() - t0, ...(before || after ? {usage: {week_percent_before: before?.percentUsed ?? null, week_percent_after: after?.percentUsed ?? null}} : {})});
+  } catch (e) {
+    if (!json) throw e;
+    out({type: 'result', ok: false, session: agent.session.id, error: e.message, duration_ms: Date.now() - t0}); process.exitCode = 1;
   } finally { agent.close(); }
 }
 
