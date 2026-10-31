@@ -1,0 +1,49 @@
+{
+  "name": "muser-cli",
+  "version": "0.1.0",
+  "description": "Unofficial terminal coding agent for Muse (muse.ai): Muse works on your Windows PC through the CLI",
+  "license": "MIT",
+  "author": "nyarurant",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nyarurant/muser.git"
+  },
+  "homepage": "https://github.com/nyarurant/muser#readme",
+  "bugs": {
+    "url": "https://github.com/nyarurant/muser/issues"
+  },
+  "bin": {
+    "muser": "bin/muser.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": [
+    "win32"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check-syntax.mjs"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "keywords": [
+    "muse",
+    "muse.ai",
+    "cli",
+    "coding-agent",
+    "terminal",
+    "unofficial"
+  ],
+  "dependencies": {
+    "@clack/prompts": "^1.8.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ink": "^8.0.0",
+    "playwright-core": "^1.64.1",
+    "react": "^19.3.1",
+    "smol-toml": "^1.9.1",
+    "ws": "^8.18.0"
+  }
+}
