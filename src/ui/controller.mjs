@@ -185,12 +185,14 @@ export class Controller {
     let preview = null;
     if (call.demoPreview) preview = call.demoPreview;
     else if (tool.preview) { try { preview = tool.preview(call.params, this.agent.ctx); } catch (e) { preview = {error: e.message}; } }
-    const word = String(call.params?.command || '').trim().split(/\s+/)[0] || '';
+    // Commands with shell syntax, or programs that run anything (powershell, node …), get no
+    // "don't ask again": a remembered key must not cover more than the user saw (src/policy.js).
+    const key = call.kind === 'exec' ? alwaysKey('exec', call.params) : null, word = key ? key.slice('exec:'.length) : '';
     const options = call.kind === 'mcp'
       ? [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは {tool} を聞かない', {tool: call.mcp.tool}), allow: true, always: alwaysKey('mcp', call.params, call.command)}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}]
       : call.kind === 'edit'
       ? [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは編集を自動に（承認モード「編集は自動」）'), allow: true, autoEdit: true}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}]
-      : [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは {word} を聞かない', {word}), allow: true, always: alwaysKey('exec', call.params)}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}];
+      : [{label: t('はい'), allow: true}, ...(key ? [{label: t('はい、このフォルダーでは {word} を聞かない', {word}), allow: true, always: key}] : []), {label: t('いいえ（Muse に伝えることを入力）'), allow: false}];
     const targets = tool.target ? [].concat(tool.target(call.params, this.agent.ctx) || []) : [];
     const outside = targets.some(t => path.relative(this.agent.cwd, t).startsWith('..'));
     process.stdout.write('\x07');

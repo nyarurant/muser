@@ -265,7 +265,8 @@ class Agent extends EventEmitter {
     if (consumeToolCall(w.turn, this.maxToolCallsPerTurn)) return this.toolEnd(w, call, {ok: false, error: toolLimitMessage(this.maxToolCallsPerTurn)});
     try {
       const targets = [].concat(tool.target ? safe(() => tool.target(params, w.ctx)) || [] : []);
-      const verdict = decide({mode: this.modeFor(w), kind: tool.kind, command, params, outside: targets.some(t => !inside(this.cwd, t)), always: this.allowAlways});
+      const cwd = typeof params.cwd === 'string' && params.cwd.trim() ? path.resolve(w.ctx.cwd, params.cwd) : w.ctx.cwd;
+      const verdict = decide({mode: this.modeFor(w), kind: tool.kind, command, params, outside: targets.some(t => !inside(this.cwd, t)), targets, cwd, always: this.allowAlways});
       if (verdict === 'deny') return this.toolEnd(w, call, {ok: false, error: (w.type?.readOnly ? 'This ' + w.typeName + ' agent is read-only' : 'Not allowed in ' + this.mode + ' mode (read-only)') + '. Explain what you would change instead.'});
       if (verdict === 'ask') { const no = await this.ask(w, call); if (no) return no; }
       const r = await tool.run(params, w.ctx, w.turn?.controller.signal, chunk => this.emit('tool-output', {id, agent: w.tag, chunk}));

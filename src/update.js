@@ -36,14 +36,20 @@ async function latest({timeoutMs = 5000} = {}) {
   return String((await r.json()).version || '');
 }
 
-// npm is a .cmd on Windows, which Node no longer spawns without a shell.
-function install() {
+// npm is a .cmd on Windows, which Node no longer spawns without a shell. A stuck npm (network,
+// a lock) is stopped after timeoutMs, so /update can be tried again.
+function install({timeoutMs = 5 * 60 * 1000, command = 'npm install -g ' + NAME + '@latest'} = {}) {
   return new Promise(resolve => {
-    let out = '';
-    const child = spawn('cmd.exe', ['/d', '/s', '/c', 'npm install -g ' + NAME + '@latest'], {windowsHide: true});
+    let out = '', done = false;
+    const child = spawn('cmd.exe', ['/d', '/s', '/c', command], {windowsHide: true});
+    const finish = r => { if (done) return; done = true; clearTimeout(timer); resolve(r); };
+    const timer = setTimeout(() => {
+      try { require('node:child_process').spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], {windowsHide: true}); } catch {}
+      finish({ok: false, output: (out.trim() + '\nnpm did not finish in ' + Math.round(timeoutMs / 1000) + ' s and was stopped.').trim()});
+    }, timeoutMs);
     child.stdout.on('data', d => { out += d; }); child.stderr.on('data', d => { out += d; });
-    child.on('error', e => resolve({ok: false, output: e.message}));
-    child.on('close', code => resolve({ok: code === 0, output: out.trim()}));
+    child.on('error', e => finish({ok: false, output: e.message}));
+    child.on('close', code => finish({ok: code === 0, output: out.trim()}));
   });
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "muser-cli",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Unofficial terminal coding agent for Muse (muse.ai): Muse works on your Windows PC through the CLI",
   "license": "MIT",
   "author": "nyarurant",

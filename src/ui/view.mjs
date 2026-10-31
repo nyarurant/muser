@@ -172,7 +172,7 @@ function Approval({a, ctrl, W}) {
       h(Box, {flexDirection: 'column', marginY: 1}, rows),
       h(Text, {bold: true}, call.kind === 'exec' || call.kind === 'mcp' ? t('実行していい？') : t('この変更をしていい？')),
       ...a.options.map((o, i) => h(Line, {key: 'o' + i}, i === a.index ? c.accent('❯ ') + c.bold((i + 1) + '. ' + o.label) : '  ' + (i + 1) + '. ' + o.label))),
-    h(Text, {color: DIM}, t('  ↑↓ で選んで enter · 1-3 · esc で断る')));
+    h(Text, {color: DIM}, t('  ↑↓ で選んで enter · 1-{n} · esc で断る', {n: a.options.length})));
 }
 const MENU_ROWS = 12;
 function Menu({m, W}) {

@@ -61,3 +61,9 @@ test('at start the footer says it is checking, then shows a newer version or not
   await ctrl.checkUpdate();
   assert.equal(ctrl.get().update, null, 'a failed check just clears the footer');
 });
+
+test('a stuck npm is stopped, so /update can be tried again', async () => {
+  const r = await update.install({timeoutMs: 1000, command: 'ping -n 30 127.0.0.1 >nul'});
+  assert.equal(r.ok, false);
+  assert.match(r.output, /did not finish in 1 s/);
+});

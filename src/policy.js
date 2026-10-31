@@ -223,34 +223,87 @@ function readOnlyCommand(command) {
   if (head === 'python' || head === 'python3') return tokens.length === 2 && (tokens[1] === '--version' || tokens[1] === '-V');
   return false;
 }
+// Shell syntax that chains, redirects or runs more: a remembered "npm test" let
+// `npm test && Remove-Item -Recurse …` through (2026-11-01), so such commands are never remembered.
+const SHELL_SYNTAX = /[|;&<>`$(){}\r\n]/;
+// Programs that run whatever their arguments say; remembering one would remember everything.
+const RUNS_ANYTHING = new Set(['powershell', 'pwsh', 'cmd', 'bash', 'sh', 'wsl', 'iex', 'invoke-expression', 'start-process', 'saps', 'start', 'node', 'deno', 'bun', 'python', 'python3', 'py', 'ruby', 'perl', 'cscript', 'wscript', 'mshta', 'rundll32', 'regsvr32', 'npx', 'pnpx', 'bunx', 'call']);
+
+// The "don't ask again" key, or null when this call must not be remembered.
 function alwaysKey(kind, params, command) {
   if (kind === 'edit') return 'edit';
   if (kind === 'mcp') return 'mcp:' + command;
   if (kind === 'exec') {
-    const parts = String(params?.command || command || '').trim().split(/\s+/).filter(Boolean);
-    const first = (parts[0] || '').toLowerCase();
-    if (!first) return 'exec:';
-    // Include a plain subcommand word, so remembering `npm ls` / `git status`
-    // never also remembers `npm exec` / `git push`. Flags, paths, values and
-    // anything with punctuation are not subcommands and do not narrow the key.
-    const second = parts[1] || '';
-    return /^[a-z][a-z0-9_-]*$/i.test(second) ? `exec:${first} ${second.toLowerCase()}` : `exec:${first}`;
+    const text = String(params?.command || command || '').trim();
+    if (!text || SHELL_SYNTAX.test(text)) return null;
+    const parts = text.split(/\s+/);
+    const first = parts[0].toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/, '');
+    if (RUNS_ANYTHING.has(first)) return null;
+    // The program and a plain subcommand word (`npm ls`, `git status`), so remembering one never
+    // remembers `npm exec` / `git push`. With a flag or path in its place (`git -C x push`), the
+    // subcommand cannot be told, and the call is not remembered at all.
+    if (parts.length === 1) return 'exec:' + first;
+    return /^[a-z][a-z0-9_-]*$/i.test(parts[1]) ? `exec:${first} ${parts[1].toLowerCase()}` : null;
   }
   return null;
 }
 
-function decide({mode, kind, command, params, outside, always = new Set()}) {
+// Repository config can make a read-only git command run a program: core.fsmonitor on `git status`
+// ran a planted command (2026-11-01), and so can external diff drivers, textconv, filters and
+// pagers. Before a git read goes through unasked, the repo's own config (with its includes) is
+// checked; the user's global config is theirs and trusted.
+const GIT_RUNS = /^(core\.(fsmonitor|pager|editor|sshcommand|hookspath|gitproxy|askpass|alternaterefscommand)|diff\.external|(diff|merge)\.[^=]*\.(command|textconv|driver)|filter\.[^=]*\.(clean|smudge|process)|pager\.|sequence\.editor|gpg\.|uploadpack\.|credential\.|include\.|includeif\.)/i;
+function gitConfigRuns(configText) {
+  for (const line of String(configText || '').split(/\r?\n/)) {
+    const eq = line.indexOf('='), key = (eq < 0 ? line : line.slice(0, eq)).trim(), value = eq < 0 ? '' : line.slice(eq + 1).trim();
+    if (!key || !GIT_RUNS.test(key)) continue;
+    if (/^core\.fsmonitor$/i.test(key) && /^(true|false|0|1|yes|no|on|off)?$/i.test(value)) continue; // the built-in daemon, or off
+    return true;
+  }
+  return false;
+}
+function repoGitConfig(command, cwd) {
+  // Same -C / --git-dir / --work-tree as the command, so it is the same repository.
+  const tokens = tokensOf(command) || [], pre = [];
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === '-C' || t === '--git-dir' || t === '--work-tree' || t === '--namespace') { pre.push(t, tokens[++i]); continue; }
+    if (/^--(git-dir|work-tree|namespace)=/.test(t)) { pre.push(t); continue; }
+    if (t.startsWith('-')) continue;
+    break;
+  }
+  const r = require('node:child_process').spawnSync('git', [...pre, 'config', '--local', '--includes', '--list'], {cwd, encoding: 'utf8', windowsHide: true, timeout: 5000});
+  if (r.error) return null;
+  return r.status === 0 || r.status === 1 ? r.stdout : null; // 1: no repo config (or not a repo)
+}
+
+// muser's own settings: writing them could switch on bypass for a folder or add an MCP server
+// that runs a program. Outside bypass such a write always asks, even in auto-edit.
+function muserSettingsPath(file) {
+  const os = require('node:os'), path = require('node:path');
+  const roots = [path.join(os.homedir(), '.muser'), path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser')];
+  const f = path.resolve(String(file || '')).toLowerCase();
+  return roots.some(r => { const rel = path.relative(r.toLowerCase(), f); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); });
+}
+
+// gitConfig(command, cwd) -> the repo's config text (null when it cannot be read); injectable for tests.
+function decide({mode, kind, command, params, outside, always = new Set(), cwd = process.cwd(), targets = [], gitConfig = repoGitConfig}) {
   if (kind === 'read') return 'allow';
   if (mode === 'bypass') return 'allow';
   // MCP tools not annotated read-only: ask (plan mode refuses), unless allowed for the session.
   if (kind === 'mcp') return mode === 'plan' ? 'deny' : always.has(alwaysKey('mcp', params, command)) ? 'allow' : 'ask';
-  const ro = kind === 'exec' && readOnlyCommand(params?.command);
+  let ro = kind === 'exec' && readOnlyCommand(params?.command);
+  if (ro && /^git\b/i.test(String(params.command).trim())) {
+    const config = gitConfig(params.command, cwd);
+    if (config === null || gitConfigRuns(config)) ro = false;
+  }
   if (mode === 'plan') return ro ? 'allow' : 'deny';
   if (ro) return 'allow';
-  if (kind === 'edit' && outside) return 'ask';
-  if (always.has(alwaysKey(kind, params))) return 'allow';
+  if (kind === 'edit' && (outside || targets.some(muserSettingsPath))) return 'ask';
+  const key = alwaysKey(kind, params);
+  if (key && always.has(key)) return 'allow';
   if (kind === 'edit' && mode === 'auto-edit') return 'allow';
   return 'ask';
 }
 
-module.exports = {MODES, LABELS, decide, alwaysKey, readOnlyCommand};
+module.exports = {MODES, LABELS, decide, alwaysKey, readOnlyCommand, gitConfigRuns, muserSettingsPath};

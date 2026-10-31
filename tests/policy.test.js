@@ -128,11 +128,11 @@ test('alwaysKey narrows exec by a plain subcommand word', () => {
   assert.equal(alwaysKey('exec', {command: 'git commit -m x'}), 'exec:git commit');
   assert.notEqual(alwaysKey('exec', {command: 'git status'}), alwaysKey('exec', {command: 'git push'}));
   // A flag or a value is not a subcommand, so the key stays at the program.
-  assert.equal(alwaysKey('exec', {command: 'node --version'}), 'exec:node');
-  assert.equal(alwaysKey('exec', {command: 'git -C C:/repo status'}), 'exec:git');
+  assert.equal(alwaysKey('exec', {command: 'node --version'}), null, 'node runs anything: never remembered');
+  assert.equal(alwaysKey('exec', {command: 'git -C C:/repo status'}), null, 'subcommand not where it can be told');
   assert.equal(alwaysKey('exec', {command: 'npm'}), 'exec:npm');
   assert.equal(alwaysKey('exec', {command: '  NPM   LS  '}), 'exec:npm ls');
-  assert.equal(alwaysKey('exec', {command: ''}), 'exec:');
+  assert.equal(alwaysKey('exec', {command: ''}), null);
   assert.equal(alwaysKey('read', {command: 'npm ls'}), null);
 });
 
@@ -177,4 +177,52 @@ test('decide: other modes keep their shape', () => {
   assert.equal(decide({mode: 'default', kind: 'read', params: {}}), 'allow');
   assert.equal(decide({mode: 'default', kind: 'mcp', command: 'tool_x', params: {}}), 'ask');
   assert.equal(decide({mode: 'default', kind: 'mcp', command: 'tool_x', params: {}, always: new Set(['mcp:tool_x'])}), 'allow');
+});
+
+// 2026-11-01: a remembered "npm test" let `npm test && Remove-Item -Recurse …` run unasked, and a
+// remembered "powershell -File x" let any `powershell -Command …` run.
+test('remembered commands never cover chained commands or programs that run anything', () => {
+  for (const c of ['npm test && Remove-Item -Recurse -Force C:/x', 'npm test; del x', 'npm test | Out-File x', 'npm test > x', 'git status $(evil)', 'npm test `n evil'])
+    assert.equal(alwaysKey('exec', {command: c}), null, c);
+  for (const c of ['powershell -Command x', 'powershell Remove-Item x', 'pwsh -c x', 'cmd /c del x', 'node -e x', 'node build', 'python -c x', 'npx something', 'Start-Process x', 'iex x'])
+    assert.equal(alwaysKey('exec', {command: c}), null, c);
+  const always = new Set(['exec:npm test', 'exec:powershell', 'exec:git']); // the last two: keys older versions could save
+  const d = command => decide({mode: 'default', kind: 'exec', params: {command}, always, gitConfig: () => ''});
+  assert.equal(d('npm test'), 'allow');
+  assert.equal(d('npm test && Remove-Item -Recurse -Force C:/x'), 'ask');
+  assert.equal(d('powershell -Command Remove-Item -Recurse C:/x'), 'ask');
+  assert.equal(d('git -C . push --force'), 'ask');
+});
+
+test('a git read runs unasked only when the repo config cannot make it run a program', () => {
+  const d = (mode, config) => decide({mode, kind: 'exec', params: {command: 'git status'}, gitConfig: () => config});
+  assert.equal(d('default', ''), 'allow');
+  assert.equal(d('default', 'core.repositoryformatversion=0\ncore.fsmonitor=true\nremote.origin.url=x'), 'allow', 'the built-in fsmonitor daemon is fine');
+  for (const bad of ['core.fsmonitor=echo pwned > x', 'diff.external=evil.exe', 'diff.x.textconv=evil', 'filter.lfs.process=evil', 'core.pager=evil', 'include.path=../evil'])
+    assert.equal(d('default', bad), 'ask', bad);
+  assert.equal(d('plan', 'core.fsmonitor=evil'), 'deny');
+  assert.equal(d('default', null), 'ask', 'config that cannot be read is not trusted');
+});
+
+test('a planted core.fsmonitor in a real repo makes git status ask', t => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), {execFileSync} = require('node:child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fsmon-')); t.after(() => fs.rmSync(dir, {recursive: true, force: true}));
+  execFileSync('git', ['init', '-q', dir]);
+  assert.equal(decide({mode: 'default', kind: 'exec', params: {command: 'git status'}, cwd: dir}), 'allow');
+  execFileSync('git', ['-C', dir, 'config', 'core.fsmonitor', 'echo pwned > pwned.txt']);
+  assert.equal(decide({mode: 'default', kind: 'exec', params: {command: 'git status'}, cwd: dir}), 'ask');
+  assert.equal(decide({mode: 'plan', kind: 'exec', params: {command: 'git status'}, cwd: dir}), 'deny');
+  assert.equal(fs.existsSync(path.join(dir, 'pwned.txt')), false, 'checking ran nothing');
+});
+
+test("writes to muser's own settings ask, even in auto-edit; bypass is the user's choice", () => {
+  const os = require('node:os'), path = require('node:path');
+  const perms = path.join(os.homedir(), '.muser', 'permissions.json'), mcp = path.join(os.homedir(), '.muser', 'mcp.json');
+  const e = (mode, file) => decide({mode, kind: 'edit', params: {path: file}, outside: false, targets: [file]});
+  assert.equal(e('auto-edit', perms), 'ask');
+  assert.equal(e('auto-edit', mcp), 'ask');
+  assert.equal(e('default', perms), 'ask');
+  assert.equal(e('bypass', perms), 'allow');
+  assert.equal(e('auto-edit', path.join(os.homedir(), 'project', 'a.js')), 'allow');
+  assert.equal(decide({mode: 'auto-edit', kind: 'edit', params: {}, outside: false, targets: [perms], always: new Set(['edit'])}), 'ask', '"edit" remembered does not cover it');
 });

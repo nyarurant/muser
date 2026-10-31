@@ -180,7 +180,7 @@ module.exports = {
   ' コマンド': ' command',
   '実行していい？': 'Run this?',
   'この変更をしていい？': 'Make this change?',
-  '  ↑↓ で選んで enter · 1-3 · esc で断る': '  ↑↓ to choose, enter · 1-3 · esc to decline',
+  '  ↑↓ で選んで enter · 1-{n} · esc で断る': '  ↑↓ to choose, enter · 1-{n} · esc to decline',
   '  ↑↓ で選んで enter · 数字 · esc で閉じる': '  ↑↓ to choose, enter · number · esc to close',
   '画像 {n}': 'Image {n}',
   '空の入力で backspace → 外す': 'Backspace on empty input detaches',
