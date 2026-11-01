@@ -300,7 +300,8 @@ function Live({s, ctrl, W}) {
 
 function Root({ctrl}) {
   const s = useSyncExternalStore(ctrl.subscribe, ctrl.get);
-  const {columns} = useWindowSize(), W = Math.max(40, (columns || 100) - 1);
+  const {columns, rows} = useWindowSize(), W = Math.max(40, (columns || 100) - 1);
+  useEffect(() => { ctrl.trace('size ' + columns + 'x' + rows); }, [columns, rows]);
   useInput((input, key) => ctrl.key(input, key));
   usePaste(text => ctrl.paste(text));
   useEffect(() => { if (s.clearCount) process.stdout.write('\x1b[2J\x1b[3J\x1b[H'); }, [s.clearCount]);
@@ -319,6 +320,21 @@ export function run({agent, museName, version, initial, connect}) {
     if (id) process.stdout.write(c.faint(t('再開するには: muser resume {id}', {id})) + '\n');
     agent.close(); setTimeout(() => process.exit(0), 50);
   }});
+  // An exception nothing caught ends muser: leave a report (src/crash.js) and the way back into the
+  // chat instead of only a stack trace.
+  const crashed = e => {
+    let file = '';
+    try { file = require('../crash.js').write({version, error: e, state: ctrl.s, trail: ctrl.trail}); } catch {}
+    try { app?.unmount(); } catch {}
+    const id = agent.session.turns && agent.client.status !== 'demo' ? agent.session.id.slice(0, 8) : '';
+    process.stderr.write('\n' + String(e?.stack || e) + '\n\n' + t('muser が予期しないエラーで止まりました。') + '\n' +
+      (file ? t('記録を保存しました（入力や会話の中身は含みません）: {file}', {file}) + '\n' : '') +
+      (id ? t('続きから再開するには: muser resume {id}', {id}) + '\n' : ''));
+    try { agent.close(); } catch {}
+    process.exit(1);
+  };
+  process.on('uncaughtException', crashed);
+  process.on('unhandledRejection', crashed);
   // Start on a clean screen, like Claude Code: the shell prompt and the onboarding output go.
   // The clear goes into Ink's first write, inside its synchronized update (ESC[?2026h … l), so
   // the splash turns into the first frame at once. Written on its own it came ~33 ms (one

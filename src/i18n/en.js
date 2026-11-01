@@ -491,4 +491,7 @@ module.exports = {
   'muser を {version} に更新しました。いったん終了して muser -c で開き直すと、この会話の続きから新しい版で使えます。': 'Updated muser to {version}. Quit and reopen it with muser -c to continue this chat on the new version.',
   '最新版': 'the latest version',
   '更新を確認中…': 'Checking for updates…',
+  'muser が予期しないエラーで止まりました。': 'muser stopped on an unexpected error.',
+  '記録を保存しました（入力や会話の中身は含みません）: {file}': 'A report was saved (it holds nothing you typed or Muse said): {file}',
+  '続きから再開するには: muser resume {id}': 'To continue where you were: muser resume {id}',
 };

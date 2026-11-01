@@ -67,7 +67,9 @@ export class Controller {
   // ---- store ----
   subscribe = fn => { this.listeners.add(fn); return () => this.listeners.delete(fn); };
   get = () => this.s;
-  set(patch) { this.s = {...this.s, ...patch}; for (const fn of this.listeners) fn(); }
+  // trail: which state keys changed, and when (no content), for the crash report (src/crash.js).
+  set(patch) { this.s = {...this.s, ...patch}; this.trace(Object.keys(patch).join(',')); for (const fn of this.listeners) fn(); }
+  trace(what) { (this.trail ||= []).push([Date.now(), what]); if (this.trail.length > 400) this.trail.splice(0, 100); }
   // Never trim this list: Ink's <Static> remembers how many items it has printed (items.length)
   // and prints only items.slice(that), so a capped list stops growing and nothing new appears.
   push(...entries) { this.set({entries: [...this.s.entries, ...entries.map(e => ({id: nextId++, ...e}))]}); }
