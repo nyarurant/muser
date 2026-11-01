@@ -4,6 +4,7 @@
 // stops them with shell.kill; muser stops all of them when it exits.
 const {spawn, spawnSync} = require('node:child_process');
 const {EventEmitter} = require('node:events');
+const {frames} = require('./tui/term');
 
 const MAX_BUFFER = 1024 * 1024, MAX_SHELLS = 8;
 
@@ -27,6 +28,9 @@ class Shells extends EventEmitter {
     const running = [...this.list.values()].filter(s => s.running).length;
     if (running >= MAX_SHELLS) throw new Error('Too many background shells (' + MAX_SHELLS + '); stop one with shell.kill first');
     const id = 'bg' + this.next++, child = launch(command, {shell, cwd});
+    // No tool types into a background shell either: a command that asks for input (set /p, a
+    // prompt) waited for it forever, "running" with nothing more to show.
+    try { child.stdin.end(); } catch {}
     // `dropped` counts bytes trimmed from the front, so read offsets stay absolute.
     // `read` is the legacy shared ('main') cursor; `reads` holds one cursor per caller id.
     const s = {id, command, cwd, title: title || command, pid: child.pid, started: Date.now(), ended: 0, running: true, exit: null, out: '', dropped: 0, read: 0, reads: new Map([['main', 0]]), child};
@@ -35,6 +39,8 @@ class Shells extends EventEmitter {
       if (s.out.length > MAX_BUFFER) { const cut = s.out.length - MAX_BUFFER; s.out = s.out.slice(cut); s.dropped += cut; }
       this.emit('change', this.snapshot(s));
     };
+    // Decoded as a stream: a character split between two chunks came out as U+FFFD twice.
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', add); child.stderr.on('data', add);
     child.on('close', code => { Object.assign(s, {running: false, exit: code, ended: Date.now()}); this.emit('change', this.snapshot(s)); });
     child.on('error', e => { add('[error] ' + e.message + '\n'); Object.assign(s, {running: false, exit: -1, ended: Date.now()}); this.emit('change', this.snapshot(s)); });
@@ -61,7 +67,7 @@ class Shells extends EventEmitter {
   }
   kill(id) { const s = this.get(id); if (s.running) killTree(s.pid); return {id: s.id, killed: s.running}; }
   killAll() { for (const s of this.list.values()) if (s.running) killTree(s.pid); }
-  snapshot(s) { return {id: s.id, title: s.title, command: s.command, running: s.running, exit: s.exit, started: s.started, ended: s.ended, tail: s.out.trimEnd().split('\n').slice(-3)}; }
+  snapshot(s) { return {id: s.id, title: s.title, command: s.command, running: s.running, exit: s.exit, started: s.started, ended: s.ended, tail: frames(s.out.slice(-8000)).trimEnd().split('\n').slice(-3)}; }
   all() { return [...this.list.values()].map(s => this.snapshot(s)); }
 }
 
@@ -70,6 +76,10 @@ class Shells extends EventEmitter {
 // result instead of hanging forever on a pipe a grandchild is holding open.
 function runOnce(command, {shell, cwd, timeout, signal, onOutput, maxOut, clip}) {
   const child = launch(command, {shell, cwd});
+  // Nobody types into a one-shot command: its stdin is closed at once, so a command that reads
+  // input (git shortlog without a revision, python's input(), a prompt) gets EOF instead of
+  // waiting out the whole timeout with no output (2026-11-01: 120 s of nothing).
+  try { child.stdin.end(); } catch {}
   return new Promise(resolve => {
     let stdout = '', stderr = '', killed = '', done = false, timer = null, forceTimer = null;
     const onAbort = () => kill('cancelled');
@@ -91,6 +101,8 @@ function runOnce(command, {shell, cwd, timeout, signal, onOutput, maxOut, clip})
       if (signal.aborted) kill('cancelled');
       else signal.addEventListener('abort', onAbort, {once: true});
     }
+    // Decoded as a stream: Japanese split between chunks came out as U+FFFD (10 in 160,000 characters).
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', d => { stdout += d; onOutput?.(String(d)); if (stdout.length > 4 * maxOut) stdout = clip(stdout, 2 * maxOut); });
     child.stderr.on('data', d => { stderr += d; onOutput?.(String(d)); if (stderr.length > 4 * maxOut) stderr = clip(stderr, 2 * maxOut); });
     child.on('close', code => finish({code, stdout, stderr, killed}));

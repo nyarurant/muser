@@ -17,7 +17,7 @@ function devCheckout(root = PKG_ROOT) { return fs.existsSync(path.join(root, '.g
 
 function enabled({env = process.env, configFile = path.join(os.homedir(), '.muser', 'config.json'), root = PKG_ROOT} = {}) {
   if (env.MUSER_NO_UPDATE_CHECK === '1') return false;
-  try { if (JSON.parse(fs.readFileSync(configFile, 'utf8'))?.updateCheck === false) return false; } catch {}
+  try { if (require('./config').readJson(configFile)?.updateCheck === false) return false; } catch {}
   return !devCheckout(root) || env.MUSER_UPDATE_CHECK === '1';
 }
 
@@ -47,6 +47,7 @@ function install({timeoutMs = 5 * 60 * 1000, command = 'npm install -g ' + NAME 
       try { require('node:child_process').spawnSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], {windowsHide: true}); } catch {}
       finish({ok: false, output: (out.trim() + '\nnpm did not finish in ' + Math.round(timeoutMs / 1000) + ' s and was stopped.').trim()});
     }, timeoutMs);
+    child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', d => { out += d; }); child.stderr.on('data', d => { out += d; });
     child.on('error', e => finish({ok: false, output: e.message}));
     child.on('close', code => finish({ok: code === 0, output: out.trim()}));

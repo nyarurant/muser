@@ -28,17 +28,40 @@ function turnsFromHistory(events) {
   return turns;
 }
 
+// Muse's history comes 50 events a page, newest first; a few pages reach back far enough for
+// most chats without fetching a whole long one.
+const HISTORY_PAGES = 10;
+async function fetchHistory(client, id) {
+  let events = [], before, more = false;
+  for (let page = 0; page < HISTORY_PAGES; page++) {
+    const h = await client.history(id, before);
+    const batch = h?.chat_events || [];
+    events = batch.concat(events);
+    more = !!h?.has_more;
+    const seqs = batch.map(e => e.seq).filter(Number.isFinite);
+    if (!more || !seqs.length) break;
+    before = Math.min(...seqs);
+  }
+  return {events, more};
+}
+
 async function forResume(session, client) {
   const local = sessions.transcript(session.id);
   if (local.length >= (session.turns || 0) || !client?.history) return {turns: local, from: 'local'};
-  const history = await client.history(session.id);
-  const remote = turnsFromHistory(history?.chat_events);
+  const {events, more} = await fetchHistory(client, session.id);
+  const remote = turnsFromHistory(events);
   if (!remote.length) return {turns: local, from: 'local'};
-  // Keep the richer local record (tools, steps, todos) wherever the same user message is in both.
+  // Keep the richer local record (tools, steps, todos) wherever the same user message is in both,
+  // and the local turns Muse's pages did not reach. Writing only what Muse returned replaced a
+  // long local transcript with the last page or so of it (2026-11-01 audit).
   const pool = [...local];
   const merged = remote.map(t => { const i = pool.findIndex(l => l.user === t.user); return i < 0 ? t : pool.splice(i, 1)[0]; });
-  try { sessions.writeTranscript(session.id, merged); } catch {}
-  return {turns: merged, from: 'muse', partial: !!history?.has_more};
+  const oldest = merged.reduce((m, t) => Math.min(m, t.at || Infinity), Infinity);
+  // Without times on Muse's side, local turns count as older only when Muse's pages ran out first.
+  const older = oldest === Infinity ? (more ? pool : []) : pool.filter(l => (l.at || 0) < oldest);
+  const turns = [...older, ...merged];
+  if (turns.length >= local.length) { try { sessions.writeTranscript(session.id, turns); } catch {} }
+  return {turns, from: 'muse', partial: more && !older.length};
 }
 
 module.exports = {forResume, turnsFromHistory, userText};

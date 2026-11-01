@@ -8,6 +8,7 @@ const os = require('node:os');
 const crypto = require('node:crypto');
 const {spawn, spawnSync} = require('node:child_process');
 const {runOnce} = require('./shells');
+const {frames} = require('./tui/term');
 const {t} = require('./i18n');
 
 const MAX_READ_LINES = 2000, MAX_LINE = 2000, MAX_OUT = 60000;
@@ -15,8 +16,19 @@ const MAX_READ_BYTES = 10 * 1024 * 1024, MAX_GLOB_RESULTS = 2000;
 
 function resolve(ctx, p) {
   if (typeof p !== 'string' || !p || p.length > 4096 || p.includes('\0')) throw new Error('Invalid path');
-  return path.resolve(ctx.cwd, p);
+  // As a shell would take them: a path in quotes ("C:\my docs\a.txt") was looked up with its
+  // quotes, and ~ was a folder named "~".
+  let s = p.trim();
+  if (s.length > 1 && /^(["']).*\1$/.test(s)) s = s.slice(1, -1);
+  if (s === '~' || /^~[\\/]/.test(s)) s = path.join(os.homedir(), s.slice(1));
+  if (!s) throw new Error('Invalid path');
+  // The file system's own spelling of the part that exists: Windows ignores case, but the
+  // read-before-edit record compared strings, so a file read as SRC/APP.TS could not be edited as
+  // src/App.ts ("read it first").
+  return realOf(path.resolve(ctx.cwd, s));
 }
+// rg globs use '/' (a backslash escapes the next character there).
+function globSlashes(g) { return String(g ?? '').replace(/\\/g, '/'); }
 function inside(root, file) { const r = path.relative(root, file); return !r.startsWith('..') && !path.isAbsolute(r); }
 // ---- Sensitive-file guard (code.read / code.grep / code.glob and every read path below) ----
 // muser's coding tools must never read secrets back to the model: env files, private keys,
@@ -30,7 +42,17 @@ function isSensitivePath(p) {
   if (lower.some(s => s === '.ssh' || s === '.aws' || s === '.gnupg')) return true;
   if (base === '.netrc' || base === '_netrc') return true;
   if (base === 'web.enc') return true;
-  if (lower.includes('.muser') && base.endsWith('.enc')) return true;
+  // muser's own DPAPI files (~/.muser, %LOCALAPPDATA%\muser, the npm token in muser-release).
+  if (lower.some(s => s === '.muser' || s === 'muser' || s === 'muser-release') && base.endsWith('.enc')) return true;
+  // Tokens other tools keep in plain files: npm / yarn / pip, git's credential store, Codex,
+  // Claude Code, GitHub CLI, Docker, kubectl.
+  if (['.npmrc', '.yarnrc', '.yarnrc.yml', '.pypirc', '.git-credentials', '.credentials.json'].includes(base)) return true;
+  if (base === 'auth.json' && lower.includes('.codex')) return true;
+  if (base === 'hosts.yml' && lower.includes('github cli')) return true;
+  if (base === 'config.json' && lower.includes('.docker')) return true;
+  if (base === 'config' && lower.includes('.kube')) return true;
+  // Certificate and key stores.
+  if (/\.(p12|pfx|ppk|jks|keystore|kdbx)$/.test(base)) return true;
   if (/^\.env($|[^a-z])/.test(base) || base.startsWith('.env')) {
     if (/^\.env\.(example|sample)(\.|$)/.test(base) || base === '.env.example' || base === '.env.sample') return false;
     return true;
@@ -43,8 +65,21 @@ function isSensitivePath(p) {
   if (/^secrets?\.(json|ya?ml|toml|env|txt)$/.test(base)) return true;
   return false;
 }
+// Where a path really leads: junctions and symlinks resolved on the deepest part that exists (the
+// rest, not yet created, is kept as written). A junction inside the project that points at ~/.ssh
+// read a private key through 's/mykey' (2026-11-01), and the same trick took writes outside the
+// working folder past the "outside" check.
+function realOf(p) {
+  let cur = path.resolve(String(p)), rest = [];
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(cur), ...rest); } catch {}
+    const up = path.dirname(cur);
+    if (up === cur) return path.resolve(String(p));
+    rest.unshift(path.basename(cur)); cur = up;
+  }
+}
 function assertNotSensitive(file) {
-  if (isSensitivePath(file)) throw new Error(t('機密ファイルのため読み取りを拒否しました: {file}（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）', {file}));
+  if (isSensitivePath(file) || (typeof file === 'string' && file && isSensitivePath(realOf(file)))) throw new Error(t('機密ファイルのため読み取りを拒否しました: {file}（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）', {file}));
 }
 function readText(file) {
   assertNotSensitive(file);
@@ -52,8 +87,20 @@ function readText(file) {
   if (st && st.size > MAX_READ_BYTES) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（{size} バイト; 上限は 10MB / {max} バイトです）', {file, size: st.size, max: MAX_READ_BYTES}));
   const buf = fs.readFileSync(file);
   if (buf.length > MAX_READ_BYTES) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（上限は 10MB です）', {file}));
+  // UTF-16 with a BOM (what `>` writes in Windows PowerShell 5.1, and many Windows exports) is
+  // text full of zero bytes; it was refused as binary. Writes keep the file's encoding (writeText).
+  const utf16 = utf16Of(buf);
+  if (utf16) return utf16;
   if (buf.includes(0)) throw new Error('Binary file; use system.run to inspect it');
   return buf.toString('utf8');
+}
+function bomOf(buf) { return buf[0] === 0xff && buf[1] === 0xfe ? 'le' : buf[0] === 0xfe && buf[1] === 0xff ? 'be' : null; }
+function utf16Of(buf) {
+  const bom = bomOf(buf);
+  if (!bom) return null;
+  const body = Buffer.from(buf.subarray(2));
+  if (bom === 'be') body.swap16();
+  return body.toString('utf16le');
 }
 // ---- Staleness: what code.read last saw on disk, keyed by the shared readFiles set ----
 const readStatsBySet = new WeakMap();
@@ -68,6 +115,13 @@ function recordRead(ctx, file) {
   try { const st = fs.statSync(file); m.set(file, {mtimeMs: st.mtimeMs, size: st.size, hash: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}); } catch { m.delete(file); }
 }
 function forgetRead(ctx, file) { statsMap(ctx)?.delete(file); }
+// A parallel agent starts from main's reads: what each file looked like goes with them, or the
+// agent's code.write overwrote a change made on disk since (there was nothing to compare with).
+function copyReads(from, to) {
+  for (const f of from.readFiles || []) to.readFiles.add(f);
+  const src = statsMap(from), dst = statsMap(to);
+  if (src && dst) for (const [f, s] of src) dst.set(f, s);
+}
 function assertNotStale(ctx, file) {
   const m = statsMap(ctx); const prev = m?.get(file); if (!prev) return;
   let cur = null;
@@ -81,8 +135,13 @@ function writeText(file, lf, ending) {
   fs.mkdirSync(path.dirname(file), {recursive: true});
   let mode = null; try { mode = fs.statSync(file).mode; } catch {}
   const temp = file + '.muser-' + process.pid + '-' + crypto.randomBytes(8).toString('hex') + '.tmp';
+  // An existing UTF-16 file stays UTF-16 (with its BOM); everything else is written as UTF-8.
+  let bom = null; try { const fd = fs.openSync(file, 'r'), head = Buffer.alloc(2); fs.readSync(fd, head, 0, 2, 0); fs.closeSync(fd); bom = bomOf(head); } catch {}
+  const text = ending === '\r\n' ? lf.replace(/\n/g, '\r\n') : lf;
+  let data = text;
+  if (bom) { const body = Buffer.from(text, 'utf16le'); if (bom === 'be') body.swap16(); data = Buffer.concat([Buffer.from(bom === 'le' ? [0xff, 0xfe] : [0xfe, 0xff]), body]); }
   try {
-    fs.writeFileSync(temp, ending === '\r\n' ? lf.replace(/\n/g, '\r\n') : lf);
+    fs.writeFileSync(temp, data);
     if (mode !== null) { try { fs.chmodSync(temp, mode); } catch {} }
     fs.renameSync(temp, file);
   } catch (e) {
@@ -169,6 +228,9 @@ function applyHunks(text, hunks, name) {
     const old = h.lines.filter(l => l[0] !== '+').map(l => l.slice(1)), neu = h.lines.filter(l => l[0] !== '-').map(l => l.slice(1));
     const pos = old.length ? findBlock(lines, old, at) : lines.length - (lines[lines.length - 1] === '' ? 1 : 0);
     if (pos < 0) throw new Error('Patch context not found in ' + name + ' near: ' + (old.find(l => l.trim()) || '').slice(0, 120));
+    // A context that fits more than one place was applied at the first one, silently, as code.edit
+    // refuses a non-unique old_string. Without an @@ anchor it must fit one place only.
+    if (old.length && !h.anchor && findBlock(lines, old, pos + 1) >= 0) throw new Error('Patch context in ' + name + ' fits more than one place (near: ' + (old.find(l => l.trim()) || '').slice(0, 80) + '); add more unchanged lines around the change, or an @@ line naming the function or section');
     lines.splice(pos, old.length, ...neu); at = pos + neu.length;
   }
   return lines.join('\n');
@@ -219,7 +281,7 @@ function heavyGlobs(root) {
   if (norm === os.homedir().replace(/\\/g, '/').toLowerCase()) globs.push('!AppData/**');
   return globs;
 }
-const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/*.pem', '!**/*.key', '!**/id_rsa*', '!**/id_ed25519*', '!**/credentials', '!**/credentials.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc'];
+const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/*.pem', '!**/*.key', '!**/id_rsa*', '!**/id_ed25519*', '!**/credentials', '!**/credentials.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/.docker/config.json', '!**/.kube/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx'];
 
 function computeEdit(p, ctx) {
   const file = resolve(ctx, p.path);
@@ -272,11 +334,18 @@ const TOOLS = {
       optional: {offset: {type: 'integer', description: 'First line (1-based), default 1.'}, limit: {type: 'integer', description: 'Lines to read, default and max 2000.'}}},
     summary: p => p.path,
     run(p, ctx) {
-      const file = resolve(ctx, p.path), text = toLf(readText(file)), all = text.split('\n');
+      const file = resolve(ctx, p.path), text = toLf(readText(file));
+      // The final newline ends the last line; it does not start another ("a\nb\n" read as 3 lines
+      // with an empty line 3, and an empty file as 1 line).
+      const all = text === '' ? [] : text.split('\n'); if (all.length > 1 && all[all.length - 1] === '') all.pop();
       const start = Math.max(1, p.offset | 0 || 1), n = Math.min(MAX_READ_LINES, Math.max(1, p.limit | 0 || MAX_READ_LINES));
       const shown = all.slice(start - 1, start - 1 + n).map((l, i) => String(start + i).padStart(6) + '\t' + (l.length > MAX_LINE ? l.slice(0, MAX_LINE) + '…' : l));
       ctx.readFiles.add(file); recordRead(ctx, file);
-      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(start - 1 + n < all.length ? {next_offset: start + n} : {}), ...encodingWarning(text)}, view: {lines: shown.length}};
+      // Cut lines were marked with one "…" and nothing said how to read the rest (offset counts
+      // lines, so a minified line could not be read past 2,000 characters).
+      const cut = all.slice(start - 1, start - 1 + n).map((l, i) => l.length > MAX_LINE ? start + i : 0).filter(Boolean);
+      const longNote = cut.length ? {long_lines: cut.slice(0, 20), note: cut.length + ' line(s) longer than ' + MAX_LINE + ' characters are cut here (ending in …). To see one whole, use system.run, e.g. (Get-Content -LiteralPath <file>)[<line - 1>].Substring(<from>, 4000), or code.grep with a pattern from it.'} : {};
+      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(start - 1 + n < all.length ? {next_offset: start + n} : {}), ...longNote, ...encodingWarning(text)}, view: {lines: shown.length}};
     },
   },
   'code.write': {
@@ -367,10 +436,13 @@ const TOOLS = {
       if (!targetIsFile) for (const g of [...SENSITIVE_GLOBS, ...heavyGlobs(p.path ? resolve(ctx, p.path) : ctx.cwd)]) args.push('-g', g);
       if (p.ignore_case) args.push('-i');
       if (p.files_only) args.push('-l');
-      if (p.glob) args.push('-g', String(p.glob));
+      if (p.glob) args.push('-g', globSlashes(p.glob)); // "src\*.ts" matched nothing
       if (p.context) args.push('-C', String(Math.min(10, p.context | 0)));
       args.push('-e', String(p.pattern), p.path ? resolve(ctx, p.path) : '.');
-      const out = (await rg(args, ctx.cwd)).trimEnd(), n = out ? out.split('\n').length : 0;
+      // With context, rg also prints the lines around a hit (file-12-text) and "--" between groups;
+      // counting every line reported 10 matches for 2. Hits are file:12:text (12:text for one file).
+      const out = (await rg(args, ctx.cwd)).trimEnd(), lines = out ? out.split('\n') : [];
+      const n = p.context && !p.files_only ? lines.filter(l => /^(?:(?:[A-Za-z]:)?[^:\r\n]*:)?\d+:/.test(l)).length : lines.length;
       return {payload: {matches: n, output: clip(out) || '(no matches)'}, view: {count: n}};
     },
   },
@@ -380,15 +452,26 @@ const TOOLS = {
       required: {pattern: {type: 'string', description: 'Glob pattern.'}}, optional: {path: {type: 'string', description: 'Directory to search; default the working directory.'}}},
     summary: p => p.pattern,
     async run(p, ctx) {
-      const root = p.path ? resolve(ctx, p.path) : ctx.cwd;
+      // rg globs take '/', and a pattern is relative to the folder searched: "src\**\*.ts" and
+      // "C:/proj/**/*.ts" both found nothing. Backslashes become '/', and an absolute pattern is
+      // split into the folder before its first wildcard and the rest.
+      let pattern = globSlashes(p.pattern), root = p.path ? resolve(ctx, p.path) : ctx.cwd;
+      if (path.isAbsolute(pattern)) {
+        const parts = pattern.split('/'), at = parts.findIndex(x => /[*?[{]/.test(x));
+        if (at > 0) { root = path.resolve(parts.slice(0, at).join('/') + '/'); pattern = parts.slice(at).join('/'); }
+        else if (at < 0) { root = path.dirname(pattern); pattern = path.basename(pattern); }
+      }
       assertNotSensitive(root);
-      if (isSensitivePath(String(p.pattern))) assertNotSensitive(String(p.pattern));
-      const raw = (await rg(['--files', '-g', String(p.pattern), ...heavyGlobs(root).flatMap(g => ['-g', g])], root)).split('\n').filter(Boolean);
+      if (isSensitivePath(pattern)) assertNotSensitive(pattern);
+      const raw = (await rg(['--files', '-g', pattern, ...heavyGlobs(root).flatMap(g => ['-g', g])], root)).split('\n').filter(Boolean);
       // Cap before statSync so a huge tree cannot blow up on stat calls; sensitive hits are dropped.
       const capped = raw.slice(0, MAX_GLOB_RESULTS).filter(f => !isSensitivePath(f) && !isSensitivePath(path.join(root, f)));
       const files = capped
         .map(f => { let t = 0; try { t = fs.statSync(path.join(root, f)).mtimeMs; } catch {} return [f, t]; })
-        .sort((a, b) => b[1] - a[1]).map(([f]) => f);
+        .sort((a, b) => b[1] - a[1])
+        // Relative to the working folder (absolute outside it), as every other tool takes paths:
+        // relative to the folder searched, with that folder not in the result, they named other files.
+        .map(([f]) => { const abs = path.join(root, f); return inside(ctx.cwd, abs) ? path.relative(ctx.cwd, abs) : abs; });
       const truncated = raw.length > MAX_GLOB_RESULTS || files.length > 500;
       return {payload: {count: files.length, files: files.slice(0, 500), ...(truncated ? {truncated: true} : {})}, view: {count: files.length}};
     },
@@ -402,16 +485,22 @@ const TOOLS = {
     summary: p => p.command,
     async run(p, ctx, signal, onOutput) {
       if (typeof p.command !== 'string' || !p.command.trim()) throw new Error('command is required');
+      // Anything but cmd ran in PowerShell without a word ("bash" too), and the output was read as bash's.
+      if (p.shell !== undefined && p.shell !== null && p.shell !== '' && !['powershell', 'cmd'].includes(String(p.shell).toLowerCase())) throw new Error('shell must be powershell or cmd (this PC runs Windows; there is no ' + p.shell + ')');
+      if (p.shell) p = {...p, shell: String(p.shell).toLowerCase()};
       const cwd = p.cwd ? resolve(ctx, p.cwd) : ctx.cwd, timeout = Math.min(600000, Math.max(1000, p.timeout_ms | 0 || 120000));
+      // A missing cwd made Node report "spawn powershell.exe ENOENT", which read as "PowerShell is missing".
+      let dirOk = false; try { dirOk = fs.statSync(cwd).isDirectory(); } catch {}
+      if (!dirOk) throw new Error('cwd is not an existing folder: ' + cwd);
       if (p.background) {
         if (!ctx.shells) throw new Error('Background shells are not available here');
         const s = ctx.shells.start(p.command, {shell: p.shell, cwd});
         await new Promise(r => setTimeout(r, 1500)); // let startup errors and the first lines show
         const first = await ctx.shells.output(s.id);
-        return {payload: {shell_id: s.id, pid: s.pid, ...first, hint: 'Running in the background. Use shell.output with shell_id to read more, shell.kill to stop.'}, view: {background: s.id, tail: first.output.trimEnd().split('\n').slice(-4)}};
+        return {payload: {shell_id: s.id, pid: s.pid, ...first, hint: 'Running in the background. Use shell.output with shell_id to read more, shell.kill to stop.'}, view: {background: s.id, tail: frames(first.output).trimEnd().split('\n').slice(-4)}};
       }
       const r = await runOnce(p.command, {shell: p.shell, cwd, timeout, signal, onOutput, maxOut: MAX_OUT, clip});
-      return {payload: {exit_code: r.code, stdout: clip(r.stdout), stderr: clip(r.stderr, MAX_OUT / 3), ...(r.killed ? {killed: r.killed} : {})}, view: {exit: r.code, killed: r.killed, tail: (r.stdout + r.stderr).trimEnd().split('\n').slice(-4)}};
+      return {payload: {exit_code: r.code, stdout: clip(r.stdout), stderr: clip(r.stderr, MAX_OUT / 3), ...(r.killed ? {killed: r.killed} : {})}, view: {exit: r.code, killed: r.killed, tail: frames(r.stdout + r.stderr).trimEnd().split('\n').slice(-4)}};
     },
   },
   'shell.output': {
@@ -457,9 +546,14 @@ const TOOLS = {
       required: {todos: {type: 'string', description: 'JSON array of {"content": string, "status": "pending"|"in_progress"|"completed"}.'}}, optional: {}},
     summary: () => '',
     run(p, ctx) {
-      let todos; try { todos = JSON.parse(p.todos); } catch { throw new Error('todos must be a JSON array string'); }
+      // The gateway may hand over the array itself instead of its JSON text (JSON.parse of an array
+      // threw "must be a JSON array string"), and a null entry crashed on t.content.
+      let todos = p.todos;
+      if (typeof todos === 'string') { try { todos = JSON.parse(todos); } catch { throw new Error('todos must be a JSON array string'); } }
       if (!Array.isArray(todos)) throw new Error('todos must be a JSON array');
-      ctx.todos = todos.slice(0, 50).map(t => ({content: String(t.content || '').slice(0, 300), status: ['pending', 'in_progress', 'completed'].includes(t.status) ? t.status : 'pending'}));
+      // "done" / "in-progress" and the like showed as pending: the common spellings are understood.
+      const status = s => { const k = String(s || '').toLowerCase().replace(/[\s-]+/g, '_'); return ['completed', 'complete', 'done', 'finished'].includes(k) ? 'completed' : ['in_progress', 'inprogress', 'active', 'doing', 'started', 'working'].includes(k) ? 'in_progress' : 'pending'; };
+      ctx.todos = todos.filter(x => x && typeof x === 'object').slice(0, 50).map(t => ({content: String(t.content || '').slice(0, 300), status: status(t.status)}));
       return {payload: {ok: true, count: ctx.todos.length}, view: {todos: ctx.todos}};
     },
   },
@@ -467,4 +561,4 @@ const TOOLS = {
 
 function commandsV2() { return Object.fromEntries(Object.entries(TOOLS).map(([k, t]) => [k, t.def])); }
 
-module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath};
+module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of};

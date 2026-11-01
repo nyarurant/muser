@@ -62,3 +62,41 @@ test('a call that lands on an idle window runs in the window whose turn it is', 
   assert.match((await z.execute('code.glob', {pattern: '*'}, 30000, 'inv-3')).error, /muser is idle/);
   assert.match((await z.execute('code.glob', {pattern: '*'}, 30000, 'inv-4', {forwarded: true})).error, /muser is idle/, 'a handed-over call is never handed on again');
 });
+
+test('an entry whose pid is alive but whose pipe is gone (pid reused) is removed when asked', async t => {
+  const dir = tmp(t, 'muser-relay-');
+  const me = relay(t, dir, () => false, async () => ({}));
+  const ghost = path.join(dir, 'muser-ghost.json');
+  fs.writeFileSync(ghost, JSON.stringify({pid: process.pid, pipe: '\\\\.\\pipe\\muser-ghost-' + Date.now()}));
+  assert.deepEqual(await me.forward('code.glob', {}, 1000, 'x'), {takers: 0});
+  assert.equal(fs.existsSync(ghost), false);
+});
+
+test('a handed call waits as long as the other window may still run it', async t => {
+  const dir = tmp(t, 'muser-relay-');
+  const idle = relay(t, dir, () => false, async () => ({}));
+  // Muse's timeout 100 ms; the working window answers 5.5 s later (an approval taken late, but
+  // inside its deadline of timeout + 30 s). The handing window gave up at timeout + 5 s.
+  relay(t, dir, () => true, () => new Promise(r => setTimeout(() => r({ok: true, payload: 'ran'}), 5500)));
+  assert.deepEqual(await idle.forward('system.run', {}, 100, 'late'), {result: {ok: true, payload: 'ran'}});
+});
+
+test('a handed call whose answer is lost is not reported as "muser is idle"', async t => {
+  const dir = tmp(t, 'muser-relay-'), zDir = tmp(t, 'muser-z-');
+  const net = require('node:net');
+  // A window that takes the call and then drops the connection (closed mid-call).
+  const pipe = String.raw`\\.\pipe\muser-test-drop-` + process.pid;
+  const server = net.createServer(sock => {
+    let buf = '';
+    sock.setEncoding('utf8');
+    sock.on('data', d => { buf += d; if (!buf.includes('\n')) return; const msg = JSON.parse(buf); buf = ''; msg.type === 'takes' ? sock.end('{"takes":true}\n') : sock.destroy(); });
+  }).listen(pipe);
+  t.after(() => server.close());
+  fs.writeFileSync(path.join(dir, 'muser-drop.json'), JSON.stringify({pid: process.pid, pipe}));
+  const z = agent(t, zDir);
+  z.relay = relay(t, dir, p => !!z.route(p), (c, p, ms, id) => z.execute(c, p, ms, id, {forwarded: true}));
+  const r = await z.execute('code.glob', {pattern: '*'}, 30000, 'inv-drop');
+  assert.equal(r.ok, false);
+  assert.doesNotMatch(r.error, /muser is idle/);
+  assert.match(r.error, /another muser window/);
+});

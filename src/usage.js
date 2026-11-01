@@ -161,12 +161,20 @@ function shapePlan(s) {
 }
 
 let sharedWeb = null;
-function resetWeb() { sharedWeb = null; } // after a new login: read the new cookies next time
+function resetWeb() { sharedWeb = null; lastFind = 0; } // after a new login: new cookies, and the id may be looked up at once
+// Any failed read (a lapsed login too) was taken for a new build and crawled up to 2,000 page
+// chunks, after every turn and at every start. The id is looked up again at most once an hour.
+const FIND_EVERY_MS = 3600 * 1000;
+let lastFind = 0;
 async function plan(web) {
   web ??= sharedWeb ??= require('./web').createWeb();
   let id = cachedAction();
   for (let attempt = 0; attempt < 2; attempt++) {
-    if (!id) { id = await findAction(web); cacheAction(id); }
+    if (!id) {
+      if (Date.now() - lastFind < FIND_EVERY_MS) break;
+      lastFind = Date.now();
+      id = await findAction(web); cacheAction(id);
+    }
     let r = null;
     try { r = await web.serverAction(id, [{includeAgreement: true}]); } catch (e) { if (attempt) throw e; }
     const sub = r && r.ok ? parseSubscription(r.text) : null;
@@ -177,7 +185,8 @@ async function plan(web) {
 }
 
 function formatPlan(p) {
-  const at = p.resetsAt ? new Date(p.resetsAt).toLocaleString('ja-JP', {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '?';
+  const locale = require('./i18n').lang() === 'en' ? 'en-US' : 'ja-JP'; // the date was Japanese in the English UI too
+  const at = p.resetsAt ? new Date(p.resetsAt).toLocaleString(locale, {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '?';
   return [
     t('Muse の利用状況（muse.ai と同じ値）'),
     t('{plan} · 週の使用量 {percent}%（{at} にリセット）{quota}', {plan: p.plan || t('プラン不明'), percent: p.percentUsed ?? '?', at, quota: p.quotaStatus && p.quotaStatus !== 'SUFFICIENT' ? ' · ' + p.quotaStatus : ''}),

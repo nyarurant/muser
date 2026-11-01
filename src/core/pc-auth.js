@@ -140,6 +140,16 @@ class PcAuth {
     try{result=await this.request('device','/fetch_vms',undefined,this.saved.device.access_token);}
     catch(e){
       if(e.status!==401)throw e;
+      // muser: another muser window may have refreshed the pair already (each window kept the one it
+      // started with, and refreshed with a refresh token that may have been used up). Take the saved
+      // pair first and only refresh when it is the same expired one.
+      let disk=null;try{disk=this.load?.()?.device||null;}catch{}
+      if(disk?.access_token&&disk.access_token!==this.saved.device.access_token){
+        this.saved={...this.saved,device:{...this.saved.device,...disk}};
+        try{result=await this.request('device','/fetch_vms',undefined,this.saved.device.access_token);}catch(e2){if(e2.status!==401)throw e2;}
+      }
+    }
+    if(!result){
       const storedRefresh=this.saved.device.refresh_token;
       if(typeof storedRefresh!=='string'||!storedRefresh.trim()||!storedRefresh.split(':').pop())throw new Error(t('保存済みの更新トークンの形式が正しくありません。PC 端末を再認証してください。保存済みの情報は変更していません。'));
       const refresh=storedRefresh.split(':').pop();

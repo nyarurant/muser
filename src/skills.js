@@ -25,22 +25,22 @@ function sources(cwd) {
 }
 
 function configFile() { return path.join(os.homedir(), '.muser', 'config.json'); }
-function readConfig() { try { return JSON.parse(fs.readFileSync(configFile(), 'utf8')) || {}; } catch { return {}; } }
+function readConfig() { try { return require('./config').readJson(configFile()) || {}; } catch { return {}; } }
 function settings() {
   const s = readConfig().skills || {};
   return {disabled: new Set(Array.isArray(s.disabled) ? s.disabled : []), sources: s.sources && typeof s.sources === 'object' ? s.sources : {}};
 }
 function saveSettings(mutate) {
-  const cfg = readConfig(), s = settings();
+  const s = settings();
   mutate(s);
-  cfg.skills = {disabled: [...s.disabled].sort(), sources: s.sources};
-  fs.mkdirSync(path.dirname(configFile()), {recursive: true});
-  fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 2));
+  require('./config').update(cfg => { cfg.skills = {disabled: [...s.disabled].sort(), sources: s.sources}; });
 }
 
 // The frontmatter as the skills in the wild write it: key: value, quoted values, and folded or
 // literal blocks (description: >- followed by indented lines).
 function frontmatter(text) {
+  // A BOM (Notepad and some editors save one) hid the frontmatter, so the skill had no description.
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
   if (!m) return {meta: {}, body: text};
   const meta = {}, lines = m[1].split(/\r?\n/);
@@ -101,6 +101,12 @@ function read(cwd, {name, path: rel} = {}) {
     const target = path.resolve(skill.dir, String(rel));
     const inside = path.relative(skill.dir, target);
     if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) throw new Error('path must be a file inside the skill folder');
+    // skill.read runs unasked, and a project's .claude/skills comes with the repository: a link
+    // inside a skill must not lead out of it, nor to a secret.
+    const {realOf, isSensitivePath} = require('./tools');
+    const real = realOf(target), realDir = realOf(skill.dir), realRel = path.relative(realDir, real);
+    if (realRel.startsWith('..') || path.isAbsolute(realRel)) throw new Error('path must be a file inside the skill folder');
+    if (isSensitivePath(target) || isSensitivePath(real)) throw new Error('Refused to read a sensitive file: ' + inside);
     const st = fs.statSync(target);
     if (st.size > MAX_FILE) throw new Error('File too large to read here (' + st.size + ' bytes)');
     return {name: skill.name, path: inside.replace(/\\/g, '/'), content: fs.readFileSync(target, 'utf8')};

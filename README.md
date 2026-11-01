@@ -63,6 +63,8 @@ Main slash commands: `/help` `/new` `/clear` `/resume` `/permissions` `/agent` `
 
 At every start muser checks npm for a newer version in the background and shows it in the footer (`⬆ v… · /update`); `/update` installs it with `npm install -g muser-cli@latest`. Nothing is installed without you. Turn the check off with `MUSER_NO_UPDATE_CHECK=1` or `{"updateCheck": false}` in `~/.muser/config.json`.
 
+Quieter terminal: `NO_COLOR=1` turns colours off, `MUSER_NO_BELL=1` (or `{"bell": false}`) silences the bell on approvals and finished agents, and `MUSER_REDUCED_MOTION=1` stops the spinners.
+
 ## Commands
 
 | Command | What it does |

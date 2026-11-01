@@ -20,8 +20,11 @@ function createChat(web) {
     // Nothing is printed here — it would land on top of the TUI.
     checkPin: (id, fingerprint) => {
       if (pins[id] === fingerprint) return;
+      // Re-read and write through a temp file: several muser windows record here.
+      try { pins = {...JSON.parse(fs.readFileSync(PINS, 'utf8')), ...pins}; } catch {}
       pins[id] = fingerprint;
-      try { fs.mkdirSync(store.DIR, {recursive: true}); fs.writeFileSync(PINS, JSON.stringify(pins)); } catch {}
+      const temp = PINS + '.tmp-' + process.pid + '-' + Date.now();
+      try { fs.mkdirSync(store.DIR, {recursive: true}); fs.writeFileSync(temp, JSON.stringify(pins)); fs.renameSync(temp, PINS); } catch { try { fs.unlinkSync(temp); } catch {} }
     },
   });
   client.on('credentials', c => store.save('session.enc', c));

@@ -78,4 +78,11 @@ function wrap(s, max, indent = '') {
 function pad(s, n) { return s + ' '.repeat(Math.max(0, n - width(s))); }
 function cols() { return Math.max(40, (process.stdout.columns || 100)); }
 
-module.exports = {c, strip, width, truncate, wrap, pad, cols, ESC, rgb, rgbTo256, truecolor};
+// Command output as a terminal leaves it: a carriage return starts the line again (progress
+// meters: curl, pip, cargo). Shown raw, the frames ran together ("  0%  12%  57% 100%") and a line
+// still being redrawn never showed at all.
+function frames(text) {
+  return String(text).replace(/\r+\n/g, '\n').split('\n').map(l => { const s = l.replace(/\r+$/, ''); return s.slice(s.lastIndexOf('\r') + 1); }).join('\n');
+}
+
+module.exports = {frames, c, strip, width, truncate, wrap, pad, cols, ESC, rgb, rgbTo256, truecolor};

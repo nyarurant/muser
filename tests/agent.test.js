@@ -37,6 +37,7 @@ function makeAgent(t, agentOpts = {}) {
     session: {id: 'main-session', cwd, title: '', created: 0, updated: 0, turns: 0},
     ...agentOpts,
   });
+  a.subscribed = true; // as bin/muser.js marks it once its startup subscribe is done
   return a;
 }
 function startTurn(a) {
@@ -61,7 +62,11 @@ test('projectInstructions caps the TOTAL characters across all files', (t) => {
   // Ancestor files above the temp dir may add entries, but the cap is over the total.
   assert.ok(total <= MAX_PROJECT_INSTRUCTION_CHARS, 'total ' + total + ' exceeds cap ' + MAX_PROJECT_INSTRUCTION_CHARS);
   assert.equal(found.filter(e => e.text.includes(NOTE)).length, 1, 'exactly the truncated file carries the note');
-  assert.ok(found[found.length - 1].text.includes(NOTE), 'the note is on the last included file');
+  // The nearest file (the project's own, most specific) is kept whole; an outer one is cut.
+  // Before, the budget went outermost-first and cut the project's own file.
+  assert.equal(found[found.length - 1].file, path.join(deep, 'AGENTS.md'), 'listed last: general before specific');
+  assert.equal(found[found.length - 1].text, 'C'.repeat(9000), "the project's own file is whole");
+  assert.ok(found[0].text.includes(NOTE), 'the outermost included file carries the note');
 });
 
 test('projectInstructions leaves small instruction sets untouched', (t) => {

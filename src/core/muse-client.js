@@ -66,7 +66,9 @@ class MuseClient extends EventEmitter {
     if(!this.fetchJson) return 'error';
     let session;
     // A network failure says nothing about the login; only an HTTP refusal means "not signed in".
-    try { session=await this.fetchJson('/api/session?vm_state=true'); } catch(e) { return e?.network?'error':'waiting'; }
+    // muser: a server error (5xx) or rate limit (429) says nothing about the login either; taken as
+    // 'waiting' it marked the login lapsed and stopped reconnecting on a passing muse.ai hiccup.
+    try { session=await this.fetchJson('/api/session?vm_state=true'); } catch(e) { return e?.network||e?.status>=500||e?.status===429?'error':'waiting'; }
     if(!session?.endpoint_url||!session?.vm_id) return 'session';
     try { allowedGateway(session.endpoint_url); } catch { return 'session'; }
     let result;
@@ -203,9 +205,10 @@ class MuseClient extends EventEmitter {
           else{const text=data.toString('utf8');const value=text?unwrap(JSON.parse(text)):{};p.settled=true;p.resolve(value);}
         }
         clearTimeout(p.timer);this.pending.delete(key);
-        if(p.stream)this.emit('stream-end');
+        // muser: say which stream ended, so a closed /chat/subscribe can be opened again.
+        if(p.stream)this.emit('stream-end',{path:p.path,scope:p.subscriptionScope});
       }
-    }catch(e){clearTimeout(p.timer);this.pending.delete(key);p.reject(e);if(p.settled)this.emit('stream-error',e.message);}
+    }catch(e){clearTimeout(p.timer);this.pending.delete(key);p.reject(e);if(p.settled)this.emit('stream-error',{path:p.path,scope:p.subscriptionScope,message:e.message});}
   }
   // muser: the gateway socket had no keepalive, so a half-open socket (sleep, network change)
   // looked connected forever. Missing pongs now count as a drop.

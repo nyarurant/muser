@@ -3,9 +3,18 @@
 import {createRequire} from 'node:module';
 const {c} = createRequire(import.meta.url)('../tui/term.js');
 
-export function inline(s) {
+// Markup inside `code` is literal: `__init__.py` showed as "init.py" and `ls *.js *.md` as
+// "ls .js .md". Code spans are set aside behind placeholders while the rest is formatted, so
+// **bold with `code` inside** still works.
+const HOLD = String.fromCharCode(0xe000), HOLD_END = String.fromCharCode(0xe001);
+const HELD = new RegExp(HOLD + '([0-9]+)' + HOLD_END, 'g');
+export function inline(src) {
+  const spans = [];
+  const s = String(src).replace(/`([^`]+)`/g, (_, x) => HOLD + (spans.push(c.code(x)) - 1) + HOLD_END);
+  return format(s).replace(HELD, (_, i) => spans[i]);
+}
+function format(s) {
   return s
-    .replace(/`([^`]+)`/g, (_, x) => c.code(x))
     .replace(/\*\*([^*]+)\*\*/g, (_, x) => c.bold(x))
     .replace(/__([^_]+)__/g, (_, x) => c.bold(x))
     .replace(/~~([^~]+)~~/g, (_, x) => c.strike(x))

@@ -3,6 +3,7 @@
 // spinners and typing do not flicker. The caret is placed with useCursor so IME composes in place.
 import React, {useEffect, useRef, useState, useSyncExternalStore} from 'react';
 import {render, Box, Text, Static, useInput, usePaste, useCursor, useWindowSize} from 'ink';
+import chalk from 'chalk';
 import {createRequire} from 'node:module';
 import path from 'node:path';
 import {Controller, COMMANDS} from './controller.mjs';
@@ -12,10 +13,14 @@ const require = createRequire(import.meta.url);
 const {c, width, truncate, pad} = require('../tui/term.js');
 const {logo} = require('../tui/logo.js');
 const {LABELS} = require('../policy.js');
-const {fragmentAt: mentionAt, complete: mentionComplete, listDiag: mentionDiag} = require('../mentions.js');
+const {fragmentAt: mentionAt, complete: mentionComplete, listDiag: mentionDiag, loading: mentionLoading} = require('../mentions.js');
 const {t} = require('../i18n.js');
 
 const h = React.createElement;
+// NO_COLOR (no-color.org): Ink colours everything through this chalk, which does not look at it.
+if (process.env.NO_COLOR) chalk.level = 0;
+// MUSER_REDUCED_MOTION=1: spinners stand still.
+const MOTION = process.env.MUSER_REDUCED_MOTION !== '1';
 const ACCENT = '#b4a0ff', DIM = '#5f5f69', GRAY = '#8c8c96';
 const SPIN = ['✻', '✽', '✶', '✳', '✢', '·', '✢', '✳', '✶', '✽'];
 const TITLES = {'shell.output': 'Output', 'shell.kill': 'Kill', 'shell.list': 'Shells', 'code.read': 'Read', 'code.grep': 'Search', 'code.glob': 'Glob', 'code.edit': 'Update', 'code.write': 'Write', 'code.apply_patch': 'Patch', 'todo.write': 'Todo', 'skill.read': 'Skill'};
@@ -39,7 +44,9 @@ function todoLine(t) {
   return c.gray('☐ ') + t.content;
 }
 function Diff({diff, W, max = 30}) {
-  const numW = Math.max(3, String(Math.max(0, ...diff.map(d => d.n || 0))).length), bodyW = W - numW - 12;
+  // Only the rows shown count: Math.max(...all rows) threw a RangeError past ~150,000 rows (a new
+  // 200,000-line file), and a throw in render takes the whole screen down.
+  const numW = Math.max(3, String(diff.slice(0, max).reduce((m, d) => Math.max(m, d.n || 0), 0)).length), bodyW = W - numW - 12;
   const lines = diff.slice(0, max).map((d, i) => {
     if (d.t === '…') return h(Line, {key: i, color: DIM}, '      ' + ' '.repeat(numW) + ' ⋮');
     const num = String(d.n).padStart(numW), body = pad(truncate(d.l, bodyW), bodyW);
@@ -70,7 +77,8 @@ function Tool({call, cwd, W}) {
   else if (call.command === 'system.run') {
     const tail = (v.tail || []).filter(l => l.trim());
     kids.push(res(h(Box, {flexDirection: 'column'}, ...(tail.length ? tail : [t('(出力なし)')]).map((l, i) => h(Line, {key: i, color: GRAY}, l)),
-      ...(v.exit ? [h(Text, {key: 'x', color: '#f06e6e'}, v.killed === 'timeout' ? t('タイムアウト') : v.killed === 'cancelled' ? t('中断しました') : 'exit ' + v.exit)] : []))));
+      ...(call.outputLines > tail.length ? [h(Text, {key: 'more', color: DIM}, t('… ほか {n} 行（/output で全文）', {n: call.outputLines - tail.length}))] : []),
+      ...(v.exit ?[h(Text, {key: 'x', color: '#f06e6e'}, v.killed === 'timeout' ? t('タイムアウト') : v.killed === 'cancelled' ? t('中断しました') : 'exit ' + v.exit)] : []))));
   }
   return h(Box, {flexDirection: 'column', marginBottom: 1}, kids);
 }
@@ -127,7 +135,8 @@ function Entry({e, ctrl, W}) {
     case 'note': return h(Box, {flexDirection: 'column', marginBottom: 1}, e.lines.map((l, i) => h(Text, {key: i, color: GRAY, wrap: 'wrap'}, '  ' + l)));
     case 'help': return h(Box, {flexDirection: 'column', marginBottom: 1}, h(Text, {bold: true}, t('コマンド')),
       ...COMMANDS.map(([n, d]) => h(Line, {key: n}, '  ' + c.accent(pad(n, 14)) + c.gray(t(d)))), h(Text, null, ' '), h(Text, {bold: true}, t('キー')),
-      h(Text, {color: GRAY, wrap: 'wrap'}, t('  enter 送信 · {bs}+enter / ctrl+j 改行 · ↑↓ 履歴 · esc 中断 · shift+tab 承認モード · tab コマンド補完 · ctrl+c ×2 終了', {bs: '\\'})));
+      h(Text, {color: GRAY, wrap: 'wrap'}, t('  enter 送信 · {bs}+enter / ctrl+j 改行 · ↑↓ 履歴 · esc 中断 · shift+tab 承認モード · tab コマンド補完 · ctrl+c ×2 終了', {bs: '\\'})),
+      h(Text, {color: GRAY, wrap: 'wrap'}, t('  ctrl+a / ctrl+e 行頭・行末 · ctrl+u / ctrl+k カーソルの前・後ろを消す · ctrl+w 単語を消す · alt+v 画像を貼る · @ ファイル · ! シェル')));
     case 'todos': return h(Box, {flexDirection: 'column', marginBottom: 1}, e.todos.length ? e.todos.map((td, i) => h(Text, {key: i, wrap: 'wrap'}, '  ' + todoLine(td))) : h(Text, {color: GRAY}, t('  Todo はまだありません。')));
     case 'status': return h(Box, {flexDirection: 'column', marginBottom: 1}, ...[
       ['Muse', ctrl.museName + c.faint('  ' + t('ゲートウェイ') + ' ' + a.client.status)], [t('端末'), a.constructor.DEVICE + '  ' + (a.device?.connected ? c.green(t('接続中')) : c.red(t('未接続')))],
@@ -140,7 +149,7 @@ function Entry({e, ctrl, W}) {
 // ---------- live area ----------
 function useTick(active, ms = 100) {
   const [n, setN] = useState(0);
-  useEffect(() => { if (!active) return; const t = setInterval(() => setN(x => x + 1), ms); return () => clearInterval(t); }, [active, ms]);
+  useEffect(() => { if (!active || !MOTION) return; const t = setInterval(() => setN(x => x + 1), ms); return () => clearInterval(t); }, [active, ms]);
   return n;
 }
 function Working({s}) {
@@ -152,18 +161,47 @@ function Running({r}) {
   const n = useTick(true);
   return h(Box, {flexDirection: 'column'},
     h(Line, null, c.accent(SPIN[n % SPIN.length]) + ' ' + c.bold(title(r.call)) + c.gray('(' + (r.call.summary || '') + ')')),
-    ...r.tail.map((l, i) => h(Line, {key: i, color: DIM}, '  │ ' + l)));
+    ...[...r.tail, ...(r.now?.trim() ? [r.now] : [])].slice(-5).map((l, i) => h(Line, {key: i, color: DIM}, '  │ ' + l)));
 }
 function Approval({a, ctrl, W}) {
   const call = a.call, rows = [];
   if (call.kind === 'mcp') {
     rows.push(h(Line, {key: 's'}, c.gray(t('サーバー ')) + call.mcp.server + c.gray(t('   ツール ')) + c.bold(call.mcp.tool)));
-    for (const [k, v] of Object.entries(call.params || {}).slice(0, 12)) rows.push(h(Text, {key: 'p' + k, wrap: 'wrap'}, c.faint(k + ': ') + String(typeof v === 'string' ? v : JSON.stringify(v)).slice(0, 400)));
+    // What is not shown is said: an approval must not hide part of what it approves.
+    // The values share the screen: 12 values of 400 characters pushed the options off it.
+    const entries = Object.entries(call.params || {}), shown = entries.slice(0, 12);
+    const each = Math.max(60, Math.min(400, Math.floor((W - 6) * Math.max(4, (process.stdout.rows || 30) - 16) / Math.max(1, shown.length))));
+    for (const [k, v] of shown) { const s = String(typeof v === 'string' ? v : JSON.stringify(v)); rows.push(h(Text, {key: 'p' + k, wrap: 'wrap'}, c.faint(k + ': ') + s.slice(0, each) + (s.length > each ? c.faint(t(' … ほか {n} 文字', {n: s.length - each})) : ''))); }
+    if (entries.length > 12) rows.push(h(Text, {key: 'pmore', color: '#e6be64'}, t('… ほか {n} 個の引数', {n: entries.length - 12})));
   } else if (call.kind === 'exec') {
-    String(call.params.command).split('\n').slice(0, 12).forEach((l, i) => rows.push(h(Text, {key: 'c' + i, wrap: 'wrap'}, l)));
+    // Lines and characters both: one 20,000-character line wrapped to hundreds of rows and pushed
+    // the yes / no options off the screen. What is cut is said, with how much.
+    const cmd = String(call.params.command), cmdLines = cmd.split('\n'), budget = Math.max(200, (W - 6) * Math.max(4, (process.stdout.rows || 30) - 18));
+    let used = 0, shownLines = 0;
+    for (const l of cmdLines.slice(0, 12)) {
+      if (used >= budget) break;
+      const part = l.length > budget - used ? l.slice(0, budget - used) : l;
+      rows.push(h(Text, {key: 'c' + shownLines, wrap: 'wrap'}, part)); used += part.length; shownLines++;
+    }
+    const hiddenChars = cmd.length - used - (shownLines - 1);
+    if (cmdLines.length > shownLines || hiddenChars > 0) rows.push(h(Text, {key: 'cmore', color: '#e6be64'}, cmdLines.length > 12
+      ? t('… ほか {n} 行（全部で {total} 行。見えていない行も実行されます）', {n: cmdLines.length - shownLines, total: cmdLines.length})
+      : t('… ほか {n} 文字（全部で {total} 文字。見えていない部分も実行されます）', {n: Math.max(0, hiddenChars), total: cmd.length})));
     if (call.params.cwd) rows.push(h(Text, {key: 'cwd', color: GRAY}, t('場所: {cwd}', {cwd: call.params.cwd})));
   } else if (a.preview?.error) rows.push(h(Text, {key: 'e', color: '#f06e6e', wrap: 'wrap'}, t('プレビューできません: {error}', {error: a.preview.error})));
-  else if (a.preview?.files) a.preview.files.forEach((f, i) => { rows.push(h(Line, {key: 'f' + i}, c.bold(path.relative(ctrl.agent.cwd, f.path) || f.path) + c.faint('  ' + f.op))); rows.push(h(Diff, {key: 'd' + i, diff: f.diff, W: W - 4, max: 14})); });
+  else if (a.preview?.files) {
+    // Diffs while they fit, then the other files by name: 15 files of 14 rows pushed the options off the screen.
+    const room = Math.max(8, (process.stdout.rows || 30) - 16), name = f => path.relative(ctrl.agent.cwd, f.path) || f.path;
+    let used = 0, i = 0;
+    for (const f of a.preview.files) {
+      if (used + 4 > room) break;
+      const max = Math.min(14, room - used - 2);
+      rows.push(h(Line, {key: 'f' + i}, c.bold(name(f)) + c.faint('  ' + f.op))); rows.push(h(Diff, {key: 'd' + i, diff: f.diff, W: W - 4, max}));
+      used += 2 + Math.min(f.diff.length, max); i++;
+    }
+    const rest = a.preview.files.slice(i);
+    if (rest.length) rows.push(h(Text, {key: 'fmore', color: '#e6be64', wrap: 'wrap'}, t('… ほか {n} ファイル: {names}', {n: rest.length, names: rest.map(f => name(f) + ' (' + f.op + ')').join(', ').slice(0, (W - 6) * 3)})));
+  }
   else if (a.preview?.diff) rows.push(h(Diff, {key: 'd', diff: a.preview.diff, W: W - 4, max: Math.max(8, (process.stdout.rows || 30) - 18)}));
   if (a.outside) rows.push(h(Text, {key: 'o', color: '#e6be64'}, t('⚠ 作業フォルダーの外への書き込みです')));
   return h(Box, {flexDirection: 'column', marginTop: 1},
@@ -241,22 +279,30 @@ function useBoxPosition(ref) {
 function Prompt({s, W}) {
   const ref = useRef(null), box = useBoxPosition(ref), {setCursorPosition} = useCursor();
   const reason = !!s.reasonFor, bang = !reason && s.text.startsWith('!'), head = reason ? t('理由 ') : '❯ ', inner = W - 4 - width(head);
-  const {lines, cur} = layout(s.text, s.pos, inner);
+  const {lines: all, cur} = layout(s.text, s.pos, inner);
+  // A window of rows around the caret: a 3,000-line paste drew 3,000 rows on every key (0.5 s a
+  // frame, far taller than the terminal). The text itself is untouched.
+  const max = Math.max(4, Math.min(30, (process.stdout.rows || 30) - 14));
+  const start = all.length <= max ? 0 : Math.max(0, Math.min(cur.row - Math.floor(max / 2), all.length - max));
+  const lines = all.slice(start, start + max), above = start, below = all.length - start - lines.length;
   // Set during render, not in an effect: Ink applies it to the frame being written, while an
   // effect lands one frame late and leaves the caret on the previous position.
-  if (box) setCursorPosition({x: box.left + 2 + width(head) + cur.col, y: box.top + 1 + cur.row});
+  if (box) setCursorPosition({x: box.left + 2 + width(head) + cur.col, y: box.top + 1 + (above ? 1 : 0) + cur.row - start});
   const placeholder = reason ? t('Muse に伝えること（空なら理由なしで断る）') : s.busy ? t('Muse が作業中（送った文は次のターンになります）') : t('何をしますか？   / でコマンド');
   return h(Box, {ref, flexDirection: 'column', borderStyle: 'round', borderColor: reason || bang ? '#e6be64' : s.busy ? '#3c3c44' : DIM, paddingX: 1, width: W, marginTop: 1},
-    ...lines.map((l, i) => h(Box, {key: i}, h(Text, {color: reason ? '#e6be64' : ACCENT}, i ? ' '.repeat(width(head)) : head),
-      h(Text, {wrap: 'truncate-end', color: !s.text ? DIM : undefined}, !s.text && i === 0 ? placeholder : l || ' '))));
+    ...(above ? [h(Text, {key: 'above', color: DIM}, ' '.repeat(width(head)) + t('↑ ほか {n} 行（全部で {total} 行）', {n: above, total: all.length}))] : []),
+    ...lines.map((l, i) => h(Box, {key: i}, h(Text, {color: reason ? '#e6be64' : ACCENT}, i + start ? ' '.repeat(width(head)) : head),
+      h(Text, {wrap: 'truncate-end', color: !s.text ? DIM : undefined}, !s.text && i === 0 ? placeholder : l || ' '))),
+    ...(below ? [h(Text, {key: 'below', color: DIM}, ' '.repeat(width(head)) + t('↓ ほか {n} 行', {n: below}))] : []));
 }
 function Footer({s, ctrl, W}) {
   const m = s.mode, color = m === 'bypass' ? '#f06e6e' : m === 'plan' ? '#78aaf0' : m === 'auto-edit' ? ACCENT : GRAY;
   const at = mentionAt(s.text, s.pos);
   if (at) {
-    const list = mentionComplete(at.fragment, ctrl.agent.cwd);
+    const list = mentionComplete(at.fragment, ctrl.agent.cwd, 6, () => ctrl.set({}));
     if (!list.length) {
       const diag = mentionDiag();
+      if (mentionLoading(ctrl.agent.cwd)) return h(Box, {paddingX: 2}, h(Text, {color: DIM}, t('ファイルを探しています…')));
       return h(Box, {paddingX: 2}, h(Text, {color: DIM}, diag.source === 'none' ? t('ファイル一覧を取得できませんでした（{error}）', {error: diag.error}) : t('一致するファイルがありません')));
     }
     const sel = ctrl.atIndex(at.fragment, list.length);
@@ -275,20 +321,26 @@ function Footer({s, ctrl, W}) {
 function AgentCards({list}) {
   const n = useTick(list.some(x => x.state === 'working'));
   if (!list.length) return null;
+  // As many as fit: 25 running agents (no limit set) took 50 rows and pushed the input off the
+  // screen. Many agents get one line each; the rest are counted.
+  const room = Math.max(3, (process.stdout.rows || 30) - 20), compact = list.length * 2 > room;
+  const shown = [...list].sort((x, y) => (y.state === 'working') - (x.state === 'working')).slice(0, list.length > room ? room - 1 : room);
   return h(Box, {flexDirection: 'column', marginTop: 1},
-    ...list.map(x => {
+    ...(list.length > shown.length ? [h(Text, {key: 'more', color: DIM}, t('… ほか {n} 件（/agents で一覧）', {n: list.length - shown.length}))] : []),
+    ...shown.map(x => {
       const working = x.state === 'working', mark = working ? c.accent(SPIN[(n + x.tag.length) % SPIN.length]) : x.state === 'done' ? c.green('✓') : x.state === 'stopped' ? c.yellow('■') : c.red('✗');
       const last = String(x.text || '').trim().split('\n').pop() || '';
       const what = working ? (x.lastTool ? c.gray(x.lastTool) : c.gray(t('考え中…'))) : c.faint(x.state === 'done' ? t('完了') : x.state === 'stopped' ? t('停止') : t('失敗'));
       return h(Box, {key: x.tag, flexDirection: 'column'},
         h(Line, null, mark + ' ' + c.bold(x.tag) + c.faint(' ' + (x.type || '')) + ' ' + x.title + c.faint('  ' + elapsed((working ? Date.now() : x.ended) - x.started)) + '  ' + what),
-        working && last ? h(Line, {color: DIM}, '   ' + last) : null);
+        working && last && !compact ? h(Line, {color: DIM}, '   ' + last) : null);
     }));
 }
 function Live({s, ctrl, W}) {
   const preview = ctrl.previewRow(), open = s.todos.filter(t => t.status !== 'completed');
   return h(Box, {flexDirection: 'column', width: W},
     preview ? h(Row, {prefix: (preview.first ? '⏺ ' : '  ') + preview.row.prefix, text: preview.row.text, code: preview.row.code}) : null,
+    s.bangRunning && !s.approval ? h(Running, {r: s.bangRunning}) : null,
     s.running && !s.approval ? h(Running, {r: s.running}) : null,
     s.busy && !s.running && !s.approval ? h(Working, {s}) : null,
     s.todos.length && open.length && !s.approval ? h(Box, {flexDirection: 'column', marginTop: 1}, s.todos.slice(0, 8).map((t, i) => h(Text, {key: i, wrap: 'truncate-end'}, '  ' + todoLine(t)))) : null,
@@ -300,7 +352,7 @@ function Live({s, ctrl, W}) {
 
 function Root({ctrl}) {
   const s = useSyncExternalStore(ctrl.subscribe, ctrl.get);
-  const {columns, rows} = useWindowSize(), W = Math.max(40, (columns || 100) - 1);
+  const {columns, rows} = useWindowSize(), W = Math.max(20, (columns || 100) - 1); // a floor wider than the terminal overflowed it
   useEffect(() => { ctrl.trace('size ' + columns + 'x' + rows); }, [columns, rows]);
   useInput((input, key) => ctrl.key(input, key));
   usePaste(text => ctrl.paste(text));
@@ -314,10 +366,12 @@ export {Entry, Live};
 
 export function run({agent, museName, version, initial, connect}) {
   let app;
-  const ctrl = new Controller({agent, museName, version, onExit: () => {
+  const ctrl = new Controller({agent, museName, version, onExit: async () => {
     app.unmount();
     const id = agent.session.turns && agent.client.status !== 'demo' ? agent.session.id.slice(0, 8) : '';
     if (id) process.stdout.write(c.faint(t('再開するには: muser resume {id}', {id})) + '\n');
+    // Leaving mid-turn only closed the sockets: Muse went on working for nobody.
+    if (agent.busy && agent.cancelAll) { process.stdout.write(c.faint(t('Muse の作業を止めています…')) + '\n'); await agent.cancelAll().catch(() => {}); }
     agent.close(); setTimeout(() => process.exit(0), 50);
   }});
   // An exception nothing caught ends muser: leave a report (src/crash.js) and the way back into the

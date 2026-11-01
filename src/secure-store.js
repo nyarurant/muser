@@ -57,7 +57,9 @@ function save(name, value) {
   const target = file(name), json = JSON.stringify(value), c = fresh(name, stampOf(target));
   if (c && c.json === json) return;
   fs.mkdirSync(DIR, {recursive: true});
-  const temp = target + '.tmp';
+  // A temp name per process: two muser windows saving the same file collided on one '.tmp' and
+  // the second rename failed (ENOENT) inside the gateway's credentials event.
+  const temp = target + '.tmp-' + process.pid + '-' + Date.now();
   fs.writeFileSync(temp, dpapi('Protect', Buffer.from(json, 'utf8')));
   fs.renameSync(temp, target);
   const st = stampOf(target); if (st) cache.set(name, {...st, json});

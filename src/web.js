@@ -123,7 +123,7 @@ function createWeb(jar = loadJar()) {
 async function probe(jar) {
   const w = createWeb(jar);
   let session;
-  try { session = await w.fetchJson('/api/session?vm_state=true'); } catch (e) { return e.network ? 'error' : 'waiting'; }
+  try { session = await w.fetchJson('/api/session?vm_state=true'); } catch (e) { return e.network || e.status >= 500 || e.status === 429 ? 'error' : 'waiting'; }
   if (!session?.endpoint_url || !session?.vm_id) return 'session';
   let token;
   try { token = await w.fetchJson('/api/hatch/token', {vmAddress: session.endpoint_url, vmName: session.vm_name, force_refresh: true}); } catch { return 'token'; }

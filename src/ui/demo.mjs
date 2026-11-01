@@ -37,7 +37,7 @@ class DemoAgent extends EventEmitter {
     } else this.emit('tool-start', call);
     if (command === 'system.run') for (const l of view.tail) { await sleep(250); this.emit('tool-output', {id: call.id, chunk: l + '\n'}); }
     await sleep(ms);
-    this.emit('tool-end', {...call, ok: true, view});
+    this.emit('tool-end', {...call, ok: true, view, output: (view.tail || []).join('\n')});
     return true;
   }
   async send() {

@@ -9,6 +9,9 @@
 // denylist fallback.
 
 const MODES = ['default', 'auto-edit', 'plan', 'bypass'];
+// A mode as people type it, for /mode and --mode alike: any case and the common words.
+const MODE_WORDS = {auto: 'auto-edit', autoedit: 'auto-edit', edit: 'auto-edit', readonly: 'plan', 'read-only': 'plan', read: 'plan', ask: 'default', yolo: 'bypass'};
+function modeFrom(word) { const w = String(word || '').trim().toLowerCase(); const m = MODE_WORDS[w] || w; return MODES.includes(m) ? m : null; }
 const LABELS = {
   'default': '毎回確認', 'auto-edit': '編集は自動', 'plan': '読み取り専用 (plan)', 'bypass': 'すべて自動 (bypass)',
 };
@@ -251,13 +254,17 @@ function alwaysKey(kind, params, command) {
 // Repository config can make a read-only git command run a program: core.fsmonitor on `git status`
 // ran a planted command (2026-11-01), and so can external diff drivers, textconv, filters and
 // pagers. Before a git read goes through unasked, the repo's own config (with its includes) is
-// checked; the user's global config is theirs and trusted.
-const GIT_RUNS = /^(core\.(fsmonitor|pager|editor|sshcommand|hookspath|gitproxy|askpass|alternaterefscommand)|diff\.external|(diff|merge)\.[^=]*\.(command|textconv|driver)|filter\.[^=]*\.(clean|smudge|process)|pager\.|sequence\.editor|gpg\.|uploadpack\.|credential\.|include\.|includeif\.)/i;
+// checked; the user's global config is theirs and trusted. Only keys the allowed read commands
+// (status, log, diff, show, blame, ls-files, grep …) act on: hooks, ssh, editors and credentials
+// never run for them, and husky's core.hooksPath or a deploy key's core.sshCommand made every git
+// read in such a repo ask (and plan mode refuse it). Includes are listed with their contents.
+const GIT_RUNS = /^(core\.(fsmonitor|pager)|diff\.external|(diff|merge)\.[^=]*\.(command|textconv|driver)|filter\.[^=]*\.(clean|smudge|process)|pager\.|gpg\.)/i;
 function gitConfigRuns(configText) {
   for (const line of String(configText || '').split(/\r?\n/)) {
     const eq = line.indexOf('='), key = (eq < 0 ? line : line.slice(0, eq)).trim(), value = eq < 0 ? '' : line.slice(eq + 1).trim();
     if (!key || !GIT_RUNS.test(key)) continue;
     if (/^core\.fsmonitor$/i.test(key) && /^(true|false|0|1|yes|no|on|off)?$/i.test(value)) continue; // the built-in daemon, or off
+    if (/^filter\.lfs\./i.test(key) && /^git-lfs (filter-process|clean|smudge)\b/.test(value)) continue; // `git lfs install --local`
     return true;
   }
   return false;
@@ -277,6 +284,24 @@ function repoGitConfig(command, cwd) {
   return r.status === 0 || r.status === 1 ? r.stdout : null; // 1: no repo config (or not a repo)
 }
 
+// code.read / code.grep refuse secrets, but a read-only `rg -e . ~/.ssh` (or `rg --hidden` from the
+// home folder, or `git grep --no-index`) ran unasked and printed a private key to Muse. Such a
+// command is not counted as read-only: it asks. Hidden files (.ssh, .env, .npmrc …) are skipped by
+// rg unless a flag turns that off, and any path in the command is checked where it really leads.
+const RG_UNHIDE = /^(--hidden|--no-ignore\S*|--follow|--unrestricted|-[a-zA-Z]*[uL][a-zA-Z]*)$/;
+function readsSecrets(command, cwd) {
+  const tokens = tokensOf(command) || [], head = (tokens[0] || '').toLowerCase();
+  if (head === 'rg' && tokens.some(t => RG_UNHIDE.test(t))) return true;
+  if (head === 'git' && tokens.includes('--no-index')) return true;
+  const {isSensitivePath, realOf} = require('./tools');
+  return tokens.slice(1).some(t => {
+    const v = t.replace(/^--?[\w-]+=/, '');
+    if (!/[\\/~.]|^[a-z]:/i.test(v) || /^-/.test(v)) return false;
+    const p = require('node:path').resolve(cwd, v.replace(/^~(?=[\\/]|$)/, require('node:os').homedir()));
+    return isSensitivePath(p) || isSensitivePath(realOf(p));
+  });
+}
+
 // muser's own settings: writing them could switch on bypass for a folder or add an MCP server
 // that runs a program. Outside bypass such a write always asks, even in auto-edit.
 function muserSettingsPath(file) {
@@ -287,12 +312,14 @@ function muserSettingsPath(file) {
 }
 
 // gitConfig(command, cwd) -> the repo's config text (null when it cannot be read); injectable for tests.
-function decide({mode, kind, command, params, outside, always = new Set(), cwd = process.cwd(), targets = [], gitConfig = repoGitConfig}) {
+// root: the session's working folder. A remembered command counts only when it runs inside it.
+function decide({mode, kind, command, params, outside, always = new Set(), cwd = process.cwd(), root = cwd, targets = [], gitConfig = repoGitConfig}) {
   if (kind === 'read') return 'allow';
   if (mode === 'bypass') return 'allow';
   // MCP tools not annotated read-only: ask (plan mode refuses), unless allowed for the session.
   if (kind === 'mcp') return mode === 'plan' ? 'deny' : always.has(alwaysKey('mcp', params, command)) ? 'allow' : 'ask';
   let ro = kind === 'exec' && readOnlyCommand(params?.command);
+  if (ro && readsSecrets(params.command, cwd)) ro = false;
   if (ro && /^git\b/i.test(String(params.command).trim())) {
     const config = gitConfig(params.command, cwd);
     if (config === null || gitConfigRuns(config)) ro = false;
@@ -300,10 +327,13 @@ function decide({mode, kind, command, params, outside, always = new Set(), cwd =
   if (mode === 'plan') return ro ? 'allow' : 'deny';
   if (ro) return 'allow';
   if (kind === 'edit' && (outside || targets.some(muserSettingsPath))) return 'ask';
-  const key = alwaysKey(kind, params);
-  if (key && always.has(key)) return 'allow';
+  // Remembered for this folder, so only here: "npm test" allowed in one project ran another's
+  // test script unasked when Muse set cwd to that project.
+  const key = alwaysKey(kind, params), rel = require('node:path').relative(root, cwd);
+  const here = kind !== 'exec' || (!rel.startsWith('..') && !require('node:path').isAbsolute(rel));
+  if (key && here && always.has(key)) return 'allow';
   if (kind === 'edit' && mode === 'auto-edit') return 'allow';
   return 'ask';
 }
 
-module.exports = {MODES, LABELS, decide, alwaysKey, readOnlyCommand, gitConfigRuns, muserSettingsPath};
+module.exports = {MODES, modeFrom, LABELS, decide, alwaysKey, readOnlyCommand, gitConfigRuns, muserSettingsPath};

@@ -12,9 +12,12 @@ const {MODES} = require('./policy');
 function file() { return process.env.MUSER_PERMISSIONS_FILE || path.join(os.homedir(), '.muser', 'permissions.json'); }
 function key(cwd) { return path.resolve(cwd || '.').replace(/[\\/]+$/, '').toLowerCase(); }
 
+// {bad: true} when the file is there but is not a permissions file (a hand edit with a stray comma):
+// the next change wrote back only its own folder and erased every other folder's mode and keys.
 function readAll() {
-  try { const j = JSON.parse(fs.readFileSync(file(), 'utf8')); if (j && typeof j.folders === 'object' && !Array.isArray(j.folders)) return j; } catch {}
-  return {version: 1, folders: {}};
+  let raw; try { raw = fs.readFileSync(file(), 'utf8'); } catch { return {version: 1, folders: {}}; }
+  try { const j = require('./config').parseJson(raw); if (j && j.folders && typeof j.folders === 'object' && !Array.isArray(j.folders)) return j; } catch {}
+  return {version: 1, folders: {}, bad: !!raw.trim()};
 }
 function writeAll(data) {
   const f = file(), temp = f + '.tmp-' + crypto.randomBytes(6).toString('hex');
@@ -25,6 +28,7 @@ function writeAll(data) {
 function update(cwd, fn) {
   try {
     const data = readAll(), k = key(cwd);
+    if (data.bad) { try { fs.renameSync(file(), file() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} delete data.bad; }
     const entry = data.folders[k] || {mode: null, allow: []};
     fn(entry); entry.updatedAt = new Date().toISOString();
     data.folders[k] = entry; writeAll(data);

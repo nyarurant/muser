@@ -38,3 +38,17 @@ test('the preamble tells Muse how to write files, to review its diff, and to kee
   assert.match(p, /read your whole diff/);
   assert.match(p, /Change what was asked and nothing more/);
 });
+
+// 2026-11-01: output was decoded chunk by chunk, so a Japanese character split between two chunks
+// turned into U+FFFD (10 of them in 160,000 characters).
+const BROKEN = new RegExp(String.fromCharCode(0xfffd), 'g');
+test('long Japanese command output arrives without broken characters (one-shot and background)', async () => {
+  const {Shells} = require('../src/shells');
+  const cmd = '$s = ("' + '日本語のテキスト' + '" * 20000); Write-Output $s';
+  const r = await runOnce(cmd, {cwd: process.cwd(), timeout: 60000, maxOut: 10 ** 7, clip: s => s});
+  assert.equal((r.stdout.match(BROKEN) || []).length, 0);
+  assert.ok(r.stdout.length >= 160000);
+  const sh = new Shells(), s = sh.start(cmd, {cwd: process.cwd()});
+  while (s.running) await new Promise(res => setTimeout(res, 100));
+  assert.equal((s.out.match(BROKEN) || []).length, 0);
+});

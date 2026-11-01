@@ -56,6 +56,7 @@ test('plan usage: the subscription line of the server action reply is read and s
 });
 
 test('plan usage: a stale cached action id is looked up again once', async t => {
+  usage.resetWeb();
   const dir = tmp(t); process.env.MUSER_USAGE_FILE = path.join(dir, 'usage.json'); t.after(() => { delete process.env.MUSER_USAGE_FILE; });
   fs.writeFileSync(path.join(dir, 'subscription-action.json'), JSON.stringify({id: 'old'}));
   const good = 'a'.repeat(42), pages = {
@@ -72,4 +73,18 @@ test('plan usage: a stale cached action id is looked up again once', async t => 
   assert.equal(p.percentUsed, 12);
   assert.deepEqual(calls, ['old', good]);
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'subscription-action.json'), 'utf8')).id, good, 'the new id is cached');
+});
+
+// A lapsed login made every read fail, and each failure crawled the site's page chunks again.
+test('plan usage: a failing read crawls for the action id at most once an hour', async t => {
+  usage.resetWeb();
+  const dir = tmp(t); process.env.MUSER_USAGE_FILE = path.join(dir, 'usage.json'); t.after(() => { delete process.env.MUSER_USAGE_FILE; });
+  fs.writeFileSync(path.join(dir, 'subscription-action.json'), JSON.stringify({id: 'cached'}));
+  let crawls = 0;
+  const web = {
+    pageText: async route => { if (route === '/') crawls++; return route === '/' ? '<script src="/_next/static/chunks/a.js"></script>' : '(0,r.createServerReference)("' + 'b'.repeat(42) + '",r.callServer,void 0,r.findSourceMapURL,"fetchSubscriptionAction")'; },
+    serverAction: async () => ({ok: false, status: 401, text: ''}), // logged out: every read fails
+  };
+  for (let i = 0; i < 3; i++) await assert.rejects(usage.plan(web));
+  assert.equal(crawls, 1, 'crawled once, not on every read');
 });

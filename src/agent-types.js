@@ -29,7 +29,9 @@ const BUILTIN = {
 };
 
 function parse(file) {
-  const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  // A BOM hid the frontmatter: "readonly: true" was lost and the whole file became the prompt.
+  let text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
   if (!m && text.startsWith('---') && !text.split('\n').slice(1).some(line => line.trim() === '---'))
     throw new Error(t('frontmatter が閉じていません（終わりの --- がありません）'));
@@ -40,21 +42,36 @@ function parse(file) {
   return {name, def: {description: meta.description || name, readOnly: /^(true|yes|1)$/i.test(meta.readonly || ''), tools, prompt: (m ? m[2] : text).trim(), file}};
 }
 
+// Each warning once per process: types are loaded again for every agent and /agent, and the same
+// notice piled up on the screen each time.
+const warned = new Set();
+function warnOnce(key, text) { if (warned.has(key)) return; warned.add(key); console.error(text); }
 function load(cwd) {
   const types = Object.fromEntries(Object.entries(BUILTIN).map(([k, v]) => [k, {...v, builtin: true}]));
-  for (const dir of [path.join(os.homedir(), '.muser', 'agents'), path.join(cwd, '.muser', 'agents')]) {
+  const userDir = path.join(os.homedir(), '.muser', 'agents'), projectDir = path.join(cwd, '.muser', 'agents');
+  for (const dir of [userDir, projectDir]) {
     let files = []; try { files = fs.readdirSync(dir).filter(f => f.endsWith('.md')); } catch {}
+    // A project's types come with the repository: one may replace a type's prompt, but a type that
+    // was read-only stays read-only, with no tools beyond the ones it had (a repo's review.md turned
+    // the read-only built-in reviewer into one that writes).
+    const fromProject = path.resolve(dir) === path.resolve(projectDir) && path.resolve(dir) !== path.resolve(userDir);
     for (const f of files) {
       const file = path.join(dir, f);
       let parsed;
       try { parsed = parse(file); } catch (e) {
-        console.error(t('muser: エージェント定義を読み込めませんでした: {file}: {reason}', {file, reason: String(e?.message || e).replace(/\s*\n\s*/g, ' ')}));
+        warnOnce('bad:' + file, t('muser: エージェント定義を読み込めませんでした: {file}: {reason}', {file, reason: String(e?.message || e).replace(/\s*\n\s*/g, ' ')}));
         continue;
       }
       const {name, def} = parsed;
       if (!name) continue;
+      const before = types[name];
+      if (fromProject && before?.readOnly) {
+        def.readOnly = true;
+        const allowed = before.tools;
+        def.tools = !def.tools ? allowed : allowed ? def.tools.filter(x => allowed.includes(x)) : def.tools;
+      }
       if (Object.prototype.hasOwnProperty.call(BUILTIN, name))
-        console.error(t('muser: 組み込みエージェント {name} は {file} で上書きされます', {name, file}));
+        warnOnce('shadow:' + file, t('muser: 組み込みエージェント {name} は {file} で上書きされます', {name, file}));
       types[name] = def;
     }
   }

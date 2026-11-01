@@ -35,7 +35,7 @@ function load() {
   let raw;
   try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return {mcpServers: {}}; }
   let cfg = null;
-  try { cfg = JSON.parse(raw); } catch {}
+  try { cfg = require('./config').parseJson(raw); } catch {}
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
     // Corrupt config: keep the bytes for recovery instead of silently starting empty.
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');

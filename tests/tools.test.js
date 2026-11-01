@@ -114,7 +114,7 @@ test('grep and glob skip OneDrive unless aimed inside it, and do not block the e
   assert.match(wide, /here\.md/); assert.ok(!/onedrive/i.test(wide), wide);
   assert.match((await TOOLS['code.grep'].run({pattern: 'needle', path: 'OneDrive'}, c)).payload.output, /note\.md/);
   assert.deepEqual((await TOOLS['code.glob'].run({pattern: '*.md'}, c)).payload.files, ['here.md']);
-  assert.deepEqual((await TOOLS['code.glob'].run({pattern: '**/*.md', path: 'OneDrive'}, c)).payload.files, [path.join('Docs', 'note.md')]);
+  assert.deepEqual((await TOOLS['code.glob'].run({pattern: '**/*.md', path: 'OneDrive'}, c)).payload.files, [path.join('OneDrive', 'Docs', 'note.md')], 'relative to the working folder, not to the folder searched');
 });
 
 test('code.read refuses files over 10MB', () => {

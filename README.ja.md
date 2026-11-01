@@ -63,6 +63,8 @@ muser
 
 起動するたびに、裏で npm に新しい版があるかを確認し、あれば下の情報欄に出します（`⬆ v… · /update`）。`/update` で `npm install -g muser-cli@latest` を実行して更新します。勝手にインストールはしません。確認を止めるには、環境変数 `MUSER_NO_UPDATE_CHECK=1` か、`~/.muser/config.json` の `{"updateCheck": false}` を使います。
 
+表示を静かにするには、`NO_COLOR=1` で色を消し、`MUSER_NO_BELL=1`（または `{"bell": false}`）で承認や並列エージェントの完了のときのベルを止め、`MUSER_REDUCED_MOTION=1` でスピナーを止められます。
+
 ## コマンド
 
 | コマンド | 説明 |

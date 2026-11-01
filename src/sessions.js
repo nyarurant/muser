@@ -15,28 +15,55 @@ function backupCorrupt() {
 function all() {
   let raw;
   try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return []; }
-  try { const list = JSON.parse(raw); if (Array.isArray(list)) return list; } catch {}
+  // Entries that are not sessions (a hand edit left a null) are skipped: one made recent() throw,
+  // and with it muser -c, /resume and `muser resume`.
+  try { const list = JSON.parse(raw); if (Array.isArray(list)) return list.filter(s => s && typeof s === 'object' && typeof s.id === 'string'); } catch {}
   backupCorrupt();
   return [];
 }
 // Atomic save: write a uniquely named temp file, then rename over the target, so a
 // crash mid-write can never leave a truncated sessions.json behind.
+// The index keeps the newest 200 of the user's sessions and, apart, the newest 50 parallel-agent
+// sessions (parent set): in one shared 200, a few agent-heavy tasks pushed the user's own chats
+// out of /resume, and their transcripts were deleted with them.
+const KEEP_USER = 200, KEEP_AGENT = 50;
 function write(list) {
   fs.mkdirSync(store.DIR, {recursive: true});
+  const users = list.filter(s => !s.parent), agents = list.filter(s => s.parent);
+  const kept = new Set([...users.slice(-KEEP_USER), ...agents.slice(-KEEP_AGENT)]);
   const temp = FILE + '.tmp-' + crypto.randomBytes(6).toString('hex');
   try {
-    fs.writeFileSync(temp, JSON.stringify(list.slice(-200), null, 1));
+    fs.writeFileSync(temp, JSON.stringify(list.filter(s => kept.has(s)), null, 1));
     fs.renameSync(temp, FILE);
   } catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
+  // Transcripts of the sessions dropped went nowhere and grew forever.
+  for (const s of list) if (!kept.has(s) && s?.id) { try { fs.unlinkSync(transcriptFile(s.id)); } catch {} }
+}
+// sessions.json is read, changed and written by every muser window; two windows doing it at the
+// same moment dropped one's update. A lock file serializes the change (a lock older than 5 s is
+// taken to be left by a crashed window).
+function locked(fn) {
+  const lock = FILE + '.lock', until = Date.now() + 2000;
+  fs.mkdirSync(store.DIR, {recursive: true});
+  for (;;) {
+    try { fs.closeSync(fs.openSync(lock, 'wx')); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') return fn();
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 5000) { fs.unlinkSync(lock); continue; } } catch { continue; }
+      if (Date.now() > until) return fn(); // never block a turn on a stuck lock
+      const end = Date.now() + 15; while (Date.now() < end) { /* brief spin: this runs between turns, not in a render */ }
+    }
+  }
+  try { return fn(); } finally { try { fs.unlinkSync(lock); } catch {} }
 }
 
 function create(cwd) { return {id: crypto.randomUUID(), cwd, title: '', created: Date.now(), updated: Date.now(), turns: 0}; }
 function touch(session, text) {
   session.turns++; session.updated = Date.now();
   if (!session.title) session.title = String(text).replace(/\s+/g, ' ').slice(0, 60);
-  const list = all().filter(s => s.id !== session.id); list.push(session); write(list);
+  locked(() => { const list = all().filter(s => s.id !== session.id); list.push(session); write(list); });
 }
-function recent(cwd) { return all().filter(s => !s.parent && (!cwd || s.cwd.toLowerCase() === cwd.toLowerCase())).sort((a, b) => b.updated - a.updated); }
+function recent(cwd) { return all().filter(s => !s.parent && (!cwd || String(s.cwd || '').toLowerCase() === cwd.toLowerCase())).sort((a, b) => (b.updated || 0) - (a.updated || 0)); }
 // Every session whose id is `ref` (exact) or starts with `ref` (prefix).
 function findAll(ref) {
   if (!ref) return [];

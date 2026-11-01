@@ -77,3 +77,37 @@ test('skill.read is a read tool that read-only agent types may use', () => {
   assert.equal(TOOLS['skill.read'].kind, 'read');
   assert.ok(agentTypes.allows(agentTypes.load(process.cwd()).explore, 'skill.read'));
 });
+
+test('a SKILL.md saved with a BOM keeps its description', t => {
+  const {proj, put} = sandbox(t);
+  put(path.join(proj, '.muser', 'skills'), 'bom', String.fromCharCode(0xfeff) + '---\nname: bom\ndescription: Saved by Notepad\n---\nbody');
+  const s = require('../src/skills').load(proj).find(x => x.name === 'bom');
+  assert.equal(s.description, 'Saved by Notepad');
+});
+
+test('skill.read does not follow a link out of the skill or read a secret', t => {
+  const {home, proj, put} = sandbox(t);
+  const ssh = path.join(home, '.ssh'); fs.mkdirSync(ssh); fs.writeFileSync(path.join(ssh, 'mykey'), 'PRIVATE');
+  put(path.join(proj, '.claude', 'skills'), 'evil', '---\nname: evil\ndescription: x\n---\n', {'notes.md': 'fine', '.env': 'SECRET=1'});
+  fs.symlinkSync(ssh, path.join(proj, '.claude', 'skills', 'evil', 'keys'), 'junction');
+  const skills = require('../src/skills');
+  assert.equal(skills.read(proj, {name: 'evil', path: 'notes.md'}).content, 'fine');
+  assert.throws(() => skills.read(proj, {name: 'evil', path: 'keys/mykey'}), /inside the skill folder|sensitive/);
+  assert.throws(() => skills.read(proj, {name: 'evil', path: '.env'}), /sensitive/);
+});
+
+test('a config.json that does not parse is kept aside, not wiped, when a setting is saved', t => {
+  const {home} = sandbox(t);
+  const dir = path.join(home, '.muser'); fs.mkdirSync(dir, {recursive: true});
+  const f = path.join(dir, 'config.json'), broken = '{"lang": "ja", "maxAgents": 0,}';
+  fs.writeFileSync(f, broken);
+  require('../src/skills').setEnabled('x', false);
+  const aside = fs.readdirSync(dir).find(n => n.startsWith('config.json.corrupt-'));
+  assert.ok(aside, 'the unreadable file was moved aside');
+  assert.equal(fs.readFileSync(path.join(dir, aside), 'utf8'), broken);
+  fs.writeFileSync(f, JSON.stringify({lang: 'ja', maxAgents: 0, skills: {disabled: ['x']}}));
+  require('../src/skills').setEnabled('y', false);
+  const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+  assert.equal(cfg.maxAgents, 0, 'other settings survive a save');
+  assert.deepEqual(cfg.skills.disabled, ['x', 'y']);
+});

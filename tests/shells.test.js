@@ -60,3 +60,14 @@ test('runOnce resolves on timeout and on abort instead of hanging', async () => 
   assert.equal(r2.killed, 'cancelled');
   assert.ok(Date.now() - t1 < 15000, 'abort result arrives promptly, took ' + (Date.now() - t1) + 'ms');
 });
+
+test('a background command that asks for input gets end-of-input instead of waiting forever', async () => {
+  const shells = new Shells();
+  const s = shells.start('set /p X=name? & echo got [%X%]', {shell: 'cmd', cwd: process.cwd()});
+  try {
+    const r = await shells.output(s.id, {waitS: 0});
+    for (let i = 0; i < 40 && s.running; i++) await new Promise(res => setTimeout(res, 250));
+    assert.equal(s.running, false, 'it ended: ' + JSON.stringify(r));
+    assert.match(s.out, /got \[/);
+  } finally { shells.killAll(); }
+});

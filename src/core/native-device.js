@@ -507,10 +507,10 @@ class NativeDevice extends EventEmitter {
     const command = typeof message.command === 'string' ? message.command : '';
     const params = isRecord(message.params) ? message.params : {};
     // muser: parallel agents call tools at the same time; allow a few concurrent invokes.
+    // 'busy' is not remembered as the call's result: a re-send of the same id (Muse re-sends after
+    // a reconnect) must run once a slot is free, not get 'busy' from the record forever.
     if (this._inflightInvokes.size >= MAX_CONCURRENT_INVOKES) {
-      const result = {ok: false, error: 'busy'};
-      this._rememberCompleted(invokeId, result);
-      this._sendResult(invokeId, result).catch(() => {});
+      this._sendResult(invokeId, {ok: false, error: 'busy'}).catch(() => {});
       return;
     }
     const timeoutMs = Number.isFinite(message.timeout_ms) && message.timeout_ms > 0

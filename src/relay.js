@@ -11,7 +11,13 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const defaultDir = () => process.env.MUSER_RELAY_DIR || path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser', 'instances');
-const ASK_MS = 2000;
+// A window busy with a big edit or a slow tool may answer late; 2 s counted such a window as gone.
+const ASK_MS = 4000;
+// How long the handing window waits for the answer, past Muse's timeout: as long as the window
+// running it may still take an approval (src/agent.js deadline: timeout + 30 s), and a little
+// more. It gave up 5 s past the timeout, and told Muse "muser is idle" about a call another
+// window was still showing for approval and could still run.
+const INVOKE_MARGIN_MS = 35000;
 
 function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 
@@ -60,7 +66,8 @@ class Relay {
     this.server.on('error', () => {});
     this.server.listen(this.pipe);
     this.server.unref();
-    try { fs.mkdirSync(this.dir, {recursive: true}); fs.writeFileSync(this.file, JSON.stringify({pid: process.pid, pipe: this.pipe})); } catch {}
+    // Through a temp file, so another window never reads half an entry.
+    try { fs.mkdirSync(this.dir, {recursive: true}); fs.writeFileSync(this.file + '.tmp', JSON.stringify({pid: process.pid, pipe: this.pipe})); fs.renameSync(this.file + '.tmp', this.file); } catch {}
     return this;
   }
   stop() {
@@ -72,22 +79,28 @@ class Relay {
     let names = []; try { names = fs.readdirSync(this.dir); } catch { return []; }
     const out = [];
     for (const n of names) {
+      if (!n.endsWith('.json')) continue; // a .tmp being written
       const f = path.join(this.dir, n);
       let e; try { e = JSON.parse(fs.readFileSync(f, 'utf8')); } catch { continue; }
       if (!e?.pipe || e.pipe === this.pipe) continue;
       if (!alive(e.pid)) { try { fs.unlinkSync(f); } catch {} continue; }
-      out.push(e);
+      out.push({...e, file: f});
     }
     return out;
   }
-  // {result} when exactly one other window takes the call; else {takers: n} (0, or 2+ = ambiguous).
+  // {result} when exactly one other window takes the call; else {takers: n} (0, or 2+ = ambiguous);
+  // {takers: 1, error} when the one that took it did not answer.
   async forward(command, params, timeoutMs, id) {
-    const answers = await Promise.all(this.peers().map(p => request(p.pipe, {type: 'takes', params}, ASK_MS).then(r => r.takes ? p : null, () => null)));
+    // An entry whose pipe is gone (its pid now belongs to another program) is removed.
+    const ask = p => request(p.pipe, {type: 'takes', params}, ASK_MS).then(r => r.takes ? p : null, e => { if (e.code === 'ENOENT') { try { fs.unlinkSync(p.file); } catch {} } return null; });
+    const answers = await Promise.all(this.peers().map(ask));
     const takers = answers.filter(Boolean);
     if (takers.length !== 1) return {takers: takers.length};
-    const r = await request(takers[0].pipe, {type: 'invoke', command, params, timeoutMs, id}, (timeoutMs || 600000) + 5000);
-    return {result: r.result};
+    try {
+      const r = await request(takers[0].pipe, {type: 'invoke', command, params, timeoutMs, id}, (timeoutMs || 600000) + INVOKE_MARGIN_MS);
+      return {result: r.result};
+    } catch (e) { return {takers: 1, error: e.message}; }
   }
 }
 
-module.exports = {Relay};
+module.exports = {Relay, INVOKE_MARGIN_MS};

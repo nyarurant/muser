@@ -8,7 +8,9 @@ const CAPS = ['ACTIVITY_FEED_GOALS', 'ACTIVITY_FEED_PEER_CONVERSATIONS'];
 const POLL_MS = 2000;
 const TERMINAL = new Set(['SUCCESS', 'FAILED', 'ERROR', 'CANCELLED']);
 // Muse's record of calls to this PC repeats what muser already shows; only its failures are kept.
-const DEVICE = /\b(devices?|homelink-\w+|muser cli|tool namespace)\b|cli \(muser\)/i; // device names are "<hostname> CLI (muser)"
+// Only phrasing about calls to devices: a bare "devices?" also hid Muse's own web searches ("Found 16
+// web results for best Android devices"). Records this misses are still dropped by duringToolCall.
+const DEVICE = /\b(paired devices?|device commands?|devices? (?:link|tools?|calls?)|homelink-\w+|muser cli|tool namespace)\b|cli \(muser\)/i; // device names are "<hostname> CLI (muser)"
 
 const clean = s => String(s || '').replace(/[⁦-⁩]/g, '').replace(/\s+/g, ' ').trim();
 

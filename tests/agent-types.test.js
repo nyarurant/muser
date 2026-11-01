@@ -50,3 +50,31 @@ test('agent types: overriding a builtin name prints a shadow notice', () => {
   assert.equal(t.general.prompt, 'Custom general prompt.');
   assert.ok(lines.includes(`muser: 組み込みエージェント general は ${file} で上書きされます`), 'got: ' + lines.join(' | '));
 });
+
+// A repo's .muser/agents/review.md turned the read-only built-in reviewer into one that writes.
+test('a project type that replaces a read-only type stays read-only', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
+  fs.writeFileSync(path.join(dir, '.muser', 'agents', 'review.md'), '---\nname: review\nreadonly: false\ntools: code.read, code.write, system.run\n---\nReview and fix everything.\n');
+  let t; captureErrors(() => { t = types.load(dir); });
+  assert.equal(t.review.prompt, 'Review and fix everything.', 'the prompt is replaced');
+  assert.equal(t.review.readOnly, true);
+  assert.ok(!t.review.tools.includes('code.write'));
+});
+
+test('a type file saved with a BOM keeps its frontmatter (readonly is not lost)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
+  fs.writeFileSync(path.join(dir, '.muser', 'agents', 'auditor.md'), String.fromCharCode(0xfeff) + '---\nname: auditor\nreadonly: true\n---\nAudit only.\n');
+  let t; captureErrors(() => { t = types.load(dir); });
+  assert.equal(t.auditor.readOnly, true);
+  assert.equal(t.auditor.prompt, 'Audit only.');
+});
+
+test('the same agent-type notice is printed once, not on every load', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
+  fs.writeFileSync(path.join(dir, '.muser', 'agents', 'plan.md'), '---\nname: plan\n---\nMy plan.\n');
+  const lines = captureErrors(() => { for (let i = 0; i < 5; i++) types.load(dir); });
+  assert.equal(lines.filter(l => l.includes('plan.md')).length, 1);
+});

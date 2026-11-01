@@ -14,7 +14,7 @@ const {NativeDevice} = require('./core/native-device');
 const {MuseSteps, citations} = require('./muse-steps');
 const {waitForReply} = require('./core/agent-reply');
 const {messageFromEvent} = require('./core/chat-model');
-const {TOOLS, commandsV2, inside} = require('./tools');
+const {TOOLS, commandsV2, inside, realOf} = require('./tools');
 const {decide} = require('./policy');
 const sessions = require('./sessions');
 const agentTypes = require('./agent-types');
@@ -23,6 +23,7 @@ const {Relay} = require('./relay');
 const {t} = require('./i18n');
 
 const DEVICE_NAME = os.hostname() + ' CLI (muser)';
+const INVOKE_GRACE_MS = 30000; // the device link's watchdog margin over Muse's timeout
 const INSTRUCTION_FILES = ['AGENTS.md', 'CLAUDE.md', 'MUSE.md', '.muser/instructions.md'];
 const MAX_AGENTS = 4;
 // Parallel-agent limits are the user's to set: a flag, else MUSER_MAX_AGENTS(_TOTAL), else
@@ -30,7 +31,7 @@ const MAX_AGENTS = 4;
 // perTurn = started during one main turn (default 0). 0 means no limit.
 function resolveAgentLimits({maxAgents, maxAgentsTotal} = {}, env = process.env, configFile = path.join(os.homedir(), '.muser', 'config.json')) {
   let cfg = {};
-  try { cfg = JSON.parse(fs.readFileSync(configFile, 'utf8')) || {}; } catch {}
+  try { cfg = require('./config').readJson(configFile) || {}; } catch {}
   const pick = (...values) => {
     for (const v of values) {
       if (v === undefined || v === null || v === '') continue;
@@ -60,16 +61,18 @@ function projectInstructions(cwd) {
     }
     const up = path.dirname(dir); if (up === dir) break; dir = up;
   }
-  // Cap the TOTAL across all files: a stack of ancestor instruction files must not
-  // eat the whole context. The last file that still fits is truncated and marked.
+  // Cap the TOTAL across all files: a stack of ancestor instruction files must not eat the whole
+  // context. The budget goes to the nearest files first (the project's own are the most specific;
+  // outermost-first cut the project's AGENTS.md whenever a parent folder held a long one), and the
+  // files are then listed outermost first, general before specific.
   const capped = [];
   let remaining = MAX_PROJECT_INSTRUCTION_CHARS;
-  for (const entry of found.reverse()) {
+  for (const entry of found) {
     if (remaining <= 0) break;
     if (entry.text.length <= remaining) { capped.push(entry); remaining -= entry.text.length; }
     else { const keep = Math.max(0, remaining - PROJECT_INSTRUCTION_TRUNCATION_NOTE.length - 1); capped.push({file: entry.file, text: entry.text.slice(0, keep) + '\n' + PROJECT_INSTRUCTION_TRUNCATION_NOTE}); remaining = 0; }
   }
-  return capped;
+  return capped.reverse();
 }
 
 function preamble(cwd, mcpNames, {tag, by, type, typeName, limits} = {}) {
@@ -179,7 +182,8 @@ class Agent extends EventEmitter {
     this.retries = 0; this.retryTimer = null; this.reconnecting = null; this.closed = false;
     this.invokes = {inflight: new Map(), completed: new Map()};
     this.steps = new MuseSteps(client, e => this.onMuseStep(e));
-    client.on('status', ({status}) => { if (!['connected', 'connecting', 'auth_required'].includes(status)) this.scheduleReconnect(); });
+    client.on('status', ({status}) => { if (status !== 'connected') this.subscribed = false; if (!['connected', 'connecting', 'auth_required'].includes(status)) this.scheduleReconnect(); });
+    client.on('stream-end', s => this.onStreamClosed(s)); client.on('stream-error', s => this.onStreamClosed(s));
   }
   get main() { return this.workers.get('main'); }
   get session() { return this.main.session; }
@@ -193,7 +197,9 @@ class Agent extends EventEmitter {
     return Object.fromEntries(Object.entries(all).map(([k, d]) => [k, {...d, optional: {...(d.optional || {}), ...AGENT_PARAM}}]));
   }
   async connectDevice() {
+    if (this.closed) throw new Error('closed');
     const vm = await this.auth.vm();
+    if (this.closed) throw new Error('closed');
     // Other muser windows on this PC hand over calls that Muse sent here but belong to their turns.
     if (!this.relay && !this.closed) this.relay = new Relay({takes: p => !!this.route(p), run: (c, p, t, id) => this.execute(c, p, t, id, {forwarded: true})}).start();
     const old = this.device;
@@ -201,21 +207,29 @@ class Agent extends EventEmitter {
     old?.disconnect();
     device.on('status', s => { this.emit('device', s); if (!s.connected && s.message !== 'connecting' && device === this.device) this.scheduleReconnect(); });
     await device.connect({vm, nodeId: this.auth.saved.nodeId});
+    // A window closed meanwhile must not stay the device Muse sends calls to.
+    if (this.closed) { device.disconnect(); throw new Error('closed'); }
   }
   // Sleep, a network change or a gateway restart closes the sockets, and nothing reopened them:
   // every later turn failed with "not connected" until muser was restarted. Reopen whatever is
   // down before each turn, and in the background (backing off) as soon as a socket drops.
   ensureConnected() {
     return this.reconnecting ??= (async () => {
-      const down = this.client.status !== 'connected' || this.client.ws?.readyState !== 1 || !this.device?.connected;
+      if (this.closed) throw new Error('closed');
+      const down = this.client.status !== 'connected' || this.client.ws?.readyState !== 1 || !this.subscribed || !this.device?.connected;
       const first = !this.everConnected;
       if (down) this.emit('connection', {state: first ? 'connecting' : 'reconnecting'});
       if (this.client.status === 'connected' && this.client.ws?.readyState !== 1) this.client.disconnect(false);
-      if (this.client.status !== 'connected') {
-        await this.client.connect(); await this.client.subscribe();
+      // A subscribe that failed after a good connect left the gateway "connected" but deaf, and the
+      // next attempt skipped it: replies never streamed again. It is tracked on its own now.
+      if (this.client.status !== 'connected' || !this.subscribed) {
+        if (this.client.status !== 'connected') { this.subscribed = false; await this.client.connect(); }
+        if (this.closed) throw new Error('closed');
+        await this.client.subscribe(); this.subscribed = true; this.subscribedAt = Date.now();
         // Turns that were running follow their chats again (the old subscriptions died with the socket).
         for (const w of this.workers.values()) if (w.turn?.owner) { this.client.subscribeAgent(w.session.id, w.turn.owner).catch(() => {}); w.turn.waiting?.refresh(); }
       }
+      if (this.closed) throw new Error('closed');
       if (!this.device?.connected) await this.connectDevice();
       this.retries = 0; this.everConnected = true;
       if (down) this.emit('connection', {state: 'connected', first});
@@ -232,6 +246,22 @@ class Agent extends EventEmitter {
     }, delay);
     this.retryTimer.unref?.();
   }
+  // The gateway can end a /chat/subscribe stream while the socket stays up; nothing opened it
+  // again, so replies stopped streaming (only the 5 s poll still found them) until a drop. The
+  // main subscription is opened again, backing off when it keeps ending soon after it opened; a
+  // running turn's own subscription is reopened for that turn.
+  onStreamClosed({path, scope} = {}) {
+    if (path !== '/chat/subscribe' || this.closed) return;
+    if (scope) {
+      for (const w of this.workers.values()) if (w.turn?.owner === scope) { this.client.subscribeAgent(w.session.id, scope).catch(() => {}); w.turn.waiting?.refresh(); }
+      return;
+    }
+    this.subscribed = false;
+    this.resubscribes = Date.now() - (this.subscribedAt || 0) < 30000 ? (this.resubscribes || 0) + 1 : 0;
+    clearTimeout(this.resubTimer);
+    this.resubTimer = setTimeout(() => { this.ensureConnected().catch(() => this.scheduleReconnect()); }, Math.min(60000, 1000 * 2 ** this.resubscribes));
+    this.resubTimer.unref?.();
+  }
   // Commands are fixed at link.register, so a change in MCP servers re-registers the device.
   async reconnectDevice() { if (this.busy) throw new Error(t('作業中は切り替えられません')); await this.connectDevice(); }
 
@@ -246,6 +276,7 @@ class Agent extends EventEmitter {
       // Muse may have sent this to the wrong muser window on this PC (src/relay.js).
       const r = !forwarded && this.relay ? await this.relay.forward(command, rawParams, timeoutMs, id).catch(() => null) : null;
       if (r?.result) return r.result;
+      if (r?.error) return {ok: false, error: 'This call went to another muser window on this PC, the one whose task it belongs to, and its answer did not come back (' + r.error + '). It may have run there; check before trying it again.'};
       if (r?.takers > 1) return {ok: false, error: 'Several muser windows on this PC are working at once, and this call could not be matched to its window. Try the call again; if it keeps failing, tell the user to run one muser task at a time.'};
       return {ok: false, error: 'muser is idle: only a turn sent from this terminal may use this device.'};
     }
@@ -254,10 +285,12 @@ class Agent extends EventEmitter {
       const error = command + ' is not available to the ' + w.typeName + ' agent type (allowed: ' + w.type.tools.join(', ') + ').';
       this.emit('agent-tool', {id, agent: w.tag, command, params, summary: '', ok: false, error}); return {ok: false, error};
     }
-    if (command.startsWith('mcp.') && this.mcp?.commands.has(command)) return this.executeMcp(w, command, params, id);
+    if (command.startsWith('mcp.') && this.mcp?.commands.has(command)) return this.executeMcp(w, command, params, id, timeoutMs);
     const tool = TOOLS[command];
     if (!tool) return {ok: false, error: 'Unknown command ' + command};
-    const call = {id, agent: w.tag, command, params, kind: tool.kind, summary: safe(() => tool.summary(params)) || ''};
+    // deadline: when the device link answers Muse invoke_timeout for this call (Muse's timeout + the
+    // link's 30 s watchdog, src/core/native-device.js); an approval past it is void.
+    const call = {id, agent: w.tag, command, params, kind: tool.kind, summary: safe(() => tool.summary(params)) || '', ...(timeoutMs ? {deadline: Date.now() + timeoutMs + INVOKE_GRACE_MS} : {})};
     // Attach the approval preview (diff for edit/write/patch) BEFORE decide/ask, so the
     // approver and the UI can show what will change. A broken preview never blocks the call.
     if (typeof tool.preview === 'function') { const preview = safe(() => tool.preview(params, w.ctx)); if (preview !== undefined) call.preview = preview; }
@@ -265,8 +298,10 @@ class Agent extends EventEmitter {
     if (consumeToolCall(w.turn, this.maxToolCallsPerTurn)) return this.toolEnd(w, call, {ok: false, error: toolLimitMessage(this.maxToolCallsPerTurn)});
     try {
       const targets = [].concat(tool.target ? safe(() => tool.target(params, w.ctx)) || [] : []);
-      const cwd = typeof params.cwd === 'string' && params.cwd.trim() ? path.resolve(w.ctx.cwd, params.cwd) : w.ctx.cwd;
-      const verdict = decide({mode: this.modeFor(w), kind: tool.kind, command, params, outside: targets.some(t => !inside(this.cwd, t)), targets, cwd, always: this.allowAlways});
+      const cwd = realOf(typeof params.cwd === 'string' && params.cwd.trim() ? path.resolve(w.ctx.cwd, params.cwd) : w.ctx.cwd);
+      // Compared where the paths really lead: a junction in the project must not carry a write outside it.
+      const realTargets = targets.map(realOf), realCwd = realOf(this.cwd);
+      const verdict = decide({mode: this.modeFor(w), kind: tool.kind, command, params, outside: realTargets.some(t => !inside(realCwd, t)), targets: realTargets, cwd, root: realCwd, always: this.allowAlways});
       if (verdict === 'deny') return this.toolEnd(w, call, {ok: false, error: (w.type?.readOnly ? 'This ' + w.typeName + ' agent is read-only' : 'Not allowed in ' + this.mode + ' mode (read-only)') + '. Explain what you would change instead.'});
       if (verdict === 'ask') { const no = await this.ask(w, call); if (no) return no; }
       const r = await tool.run(params, w.ctx, w.turn?.controller.signal, chunk => this.emit('tool-output', {id, agent: w.tag, chunk}));
@@ -275,9 +310,9 @@ class Agent extends EventEmitter {
     } catch (e) { return this.toolEnd(w, call, {ok: false, error: e.message}); }
   }
 
-  async executeMcp(w, command, params, id) {
+  async executeMcp(w, command, params, id, timeoutMs) {
     const m = this.mcp.commands.get(command);
-    const call = {id, agent: w.tag, command, params, kind: 'mcp', mcp: {server: m.server, tool: m.tool, readOnly: m.readOnly}, summary: m.server + ' · ' + m.tool};
+    const call = {id, agent: w.tag, command, params, kind: 'mcp', mcp: {server: m.server, tool: m.tool, readOnly: m.readOnly}, summary: m.server + ' · ' + m.tool, ...(timeoutMs ? {deadline: Date.now() + timeoutMs + INVOKE_GRACE_MS} : {})};
     this.toolStart(w, call);
     if (consumeToolCall(w.turn, this.maxToolCallsPerTurn)) return this.toolEnd(w, call, {ok: false, error: toolLimitMessage(this.maxToolCallsPerTurn)});
     try {
@@ -301,18 +336,29 @@ class Agent extends EventEmitter {
     this.toolStart(w, call);
     const tags = String(params.tags || '').split(',').map(s => s.trim()).filter(Boolean);
     const list = (tags.length ? tags.map(t => this.workers.get(t)).filter(Boolean) : [...this.workers.values()].filter(x => !x.main));
+    // A tag that names no agent was dropped without a word, and an empty answer read as "all done".
+    const unknown = tags.filter(t => !this.workers.has(t) || this.workers.get(t).main);
+    if (unknown.length && !list.length) return this.toolEnd(w, call, {ok: false, error: 'No parallel agent with tag ' + unknown.join(', ') + '. Running agents: ' + ([...this.workers.values()].filter(x => !x.main).map(x => x.tag).join(', ') || 'none') + '.'});
     const until = Date.now() + Math.min(120, Math.max(1, params.timeout_s | 0 || 60)) * 1000;
     while (list.some(x => x.turn) && Date.now() < until && w.turn && !w.turn.controller.signal.aborted) await new Promise(r => setTimeout(r, 1000));
-    const agents = list.map(x => ({tag: x.tag, title: x.title, state: x.state, ...(x.state === 'done' ? {result: x.result.slice(0, 8000)} : {}), ...(x.error ? {error: x.error} : {}), ...(x.state === 'working' ? {last_tool: x.lastTool} : {})}));
+    const agents = list.map(x => ({tag: x.tag, title: x.title, state: x.state, ...(x.state === 'done' ? {result: x.result.length > 8000 ? x.result.slice(0, 8000) + String.fromCharCode(10) + '… (cut: ' + (x.result.length - 8000) + ' more characters of ' + x.result.length + ')' : x.result, ...(x.result.length > 8000 ? {result_truncated: true} : {})} : {}), ...(x.error ? {error: x.error} : {}), ...(x.state === 'working' ? {last_tool: x.lastTool} : {})}));
     for (const x of list) if (x.state === 'done') x.collected = true; // pruned on the next spawn / wait
-    return this.toolEnd(w, {...call, view: {agents: agents.map(a => a.tag + ' ' + a.state)}}, {ok: true, payload: {agents}});
+    return this.toolEnd(w, {...call, view: {agents: agents.map(a => a.tag + ' ' + a.state)}}, {ok: true, payload: {agents, ...(unknown.length ? {unknown_tags: unknown} : {})}});
   }
 
   // Read-only agent types run under plan rules whatever the session mode is.
   modeFor(w) { return w.type?.readOnly ? 'plan' : this.mode; }
   // Asks the user; returns the refusal to send back, or null when allowed.
   async ask(w, call) {
+    // The approval belongs to this turn: stopped meanwhile (esc, /agents stop), the change must not
+    // run when the approval comes later (it did, after the task was gone). The screen closes it too.
+    const turn = w.turn;
+    if (turn) Object.defineProperty(call, 'abortSignal', {value: turn.controller.signal, enumerable: false});
     const answer = await this.approver(call);
+    if (!turn || w.turn !== turn || turn.controller.signal.aborted) return this.toolEnd(w, {...call, declined: true}, {ok: false, error: 'The task was stopped before the user answered; nothing was done.'});
+    // Muse had already given up on the call (it got invoke_timeout): approving then ran the change
+    // anyway, unseen by Muse, which may try it again. Nothing is done past the deadline.
+    if (answer.expired || (call.deadline && Date.now() > call.deadline)) return this.toolEnd(w, {...call, declined: true}, {ok: false, error: 'Muse stopped waiting for this call before the user answered; nothing was done. Ask again if it is still needed.'});
     if (answer.always) { this.allowAlways.add(answer.always); require('./permissions').addAllow(this.cwd, answer.always); }
     if (answer.allow) return null;
     return this.toolEnd(w, {...call, declined: true}, {ok: false, error: 'The user declined this' + (answer.reason ? ': ' + answer.reason : '.') + ' Do not retry it unless the user asks.'});
@@ -323,7 +369,8 @@ class Agent extends EventEmitter {
     else { w.lastTool = (call.kind === 'mcp' ? 'MCP ' : '') + call.command.replace(/^code\./, '') + (call.summary ? ' ' + call.summary : ''); this.update(w); }
   }
   toolEnd(w, call, result) {
-    const done = {...call, ok: result.ok, ...(result.ok ? {} : {error: result.error})};
+    // output: the whole text Muse got back (the screen shows a few lines), for /output.
+    const done = {...call, ok: result.ok, ...(result.ok ? {} : {error: result.error}), output: outputText(result)};
     if (w.turn) { const c = (w.turn.calls ||= []).find(x => x.id === call.id && x.end === null); if (c) c.end = Date.now(); else w.turn.calls.push({id: call.id, start: Date.now(), end: Date.now()}); }
     if (w.turn?.log && w.turn.log.tools.length < 300) w.turn.log.tools.push({command: call.command, summary: String(call.summary || '').slice(0, 200), ok: !!result.ok, ...(result.ok ? {} : {error: String(result.error || '').slice(0, 300)})});
     if (w.main) this.emit('tool-end', done); else this.emit('agent-tool', done);
@@ -409,6 +456,7 @@ class Agent extends EventEmitter {
         waiting.accept(ack?.message_id);
         await this.client.subscribeAgent(w.session.id, owner); waiting.refresh();
         sessions.touch(w.session, display); turn.sent = true;
+        this.emit('sent', {agent: w.tag, chars: body.length}); // for the usage tally (what went to Muse)
         if (w.main) this.emit('turn-start');
         const reply = await waiting.promise;
         await this.steps.finish(turn, w);
@@ -434,8 +482,10 @@ class Agent extends EventEmitter {
   }
   // One line of the main chat's transcript (src/sessions.js), so /resume can show the conversation.
   record(w, turn, display, {reply = '', error} = {}) {
-    sessions.appendTurn(w.session.id, {v: 1, at: Date.now(), user: String(display ?? ''), reply: String(reply || ''), ...(error ? {error: String(error)} : {}),
-      tools: turn.log.tools, steps: turn.log.steps, sources: [...turn.sources.values()].map(s => ({label: s.label, uri: s.uri})), todos: Array.isArray(w.ctx.todos) ? w.ctx.todos : []});
+    // Capped per turn, so one huge reply or a tool storm does not bloat what /resume reads back.
+    const cap = (s, n) => s.length > n ? s.slice(0, n) + '\n… (' + (s.length - n) + ' more characters not kept)' : s;
+    sessions.appendTurn(w.session.id, {v: 1, at: Date.now(), user: cap(String(display ?? ''), 50000), reply: cap(String(reply || ''), 50000), ...(error ? {error: cap(String(error), 2000)} : {}),
+      tools: turn.log.tools.slice(-300), steps: turn.log.steps, sources: [...turn.sources.values()].map(s => ({label: s.label, uri: s.uri})), todos: Array.isArray(w.ctx.todos) ? w.ctx.todos : []});
   }
 
   // A parallel agent: its own side chat, started now, reported through agent-update / agent-done.
@@ -454,7 +504,10 @@ class Agent extends EventEmitter {
     const session = {...sessions.create(this.cwd), parent: this.session.id};
     // The worker gets its OWN readFiles set, seeded with a copy of main's: sharing the
     // set let one agent's reads silently mark files as read (and fresh) for everyone.
-    const w = new Worker({tag, session, ctx: {cwd: this.cwd, readFiles: new Set(this.ctx.readFiles), todos: [], shells: this.shells}, title: (title || task).replace(/\s+/g, ' ').slice(0, 60), by, typeName, type: types[typeName]});
+    const ctx = {cwd: this.cwd, readFiles: new Set(), todos: [], shells: this.shells};
+    require('./tools').copyReads(this.ctx, ctx); // the files and what they looked like when read
+    const w = new Worker({tag, session, ctx, title: (title || task).replace(/\s+/g, ' ').slice(0, 60), by, typeName, type: types[typeName]});
+    w.spawnedIn = by === 'muse' ? this.main.turn : null; // stopped with that task on esc (interrupt)
     this.workers.set(tag, w);
     this.runTurn(w, task).catch(() => {});
     return w;
@@ -467,13 +520,34 @@ class Agent extends EventEmitter {
   async interrupt() {
     const t = this.main.turn; if (!t) return;
     t.controller.abort();
+    // The agents Muse started for this task stop with it: after esc they went on editing files
+    // and running commands under a screen that said "interrupted". /agent ones are the user's own.
+    for (const w of this.workers.values()) if (w.turn && w.spawnedIn === t) this.stopAgent(w.tag);
     await this.client.cancel(this.session.id).catch(() => {});
   }
 
-  close() { this.closed = true; clearTimeout(this.retryTimer); this.relay?.stop(); this.shells.killAll(); this.device?.disconnect(); this.client.disconnect(false); this.mcp?.close(); }
+  // On exit: every turn of this window is cancelled on Muse's side, so Muse does not keep working
+  // (and spending the allowance) for a muser that is gone. Waits at most waitMs for the requests.
+  async cancelAll(waitMs = 2000) {
+    const jobs = [];
+    if (this.main.turn) jobs.push(this.interrupt());
+    for (const w of this.workers.values()) if (!w.main && w.turn) jobs.push(this.stopAgent(w.tag));
+    if (jobs.length) await Promise.race([Promise.allSettled(jobs), new Promise(r => setTimeout(r, waitMs))]);
+    return jobs.length;
+  }
+  close() { this.closed = true; clearTimeout(this.retryTimer); clearTimeout(this.resubTimer); this.relay?.stop(); this.shells.killAll(); this.device?.disconnect(); this.client.disconnect(false); this.mcp?.close(); }
 }
 
 function safe(fn) { try { return fn(); } catch { return undefined; } }
+// A tool result as text: command output, search hits, file text, else the payload as JSON.
+function outputText(result) {
+  const cap = s => s.length > 200000 ? s.slice(0, 200000) + '\n… (cut at 200,000 characters)' : s;
+  if (!result.ok) return cap(String(result.error || ''));
+  const p = result.payload || {};
+  if (typeof p.stdout === 'string' || typeof p.stderr === 'string') return cap([p.stdout || '', p.stderr ? '[stderr]\n' + p.stderr : ''].filter(Boolean).join('\n'));
+  for (const k of ['output', 'content', 'result']) if (typeof p[k] === 'string') return cap(p[k]);
+  try { return cap(JSON.stringify(p, null, 1)); } catch { return ''; }
+}
 
 Agent.DEVICE = DEVICE_NAME;
 module.exports = {Agent, DEVICE_NAME, preamble, projectInstructions, routeFor, consumeToolCall, toolLimitMessage, resolveMaxToolCallsPerTurn, resolveAgentLimits, mcpEffectiveKind, pruneCollectedWorkers, MAX_PROJECT_INSTRUCTION_CHARS};

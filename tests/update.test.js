@@ -67,3 +67,22 @@ test('a stuck npm is stopped, so /update can be tried again', async () => {
   assert.equal(r.ok, false);
   assert.match(r.output, /did not finish in 1 s/);
 });
+
+test('/update says "up to date" or "could not check" instead of running npm for nothing', async t => {
+  const {Controller} = await import('../src/ui/controller.mjs');
+  const saved = {devCheckout: update.devCheckout, latest: update.latest, install: update.install};
+  t.after(() => Object.assign(update, saved));
+  let installs = 0;
+  update.devCheckout = () => false; update.install = async () => { installs++; return {ok: true, output: ''}; };
+  const ctrl = new Controller({agent: new FakeAgent(), museName: 'm', version: '0.3.1', onExit() {}});
+  const last = () => ctrl.get().entries.at(-1).lines.join(' ');
+  update.latest = async () => '0.3.1';
+  await ctrl.runUpdate();
+  assert.match(last(), /最新版です/); assert.equal(installs, 0);
+  update.latest = async () => { throw new Error('offline'); };
+  await ctrl.runUpdate();
+  assert.match(last(), /確認できませんでした（offline）/); assert.equal(installs, 0);
+  update.latest = async () => '0.4.0';
+  await ctrl.runUpdate();
+  assert.match(last(), /v0\.4\.0 に更新しました/); assert.equal(installs, 1);
+});

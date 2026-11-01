@@ -35,6 +35,8 @@ const HELP_LINES = [
 const KNOWN_FLAGS = '--mode <m> / --cd <dir> / --max-agents <n> / --max-agents-total <n> / --json / --session <ID> / -c, --continue / -h, --help / -V, --version';
 function parse(argv) {
   const o = {_: [], mode: undefined, cwd: process.cwd()}; // mode: --mode, else the folder's remembered one
+  // --flag=value is the same as --flag value (--mode=bypass was an unknown option).
+  argv = argv.flatMap(a => /^--(mode|cd|max-agents|max-agents-total|session)=/.test(a) ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '-c' || a === '--continue') o.continue = true;
@@ -42,7 +44,11 @@ function parse(argv) {
       const v = argv[i + 1];
       if (v === undefined || v.startsWith('--')) throw new Error(t('{flag} には値が必要です。使い方: muser --help', {flag: a}));
       if (a === '--mode') o.mode = argv[++i];
-      else if (a === '--cd') o.cwd = require('node:path').resolve(argv[++i]);
+      else if (a === '--cd') {
+        o.cwd = require('node:path').resolve(argv[++i]); o.cdGiven = true;
+        let dir = false; try { dir = require('node:fs').statSync(o.cwd).isDirectory(); } catch {}
+        if (!dir) throw new Error(t('--cd のフォルダーがありません: {dir}', {dir: o.cwd}));
+      }
       else {
         if (!/^\d+$/.test(v)) throw new Error(t('{flag} には 0 以上の整数を指定してください（0 で無制限）。', {flag: a}));
         o[a === '--max-agents' ? 'maxAgents' : 'maxAgentsTotal'] = Number(argv[++i]);
@@ -55,8 +61,11 @@ function parse(argv) {
       o.resume = argv[++i];
     }
     else if (a === '-h' || a === '--help') o.help = true;
-    else if (a === '-V' || a === '--version') o.version = true;
+    else if (a === '-V' || a === '--version' || (a === '-v' && !o._.length)) o.version = true;
     else if (a.startsWith('--')) throw new Error(t('知らないオプションです: {flag}（使えるのは {flags}）', {flag: a, flags: KNOWN_FLAGS}));
+    // An unknown short option before the prompt (muser -x) went to Muse as a one-word prompt; inside
+    // a prompt ("fix the -x flag") it is just a word.
+    else if (/^-[A-Za-z]/.test(a) && !o._.length) throw new Error(t('知らないオプションです: {flag}（使えるのは {flags}）', {flag: a, flags: KNOWN_FLAGS}));
     else o._.push(a);
   }
   return o;
@@ -83,18 +92,18 @@ async function connect(o, log) {
   const subscribed = client.subscribe();
   const sessions = require('../src/sessions');
   let session;
-  if (o.resume) { session = sessions.find(o.resume); if (!session) throw new Error(t('会話が見つかりません: {id}', {id: o.resume})); }
+  if (o.resume) session = resumeTarget(sessions, o.resume);
   else if (o.continue) { session = sessions.recent(o.cwd).find(s => s.turns); if (!session) throw new Error(t('このフォルダーで再開できる会話がありません。')); }
   const {McpHub} = require('../src/mcp');
   const mcp = new McpHub();
   if (Object.values(mcp.config.mcpServers || {}).some(s => s.enabled)) { log(t('MCP サーバーに接続しています…')); await mcp.start(); }
   mcp.index();
   const {Agent} = require('../src/agent');
-  const cwd = session?.cwd || o.cwd, remembered = require('../src/permissions').load(cwd);
+  const cwd = sessionFolder(session, o), remembered = require('../src/permissions').load(cwd);
   const agent = new Agent({client, auth, cwd, mode: o.mode || remembered.mode || 'default', allowAlways: remembered.allow, web, session, mcp, agentLimits: {maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal}});
   log(t('この PC の CLI 端末をつないでいます…'));
   const identity = client.request('GET', '/identity').catch(() => null);
-  await Promise.all([subscribed, agent.connectDevice()]);
+  await Promise.all([subscribed.then(() => { agent.subscribed = true; }), agent.connectDevice()]);
   let museName = 'Muse';
   const r = await identity;
   if (typeof r?.name === 'string' && r.name.trim()) museName = r.name.trim().slice(0, 40);
@@ -105,6 +114,8 @@ async function connect(o, log) {
     agent.on('tool-end', () => { try { usage.record({toolCalls: 1}); } catch {} });
     agent.on('agent-tool', () => { try { usage.record({toolCalls: 1}); } catch {} });
     agent.on('turn-end', e => { try { if (e && e.ok) usage.record({turns: 1, outChars: (e.text || '').length}); } catch {} });
+    // What was sent was never recorded: /usage showed "in 0" and too few tokens.
+    agent.on('sent', e => { try { usage.record({inChars: e.chars || 0}); } catch {} });
   } catch {}
   return {agent, museName};
 }
@@ -128,20 +139,22 @@ async function prepare(o) {
   const client = require('../src/session').createChat(web);
   const sessions = require('../src/sessions');
   let session;
-  if (o.resume) { session = sessions.find(o.resume); if (!session) throw new Error(t('会話が見つかりません: {id}', {id: o.resume})); }
+  if (o.resume) session = resumeTarget(sessions, o.resume);
   else if (o.continue) { session = sessions.recent(o.cwd).find(s => s.turns); if (!session) throw new Error(t('このフォルダーで再開できる会話がありません。')); }
   const {McpHub} = require('../src/mcp');
   const mcp = new McpHub();
   if (Object.values(mcp.config.mcpServers || {}).some(s => s.enabled)) await mcp.start(); // its tools are registered with the device
   mcp.index();
   const {Agent} = require('../src/agent');
-  const cwd = session?.cwd || o.cwd, remembered = require('../src/permissions').load(cwd);
+  const cwd = sessionFolder(session, o), remembered = require('../src/permissions').load(cwd);
   const agent = new Agent({client, auth, cwd, mode: o.mode || remembered.mode || 'default', allowAlways: remembered.allow, web, session, mcp, agentLimits: {maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal}});
   try {
     const usage = require('../src/usage');
     agent.on('tool-end', () => { try { usage.record({toolCalls: 1}); } catch {} });
     agent.on('agent-tool', () => { try { usage.record({toolCalls: 1}); } catch {} });
     agent.on('turn-end', e => { try { if (e && e.ok) usage.record({turns: 1, outChars: (e.text || '').length}); } catch {} });
+    // What was sent was never recorded: /usage showed "in 0" and too few tokens.
+    agent.on('sent', e => { try { usage.record({inChars: e.chars || 0}); } catch {} });
   } catch {}
   return {agent, museName: lastMuseName(), web};
 }
@@ -194,7 +207,13 @@ async function exec(o, prompt) {
   const json = !!o.json, t0 = Date.now();
   const out = obj => process.stdout.write(JSON.stringify(obj) + '\n');
   const err = s => { if (!json) process.stderr.write(s + '\n'); };
-  if (!prompt) {
+  // `type task.md | muser exec` (or `muser exec -`): the prompt comes from stdin.
+  if ((!prompt || prompt === '-') && !process.stdin.isTTY) {
+    const chunks = []; for await (const c of process.stdin) chunks.push(c);
+    prompt = Buffer.concat(chunks).toString('utf8').trim();
+    if (prompt.charCodeAt(0) === 0xfeff) prompt = prompt.slice(1).trim(); // a BOM from PowerShell redirection
+  }
+  if (!prompt || prompt === '-') {
     if (json) { out({type: 'result', ok: false, error: t('exec には指示が必要です。')}); process.exitCode = 1; return; }
     throw new Error(t('exec には指示が必要です。'));
   }
@@ -215,6 +234,14 @@ async function exec(o, prompt) {
     err((call.ok ? '  ✓ ' : '  ✗ ') + call.command + ' ' + String(call.summary || '').slice(0, 120));
     if (json) out({type: 'tool', agent: call.agent || 'main', command: call.command, summary: call.summary || '', ok: !!call.ok, ...(call.ok ? {} : {error: String(call.error || ''), ...(call.declined ? {declined: true} : {})})});
   };
+  // Ctrl+C killed the process and left Muse working on the turn (and spending the allowance).
+  process.once('SIGINT', async () => {
+    err(t('Muse の作業を止めています…'));
+    await agent.cancelAll().catch(() => {});
+    agent.close();
+    if (json) out({type: 'result', ok: false, session: agent.session.id, error: 'interrupted', duration_ms: Date.now() - t0});
+    process.exit(130);
+  });
   agent.on('tool-end', tool);
   agent.on('agent-tool', tool);
   agent.on('muse-step', s => { if (json) for (const x of s.items || [s]) out({type: 'muse_step', title: x.title, ...(x.detail ? {detail: x.detail} : {}), ...(x.failed ? {failed: true} : {})}); });
@@ -240,7 +267,8 @@ async function main() {
   const [cmd, ...rest] = o._;
   if (o.version) return console.log(VERSION);
   if (o.help || cmd === 'help') return process.stdout.write(HELP_LINES.map(l => t(l, {version: VERSION})).join('\n'));
-  if (o.mode !== undefined && !require('../src/policy').MODES.includes(o.mode)) throw new Error(t('--mode は default / auto-edit / plan / bypass のどれかです。'));
+  // The same spellings as /mode (--mode Bypass, --mode auto).
+  if (o.mode !== undefined && !(o.mode = require('../src/policy').modeFrom(o.mode))) throw new Error(t('--mode は default / auto-edit / plan / bypass のどれかです。'));
   if (cmd === 'login') return onboard({forceLogin: true});
   if (cmd === 'logout') { require('../src/login').logout(); return console.log(t('ログアウトしました。')); }
   if (cmd === 'pc-login') return onboard({forceDevice: true});
@@ -262,22 +290,65 @@ async function main() {
     o.resume = rest[0];
     return interactive(o, rest.slice(1).join(' ') || undefined);
   }
+  // `muser doctro` used to go to Muse as a one-word prompt. A single word close to a command is a typo.
+  const near = cmd && o._.length === 1 ? nearCommand(cmd) : null;
+  if (near) throw new Error(t('「{word}」というコマンドはありません。もしかして: muser {near}（Muse に頼むなら文章で書いてください）', {word: cmd, near}));
   return interactive(o, o._.join(' ') || undefined);
+}
+
+const COMMAND_NAMES = ['login', 'logout', 'pc-login', 'doctor', 'usage', 'demo', 'exec', 'resume', 'help'];
+// The command a word was probably meant to be: at most 2 edits away (a swap counts as one).
+function nearCommand(word) {
+  const w = String(word).toLowerCase();
+  if (w.length < 3 || COMMAND_NAMES.includes(w)) return null;
+  const dist = (a, b) => {
+    const d = Array.from({length: a.length + 1}, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 1; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) {
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+    }
+    return d[a.length][b.length];
+  };
+  let best = null, bestD = 3;
+  for (const c of COMMAND_NAMES) { const x = dist(w, c); if (x < bestD && x < c.length / 2) { best = c; bestD = x; } }
+  return best;
+}
+
+// Where a resumed chat runs: its own folder, or --cd when given. A folder deleted or moved since
+// left every file and command of the chat failing; it is reported with the way out instead.
+function sessionFolder(session, o) {
+  if (!session || o.cdGiven) return o.cwd;
+  let ok = false; try { ok = require('node:fs').statSync(session.cwd).isDirectory(); } catch {}
+  if (!ok) throw new Error(t('この会話のフォルダーがありません: {cwd}（別のフォルダーで続けるなら --cd <フォルダー> を付けてください）', {cwd: session.cwd}));
+  return session.cwd;
+}
+
+// The session `muser resume <id>` names. A prefix that fits several sessions said "not found";
+// it lists them instead.
+function resumeTarget(sessions, ref) {
+  const session = sessions.find(ref);
+  if (session) return session;
+  if (sessions.find.ambiguous) {
+    const list = sessions.findAll(ref).slice(0, 10).map(s => '  ' + s.id + '  ' + (s.title || '') + '  ' + s.cwd);
+    throw new Error([t('「{id}」に当てはまる会話が複数あります。もう少し長く指定してください:', {id: ref}), ...list].join(String.fromCharCode(10)));
+  }
+  throw new Error(t('会話が見つかりません: {id}', {id: ref}));
 }
 
 async function doctor() {
   const {createWeb, loadJar, probe} = require('../src/web');
   const jar = loadJar();
-  console.log('web login   :', await probe(jar));
+  console.log(t('Web ログイン  : {state}', {state: await probe(jar)}));
   const web = createWeb(jar);
   const {connectChat} = require('../src/session');
   const client = await connectChat(web);
-  console.log('gateway     : connected, chats', (await client.sessions())?.sessions?.length ?? '?');
+  console.log(t('ゲートウェイ  : 接続できました（会話 {n} 件）', {n: (await client.sessions())?.sessions?.length ?? '?'}));
   client.disconnect(false);
   const auth = require('../src/pc-login').createAuth(web);
   const pc = auth.snapshot();
-  console.log('pc device   :', pc.phase, pc.phase === 'authenticated' ? '(vm ' + ((await auth.vm()).vm_id ? 'ok' : '?') + ')' : '');
-  try { const u = require('../src/usage').summary().today; console.log('usage       :', 'today turns ' + u.turns + ', tools ' + u.toolCalls); } catch {}
+  console.log(t('PC の端末     : {phase}', {phase: pc.phase + (pc.phase === 'authenticated' ? ' (vm ' + ((await auth.vm()).vm_id ? 'ok' : '?') + ')' : '')}));
+  try { const u = require('../src/usage').summary().today; console.log(t('今日の利用    : {turns} ターン、PC 操作 {tools} 回', {turns: u.turns, tools: u.toolCalls})); } catch {}
 }
 
 main().catch(e => { process.stdout.write('\x1b[?25h'); console.error('muser: ' + e.message); process.exitCode = 1; });

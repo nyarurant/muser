@@ -8,7 +8,7 @@ import path from 'node:path';
 import {createMd} from './md.mjs';
 import {sanitizeEmbeds, stripEmbeds, partialEmbedTail} from './sanitize.mjs';
 const require = createRequire(import.meta.url);
-const {MODES, LABELS, alwaysKey} = require('../policy.js');
+const {MODES, LABELS, alwaysKey, modeFrom} = require('../policy.js');
 const MODE_HELP = {
   'default': '読むのは自動。編集とコマンドは毎回確認',
   'auto-edit': '作業フォルダー内の編集は自動。コマンドは確認',
@@ -25,6 +25,7 @@ const transcript = require('../transcript.js');
 const permissions = require('../permissions.js');
 const skills = require('../skills.js');
 const update = require('../update.js');
+const {c, frames} = require('../tui/term.js');
 const {TOOLS: LOCAL} = require('../tools.js');
 const i18n = require('../i18n.js');
 const {t} = i18n;
@@ -32,22 +33,34 @@ const {t} = i18n;
 export const COMMANDS = [
   ['/help', 'コマンドとキー操作（!コマンド・@ファイル も）'], ['/permissions', '承認モード（権限）を選ぶ'], ['/mode', '承認モードを選ぶ（/mode bypass で直接）'],
   ['/new', '新しい会話を始める'], ['/clear', '画面を消して新しい会話'], ['/resume', 'このフォルダーの過去の会話を再開'],
-  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルの一覧とオン・オフ（Claude Code / Codex のスキルも読めます）'], ['/skill', 'スキルを使って頼む（/skill <名前> <頼みたいこと>）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/update', 'muser を最新版に更新する（npm）'], ['/exit', '終了'],
+  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルの一覧とオン・オフ（Claude Code / Codex のスキルも読めます）'], ['/skill', 'スキルを使って頼む（/skill <名前> <頼みたいこと>）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/update', 'muser を最新版に更新する（npm）'], ['/output', 'PC 操作の出力を全文で見る（画面では一部だけ）'], ['/exit', '終了'],
 ];
 
 let nextId = 1;
-const MAX_QUEUE = 5, MAX_HISTORY = 200;
-const HISTORY_FILE = path.join(os.homedir(), '.muser', 'history.json');
+const ATTACH_TOTAL = 11 * 1024 * 1024; // images per message, before base64 (the device link takes ~16 MB)
+// The terminal bell on approvals and finished agents; off with MUSER_NO_BELL=1 or "bell": false in ~/.muser/config.json.
+const BELL = process.env.MUSER_NO_BELL !== '1' && (() => { try { return require('../config.js').read().bell !== false; } catch { return true; } })();
+const bell = () => { if (BELL) process.stdout.write('\x07'); };
+const MAX_QUEUE = 5, MAX_HISTORY = 200, BANG_NOTE = 20000; // characters of a !command's output sent to Muse
+const HISTORY_FILE = process.env.MUSER_HISTORY_FILE || path.join(os.homedir(), '.muser', 'history.json'); // tests point it elsewhere
 function loadHistory() {
   try { const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); return Array.isArray(h) ? h.filter(x => typeof x === 'string').slice(-MAX_HISTORY) : []; } catch { return []; }
 }
+// Appends to what is on disk now: every muser window wrote back its own copy from startup, so the
+// last window to send a message erased what was typed in the others.
 function saveHistory(history) {
-  try { fs.mkdirSync(path.dirname(HISTORY_FILE), {recursive: true}); fs.writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(-MAX_HISTORY))); } catch {}
+  try {
+    const text = history[history.length - 1], disk = loadHistory();
+    if (typeof text === 'string' && disk[disk.length - 1] !== text) disk.push(text);
+    fs.mkdirSync(path.dirname(HISTORY_FILE), {recursive: true});
+    const temp = HISTORY_FILE + '.tmp-' + process.pid;
+    fs.writeFileSync(temp, JSON.stringify(disk.slice(-MAX_HISTORY))); fs.renameSync(temp, HISTORY_FILE);
+  } catch {}
 }
 
 export class Controller {
   constructor({agent, museName, version, onExit}) {
-    this.heldSteps = [];
+    this.heldSteps = []; this.outputs = [];
     this.agent = agent; this.museName = museName; this.version = version; this.onExit = onExit;
     this.listeners = new Set();
     this.s = {
@@ -104,18 +117,24 @@ export class Controller {
     a.on('muse-running', running => this.set({museRunning: running}));
     a.on('muse-step', step => { if (this.s.stream) this.heldSteps.push(step); else this.push({type: 'muse', step}); });
     a.on('tool-start', call => { this.flushStream(); this.set({running: {call, tail: []}}); });
-    a.on('tool-output', ({chunk}) => {
-      const r = this.s.running; if (!r) return;
-      const lines = ((r.rest || '') + stripEmbeds(chunk.replace(/\r/g, ''))).split('\n'), rest = lines.pop();
-      this.set({running: {...r, rest, tail: [...r.tail, ...lines.filter(l => l.trim())].slice(-5)}});
+    a.on('tool-output', ({id, chunk}) => {
+      // Only the running call's own output: a parallel agent's command printed into main's display.
+      const r = this.s.running; if (!r || (id && r.call.id && r.call.id !== id)) return;
+      // The unfinished last line is shown as its latest frame: a progress meter redraws one line with \r.
+      const lines = ((r.rest || '') + stripEmbeds(chunk)).split('\n'), last = lines.pop();
+      const rest = last.slice(last.replace(/\r+$/, '').lastIndexOf('\r') + 1); // only the latest frame is kept
+      this.set({running: {...r, rest, now: frames(rest), tail: [...r.tail, ...lines.map(frames).filter(l => l.trim())].slice(-5)}});
     });
-    a.on('tool-end', call => { this.set({running: null}); this.push({type: 'tool', call}); });
+    // The full output stays here (the last 30), not in scrollback entries; the screen shows a tail.
+    a.on('tool-end', ({output, ...call}) => {
+      this.set({running: null}); this.push({type: 'tool', call: {...call, outputLines: this.keepOutput(call, output)}});
+    });
     a.on('todos', todos => this.set({todos}));
     // Parallel agents: live cards while they work, a result card in scrollback when they finish.
     const upsert = snap => this.set({agents: [...this.s.agents.filter(x => x.tag !== snap.tag), snap].sort((x, y) => x.tag.localeCompare(y.tag, 'en', {numeric: true}))});
     a.on('agent-update', upsert);
     a.on('shell', snap => this.set({shells: [...this.s.shells.filter(x => x.id !== snap.id), snap].sort((x, y) => x.started - y.started)}));
-    a.on('agent-done', snap => { upsert(snap); this.push({type: 'agent', snap}); process.stdout.write('\x07'); });
+    a.on('agent-done', snap => { upsert(snap); this.push({type: 'agent', snap}); bell(); });
     a.on('turn-start', () => { this.planAtTurn = this.s.plan?.percentUsed ?? null; });
     a.on('turn-end', e => {
       this.set({activity: '', museRunning: ''});
@@ -135,7 +154,13 @@ export class Controller {
       this.refreshPlan().then(p => {
         if (p && before !== null && before !== undefined && p.percentUsed > before) this.note(t('Muse の週の使用量 {before}% → {after}%（この作業で +{diff}%）', {before, after: p.percentUsed, diff: p.percentUsed - before}));
       });
-      if (this.queue.length) this.submit(this.queue.shift());
+      // After esc (an interrupted turn) the queued messages go back into the input instead of being
+      // sent: the user stopped the work, and the next queued task started right away regardless.
+      if (this.queue.length && e.aborted) {
+        const n = this.queue.length, back = this.queue.splice(0).join('\n'), cur = this.s.text;
+        this.setText(cur ? back + '\n' + cur : back);
+        this.flash(t('中断したので、待っていた {n} 件は送らずに入力欄に戻しました', {n}), 5000);
+      } else if (this.queue.length) this.submit(this.queue.shift());
     });
   }
   onText({id, text}) {
@@ -168,7 +193,12 @@ export class Controller {
   // Preview of the unfinished line; must not move the fence state of the real render.
   previewRow() {
     const st = this.s.stream; if (!st?.partial) return null;
-    const fence = this.md.fence, row = this.md.row(st.partial); this.md.fence = fence;
+    // Only the tail of an unfinished line that would not fit the screen: a 60,000-character line
+    // (minified JSON) streamed as thousands of rows redrawn on every delta. Cut before Markdown
+    // styling, so no escape sequence is split. The whole line is kept once it ends.
+    const room = (process.stdout.columns || 100) * Math.max(3, (process.stdout.rows || 30) - 16);
+    const shown = st.partial.length > room ? '…' + st.partial.slice(-room) : st.partial;
+    const fence = this.md.fence, row = this.md.row(shown); this.md.fence = fence;
     return {row, first: !st.started};
   }
   flushStream() { if (this.s.stream) this.endMessage(this.s.stream.id); }
@@ -196,21 +226,43 @@ export class Controller {
       ? [{label: t('はい'), allow: true}, {label: t('はい、このフォルダーでは編集を自動に（承認モード「編集は自動」）'), allow: true, autoEdit: true}, {label: t('いいえ（Muse に伝えることを入力）'), allow: false}]
       : [{label: t('はい'), allow: true}, ...(key ? [{label: t('はい、このフォルダーでは {word} を聞かない', {word}), allow: true, always: key}] : []), {label: t('いいえ（Muse に伝えることを入力）'), allow: false}];
     const targets = tool.target ? [].concat(tool.target(call.params, this.agent.ctx) || []) : [];
-    const outside = targets.some(t => path.relative(this.agent.cwd, t).startsWith('..'));
-    process.stdout.write('\x07');
+    // As muser itself judges it (agent.execute): where the path really leads. startsWith('..') missed
+    // another drive (D:\ from C:\ is not "..") and writes through a junction.
+    const {inside, realOf} = require('../tools.js'), realCwd = realOf(this.agent.cwd);
+    const outside = targets.some(t => !inside(realCwd, realOf(t)));
+    bell();
     return new Promise(resolve => {
-      const req = {call, preview, options, index: 0, outside, resolve};
+      const req = {call, preview, options, index: 0, outside};
+      req.resolve = v => { if (req.done) return; req.done = true; clearTimeout(req.timer); resolve(v); };
+      // Muse stops waiting at call.deadline; the approval closes then instead of staying open
+      // for a change that would run unseen by Muse.
+      if (call.deadline) { req.timer = setTimeout(() => this.expireApproval(req), Math.max(0, call.deadline - Date.now())); req.timer.unref?.(); }
+      // Its task stopped (esc, an agent stopped): the approval goes away instead of waiting for a "yes" that would do nothing.
+      call.abortSignal?.addEventListener('abort', () => this.expireApproval(req, 'stopped'), {once: true});
       if (this.s.approval || this.s.reasonFor) (this.pending ||= []).push(req);
       else this.set({...(call.agent === 'main' ? {running: null} : {}), approval: req});
     });
   }
+  expireApproval(req, why = 'timeout') {
+    if (req.done) return;
+    if (this.s.approval === req) this.set({approval: null});
+    else if (this.s.reasonFor === req) { this.set({reasonFor: null}); this.restoreDraft(); }
+    else this.pending = (this.pending || []).filter(x => x !== req);
+    req.resolve({allow: false, expired: true});
+    const what = ((req.call.command || '') + ' ' + (req.call.summary || '')).trim();
+    if (why === 'stopped') this.note(t('作業を止めたので、承認待ちだった {what} は取りやめました。', {what}));
+    else this.note(t('承認が間に合わず Muse が待つのをやめたので、{what} は行いませんでした。', {what}));
+    if (!this.s.approval && !this.s.reasonFor) this.nextApproval();
+  }
+  // Declining with a reason borrows the input; what the user was typing comes back after.
+  restoreDraft() { const d = this.reasonDraft; this.reasonDraft = null; if (d) this.setText(d.text, d.pos); }
   nextApproval() {
     const next = this.pending?.shift();
     if (next) this.set({approval: next});
   }
   answer(i) {
     const a = this.s.approval, o = a.options[i];
-    if (!o.allow) return this.set({approval: null, reasonFor: a, text: '', pos: 0});
+    if (!o.allow) { this.reasonDraft = {text: this.s.text, pos: this.s.pos}; return this.set({approval: null, reasonFor: a, text: '', pos: 0}); }
     if (o.autoEdit && this.agent.mode === 'default') this.setMode('auto-edit');
     this.set({approval: null, ...(a.call.agent === 'main' ? {running: {call: a.call, tail: []}} : {})});
     a.resolve({allow: true, always: o.always || null});
@@ -245,7 +297,9 @@ export class Controller {
     } catch (e) { this.flash(''); this.note(v.toggle + ': ' + e.message); try { a.mcp.index(); await a.reconnectDevice(); } catch {} }
   }
   // A pick-one menu in place of the input box (/permissions, /resume).
-  openMenu(menu) { this.set({menu: {index: 0, ...menu}, text: '', pos: 0}); }
+  // The draft stays: a menu can open by itself (the re-login offer) while the user is typing, and a
+  // slash command was already taken out of the input when it was sent.
+  openMenu(menu) { this.set({menu: {index: 0, ...menu}}); }
   menuKey(input, k) {
     const m = this.s.menu, n = m.options.length;
     if (k.upArrow) return this.set({menu: {...m, index: (m.index + n - 1) % n}});
@@ -255,7 +309,7 @@ export class Controller {
     if (k.return) return pick(m.index);
     if (k.escape || (k.ctrl && input === 'c')) this.set({menu: null});
   }
-  submitReason(text) { const a = this.s.reasonFor; this.set({reasonFor: null}); a.resolve({allow: false, reason: text.trim()}); this.nextApproval(); }
+  submitReason(text) { const a = this.s.reasonFor; this.set({reasonFor: null}); this.restoreDraft(); a.resolve({allow: false, reason: text.trim()}); this.nextApproval(); }
   // The mode is remembered for this folder (src/permissions.js).
   setMode(m) { this.agent.mode = m; this.set({mode: m}); if (this.agent.client?.status !== 'demo') permissions.saveMode(this.agent.cwd, m); }
   cycleMode() { this.setMode(MODES[(MODES.indexOf(this.agent.mode) + 1) % MODES.length]); }
@@ -271,7 +325,14 @@ export class Controller {
     this.insert(t.replace(/\r\n?/g, '\n'));
   }
   attach(file, temporary) {
-    try { const a = clip.attachment(file, temporary); this.set({attachments: [...this.s.attachments, a]}); this.flash(t('画像を添付: {name}', {name: a.name})); }
+    try {
+      const a = clip.attachment(file, temporary);
+      // A message carries at most ~16 MB, base64 adds a third: two 9 MB images failed at send time
+      // with a bare "message_too_large", and the attachments were already gone from the input.
+      const total = this.s.attachments.reduce((n, x) => n + x.size, 0) + a.size;
+      if (total > ATTACH_TOTAL) return this.flash(t('画像は合計 {max} MB までです（{name} を足すと {mb} MB）', {max: ATTACH_TOTAL / 1024 / 1024, name: a.name, mb: (total / 1024 / 1024).toFixed(1)}), 6000);
+      this.set({attachments: [...this.s.attachments, a]}); this.flash(t('画像を添付: {name}', {name: a.name}));
+    }
     catch (e) { this.flash(e.message); }
   }
   async pasteImage() {
@@ -287,15 +348,26 @@ export class Controller {
     const {text, pos} = this.s;
     if (k.ctrl && input === 'c') {
       if (this.s.busy) { this.agent.interrupt(); return this.flash(t('中断しています…')); }
+      // A !command could not be stopped at all: `!npm run dev` without & held the screen for its full 120 s.
+      if (this.s.bangRunning) { this.bangStop?.abort(); return this.flash(t('中断しています…')); }
       if (text) return this.setText('');
       if (Date.now() - this.exitArmed < 1500) return this.onExit();
       this.exitArmed = Date.now(); return this.flash(t('もう一度 ctrl+c で終了'));
     }
-    if (k.ctrl && input === 'd' && !text) return this.onExit();
+    // Twice, like ctrl+c: one stray ctrl+d closed muser at once, a running turn included.
+    if (k.ctrl && input === 'd' && !text) {
+      if (Date.now() - this.exitArmed < 1500) return this.onExit();
+      this.exitArmed = Date.now(); return this.flash(t('もう一度 ctrl+d で終了'));
+    }
     if (k.escape) {
       if (this.s.reasonFor) return this.submitReason('');
       if (this.s.busy) { this.agent.interrupt(); return this.flash(t('中断しています…')); }
-      if (text) this.setText('');
+      if (this.s.bangRunning) { this.bangStop?.abort(); return this.flash(t('中断しています…')); }
+      // Twice to clear: one esc (closing the @ list, say) wiped a long draft.
+      if (text) {
+        if (Date.now() - (this.escArmed || 0) < 1500) { this.escArmed = 0; this.setText(''); return; }
+        this.escArmed = Date.now(); return this.flash(t('もう一度 esc で入力を消す'), 1500);
+      }
       return;
     }
     if (k.tab && k.shift) return this.cycleMode();
@@ -310,7 +382,9 @@ export class Controller {
     // the completed path) sends as usual.
     if (k.return && !k.shift && !k.meta) {
       const ctx = this.atContext(text, pos);
-      if (ctx?.list.length) return this.applyAtPick(ctx.at, ctx.list[this.atIndex(ctx.at.fragment, ctx.list.length)]);
+      const pick = ctx?.list.length ? ctx.list[this.atIndex(ctx.at.fragment, ctx.list.length)] : null;
+      // A path already typed out in full sends, as Enter normally does (it took a second Enter).
+      if (pick && pick !== ctx.at.fragment) return this.applyAtPick(ctx.at, pick);
     }
     if (k.return) {
       if (k.shift || k.meta) return this.insert('\n');
@@ -339,7 +413,7 @@ export class Controller {
       if (ctx?.list.length) {
         const idx = this.atIndex(ctx.at.fragment, ctx.list.length);
         this.atPick.idx = (idx + (k.upArrow ? -1 : 1) + ctx.list.length) % ctx.list.length;
-        return;
+        return this.set({}); // atPick is not store state: without a render the highlight did not move
       }
     }
     if ((k.upArrow || k.downArrow) && !text.includes('\n')) {
@@ -428,9 +502,16 @@ export class Controller {
     this.push({type: 'user', text, images: attachments.map(a => a.name), files: ex.files, missing: ex.missing}); this.sawText = false;
     this.set({busy: true, turnStart: Date.now(), status: '', attachments: []});
     const extra = [...(this.bangNotes || []), ex.block].filter(Boolean); this.bangNotes = [];
-    const body = (text || '（画像を見てください）') + (extra.length ? '\n\n' + extra.join('\n\n') : '');
+    // In the user's language: it is the user's message in the Muse chat (the app shows it too).
+    const body = (text || t('（画像を見てください）')) +(extra.length ? '\n\n' + extra.join('\n\n') : '');
     try { await this.agent.send(body, {attachments, display: text}); }
     catch (e) { if (this.s.busy) { this.set({busy: false}); this.push({type: 'end', ok: false, error: e.message}); } }
+  }
+  // The full output of a call, for /output (the last 30); returns its line count for the "… N more" hint.
+  keepOutput(call, output) {
+    const text = frames(String(output || '')).trimEnd();
+    if (text) { this.outputs.push({id: call.id, at: Date.now(), command: call.command, summary: call.summary || '', text}); if (this.outputs.length > 30) this.outputs.shift(); }
+    return text ? text.split('\n').length : 0;
   }
   // !command: the user's own shell command, run here without Muse or approval. Its output
   // goes to Muse with the next message, as in Claude Code's bash mode.
@@ -444,21 +525,30 @@ export class Controller {
       return;
     }
     const call = {id: 'bang-' + Date.now(), agent: 'main', command: 'system.run', params: {command: cmd}, kind: 'exec', summary: cmd, user: true};
-    this.set({running: {call, tail: []}});
-    const onOut = chunk => { const r = this.s.running; if (!r || r.call !== call) return; const lines = chunk.replace(/\r/g, '').split('\n').filter(l => l.trim()); this.set({running: {...r, tail: [...r.tail, ...lines].slice(-5)}}); };
+    // Its own row, not `running`: during a turn Muse's next call took the row over, and the
+    // command's end then cleared the row of the call Muse still had running.
+    this.set({bangRunning: {call, tail: []}});
+    const onOut = chunk => { const r = this.s.bangRunning; if (!r || r.call !== call) return; const lines = frames(chunk).split('\n').filter(l => l.trim()); this.set({bangRunning: {...r, tail: [...r.tail, ...lines].slice(-5)}}); };
     try {
-      const r = await LOCAL['system.run'].run({command: cmd}, this.agent.ctx, undefined, onOut);
-      this.set({running: null});
-      this.push({type: 'tool', call: {...call, ok: true, view: {...r.view, tail: stripEmbeds(r.payload.stdout + r.payload.stderr).trimEnd().split('\n').slice(-12)}}});
-      (this.bangNotes ||= []).push('[The user ran this in the terminal: ' + cmd + ']\nexit ' + r.payload.exit_code + '\n' + stripEmbeds(r.payload.stdout + (r.payload.stderr ? '\n' + r.payload.stderr : '')).slice(0, 20000));
-    } catch (e) { this.set({running: null}); this.push({type: 'tool', call: {...call, ok: false, error: e.message}}); }
+      const stop = this.bangStop = new AbortController();
+      const r = await LOCAL['system.run'].run({command: cmd}, this.agent.ctx, stop.signal, onOut);
+      this.set({bangRunning: null});
+      // Kept for /output like Muse's commands: past the 12 lines on screen it could not be seen at all.
+      const outputLines = this.keepOutput(call, stripEmbeds(r.payload.stdout + (r.payload.stderr ? '\n' + r.payload.stderr : '')));
+      this.push({type: 'tool', call: {...call, ok: true, outputLines, view: {...r.view, tail: frames(stripEmbeds(r.payload.stdout + r.payload.stderr)).trimEnd().split('\n').slice(-12)}}});
+      // The end is kept too, and the cut is said: the first 20,000 characters alone dropped the
+      // errors at the bottom of a long build and all of stderr, without a word.
+      const out = stripEmbeds(r.payload.stdout + (r.payload.stderr ? '\n' + r.payload.stderr : ''));
+      const sent = out.length > BANG_NOTE ? out.slice(0, BANG_NOTE * 0.3) + '\n… (' + (out.length - BANG_NOTE) + ' characters cut here) …\n' + out.slice(-BANG_NOTE * 0.7) : out;
+      (this.bangNotes ||= []).push('[The user ran this in the terminal: ' + cmd + ']\nexit ' + r.payload.exit_code + '\n' + sent);
+    } catch (e) { this.set({bangRunning: null}); this.push({type: 'tool', call: {...call, ok: false, error: e.message}}); }
   }
   // A resumed chat: its turns from the local transcript (Muse fills in only what is missing),
   // the last ones on screen, and the todo list as it was.
   async showResumed(s, {startup = false} = {}) {
     if (!s) return;
     const a = this.agent;
-    if (!startup) { a.session = s; a.ctx.readFiles.clear(); this.set({todos: []}); }
+    if (!startup) { a.session = s; a.ctx.readFiles.clear(); a.ctx.todos = []; this.bangNotes = []; this.set({todos: []}); }
     // Reading the chat from Muse needs the gateway, which may still be connecting at startup.
     if (sessions.transcript(s.id).length < (s.turns || 0)) { try { await a.ensureConnected?.(); } catch {} }
     let res;
@@ -497,7 +587,23 @@ export class Controller {
   }
   // Muse's real plan usage (src/usage.js plan()); one request at a time, failures keep the old value.
   refreshPlan() {
+    // The demo is offline: it asked muse.ai for the real plan with the saved login (the footer of
+    // `muser demo` showed the user's own weekly usage) at start and after every turn.
+    if (this.agent.client?.status === 'demo') return Promise.resolve(null);
     return this.planLoading ??= usage.plan().then(p => { this.set({plan: p}); return p; }).catch(() => null).finally(() => { this.planLoading = null; });
+  }
+  // /output: a tool call's whole output. Saved to a file every time; shown in full up to 400 lines,
+  // else its last 200 lines and where the file is.
+  showOutput(o) {
+    let file = '';
+    try {
+      const dir = path.join(os.tmpdir(), 'muser-output'); fs.mkdirSync(dir, {recursive: true});
+      file = path.join(dir, new Date(o.at).toISOString().replace(/[:.]/g, '-') + '-' + o.command.replace(/[^\w.-]/g, '') + '.txt');
+      fs.writeFileSync(file, o.text + '\n');
+    } catch {}
+    const lines = o.text.split('\n'), long = lines.length > 400;
+    this.note([c.bold(o.command + '  ' + o.summary), ...(long ? [c.faint(t('… 先頭の {n} 行は省略', {n: lines.length - 200}))] : []), ...(long ? lines.slice(-200) : lines),
+      ...(file ? ['', c.faint(t('全文: {file}', {file}))] : [])]);
   }
   // At every start (src/update.js): the footer says "checking for updates…", then shows a newer
   // version until /update installs it. A failed check just clears the footer.
@@ -509,12 +615,18 @@ export class Controller {
   async runUpdate() {
     if (update.devCheckout()) return this.note(t('この muser は git から動いている開発用なので、/update では更新しません（git pull で更新してください）。'));
     if (this.updating) return;
-    this.updating = true; this.flash(t('muser を更新しています（npm install -g muser-cli@latest）…'), 300000);
+    this.updating = true;
     try {
+      // Ask npm first: "already the latest" and "could not check" read the same before.
+      this.flash(t('新しい版を確認しています…'), 20000);
+      let v;
+      try { v = await update.latest(); }
+      catch (e) { this.flash(''); return this.note(t('npm に新しい版を確認できませんでした（{error}）。つながる環境で /update するか、npm install -g muser-cli@latest を実行してください。', {error: e.message})); }
+      if (!update.newer(v, this.version)) { this.flash(''); this.set({update: null}); return this.note(t('muser は最新版です（v{version}）。', {version: this.version})); }
+      this.flash(t('muser を更新しています（npm install -g muser-cli@latest）…'), 300000);
       const r = await update.install();
       this.flash('');
       if (!r.ok) return this.note([t('更新できませんでした:'), ...r.output.split('\n').slice(-6)]);
-      let v = ''; try { v = await update.latest(); } catch {}
       this.set({update: null});
       this.note(t('muser を {version} に更新しました。いったん終了して muser -c で開き直すと、この会話の続きから新しい版で使えます。', {version: v ? 'v' + v : t('最新版')}));
     } finally { this.updating = false; }
@@ -542,11 +654,20 @@ export class Controller {
   }
   note(lines) { this.push({type: 'note', lines: [].concat(lines)}); }
   slash(line) {
-    const [cmd, ...rest] = line.split(/\s+/), arg = rest.join(' '), a = this.agent;
+    // The argument is the rest of the line as typed: a multi-line task after /agent or /skill had
+    // its line breaks and indentation squeezed into single spaces.
+    const m = /^(\S+)\s*([\s\S]*)$/.exec(line), cmd = m[1], arg = m[2], a = this.agent;
     if (cmd === '/exit' || cmd === '/quit') return this.onExit();
     if (cmd === '/help') return this.push({type: 'help'});
     if (cmd === '/login') return this.login();
     if (cmd === '/update') return this.runUpdate();
+    if (cmd === '/output') {
+      if (!this.outputs.length) return this.note(t('まだ PC 操作の出力はありません。'));
+      const list = [...this.outputs].reverse();
+      return this.openMenu({title: t('PC 操作の出力'), hint: t('選ぶと全文を表示（ファイルにも保存）'), index: 0,
+        options: list.map((o, i) => ({value: i, label: o.command.replace(/^code\./, '') + '  ' + String(o.summary).slice(0, 60), desc: t('{n} 行', {n: o.text.split('\n').length})})),
+        pick: i => this.showOutput(list[i])});
+    }
     if (cmd === '/usage') {
       this.flash(t('Muse の利用状況を確認しています…'), 20000);
       return this.refreshPlan().then(p => {
@@ -555,6 +676,9 @@ export class Controller {
       });
     }
     if (cmd === '/lang') {
+      // /lang en switches at once (the argument used to be ignored and the menu opened).
+      const want = ({en: 'en', english: 'en', ja: 'ja', jp: 'ja', japanese: 'ja', '日本語': 'ja'})[arg.toLowerCase()];
+      if (want) { i18n.setLang(want); this.set({}); return this.note(t('言語を {lang} に切り替えました', {lang: want === 'en' ? 'English' : '日本語'})); }
       return this.openMenu({
         title: t('表示言語'), hint: t('UI の表示言語'),
         options: [{value: 'en', label: 'English', desc: t('英語で表示')}, {value: 'ja', label: '日本語', desc: t('日本語で表示')}],
@@ -563,8 +687,10 @@ export class Controller {
       });
     }
     if (cmd === '/mode' || cmd === '/permissions' || cmd === '/perm') {
-      if (arg && !MODES.includes(arg)) return this.note(t('モードは {modes}', {modes: MODES.join(' / ')}));
-      if (arg) { this.setMode(arg); return this.note(t('承認モード: {label}', {label: t(LABELS[a.mode])})); }
+      // Any case, and the words people use for them (/mode Bypass, /mode auto, /mode readonly).
+      const want = arg && modeFrom(arg);
+      if (arg && !want) return this.note(t('モードは {modes}', {modes: MODES.join(' / ')}));
+      if (want) { this.setMode(want); return this.note(t('承認モード: {label}', {label: t(LABELS[a.mode])})); }
       return this.openMenu({
         title: t('承認モード（権限）'), hint: t('Muse がこの PC で何をするときに確認するか'),
         options: [...MODES.map(m => ({value: m, label: t(LABELS[m]), desc: t(MODE_HELP[m]), danger: m === 'bypass'})),
@@ -578,7 +704,8 @@ export class Controller {
     }
     if (cmd === '/new' || cmd === '/clear') {
       if (this.s.busy) return this.flash(t('作業中は切り替えられません'));
-      a.session = sessions.create(a.cwd); a.ctx.readFiles.clear(); // allowAlways belongs to the folder, not the chat
+      // The old chat's todo list went into the new chat's first transcript line (only the screen was cleared).
+      a.session = sessions.create(a.cwd); a.ctx.readFiles.clear(); a.ctx.todos = []; this.bangNotes = []; // allowAlways belongs to the folder, not the chat
       this.set({todos: []});
       if (cmd === '/clear') return this.set({clearCount: this.s.clearCount + 1, entries: [{id: nextId++, type: 'banner'}]});
       return this.note(t('新しい会話を始めます。'));
@@ -591,7 +718,9 @@ export class Controller {
       if (!list.length) return this.note(t('このフォルダーの過去の会話はありません。'));
       if (!arg) return this.openMenu({title: t('会話を再開'), hint: t('このフォルダーの過去の会話'), options: list.map(s => ({value: s.id, label: s.title || s.id, desc: new Date(s.updated).toLocaleString() + ' · ' + t('{n} ターン', {n: s.turns})})),
         pick: id => this.showResumed(sessions.find(id))});
-      const s = list[Number(arg) - 1] || sessions.find(arg);
+      // A number is a line of the list; an id is looked up among this folder's chats only ("/resume 12"
+      // matched any session whose id began with 12, another project's included).
+      const s = /^\d$/.test(arg) ? list[Number(arg) - 1] : sessions.recent(a.cwd).find(x => x.id === arg || x.id.startsWith(arg));
       if (!s) return this.note(t('見つかりません: {arg}', {arg}));
       return this.showResumed(s);
     }
@@ -602,13 +731,15 @@ export class Controller {
       const list = a.shells.all();
       if (!list.length) return this.note(t('バックグラウンドの処理はありません。Muse に「開発サーバーを裏で起動して」と頼むか、!npm run dev & のように & を付けて実行します。'));
       return this.openMenu({title: t('バックグラウンドの処理'), hint: t('選ぶと出力を表示 · 止めるのは /bg kill <id>'), options: list.map(x => ({value: x.id, label: x.id + '  ' + x.command.slice(0, 22), desc: (x.running ? t('● 実行中 ') : t('○ 終了 exit {exit} ', {exit: x.exit})) + (x.tail.filter(Boolean).pop() || '')})),
-        pick: async id => { const r = await a.shells.output(id, {since: 0, maxChars: 4000}); this.push({type: 'shellout', id, running: r.running, exit: r.exit_code, lines: r.output.trimEnd().split('\n').slice(-30)}); }});
+        pick: async id => { const r = await a.shells.output(id, {since: 0, maxChars: 4000}); this.push({type: 'shellout', id, running: r.running, exit: r.exit_code, lines: frames(r.output).trimEnd().split('\n').slice(-30)}); }});
     }
     if (cmd === '/agent' || cmd === '/spawn') {
       const types = a.types();
       if (!arg) return this.note([t('使い方: /agent [型] <任せるタスク>   例: /agent explore 認証まわりの処理はどこ？'), t('型: {list}', {list: Object.entries(types).map(([k, v]) => k + '（' + t(v.description) + '）').join('  ')})]);
-      const [first, ...words] = arg.split(/\s+/), typed = types[first.toLowerCase()] && words.length;
-      try { const w = a.spawn(typed ? words.join(' ') : arg, {by: 'user', type: typed ? first : 'general'}); return this.note(t('エージェント {tag}（{type}）に任せました: {title}', {tag: w.tag, type: w.typeName, title: w.title})); }
+      const [, first, task] = /^(\S+)\s*([\s\S]*)$/.exec(arg), typed = types[first.toLowerCase()] && task;
+      // A type name alone (/agent explore) started a general agent whose whole task was "explore".
+      if (types[first.toLowerCase()] && !task) return this.note(t('使い方: /agent [型] <任せるタスク>   例: /agent explore 認証まわりの処理はどこ？'));
+      try { const w = a.spawn(typed ? task : arg, {by: 'user', type: typed ? first : 'general'}); return this.note(t('エージェント {tag}（{type}）に任せました: {title}', {tag: w.tag, type: w.typeName, title: w.title})); }
       catch (e) { return this.note(e.message); }
     }
     if (cmd === '/agents') {
@@ -619,21 +750,24 @@ export class Controller {
     }
     if (cmd === '/image') {
       if (!arg) { this.pasteImage(); return; }
-      const p = path.resolve(a.cwd, arg.replace(/^["']|["']$/g, ''));
+      // ~ is the home folder, as in the tools' paths (/image ~\Pictures\a.png looked in <cwd>\~).
+      const given = arg.replace(/^["']|["']$/g, '');
+      const p = path.resolve(a.cwd, given === '~' || /^~[\\/]/.test(given) ? path.join(os.homedir(), given.slice(1)) : given);
       if (!clip.isImage(p)) return this.note(t('画像ファイル（png / jpg / gif / webp / bmp）を指定してください'));
       return this.attach(p);
     }
     if (cmd === '/todos') return this.push({type: 'todos', todos: this.s.todos});
     if (cmd === '/skills') return this.skillsMenu();
     if (cmd === '/skill') {
-      const [name, ...rest] = arg.split(/\s+/);
+      const [, name, request] = /^(\S*)\s*([\s\S]*)$/.exec(arg);
       const all = skills.load(a.cwd), s = all.find(x => x.name === String(name || '').toLowerCase());
       if (!name || !s) return this.note([t('使い方: /skill <名前> <頼みたいこと>'), t('スキル: {list}', {list: all.filter(x => x.enabled).map(x => x.name).join(', ') || t('（ありません）')})]);
       if (!s.enabled) return this.note(t('{name} はオフです（/skills でオンにできます）', {name: s.name}));
-      return this.submit('Use the skill "' + s.name + '" (read it with skill.read first). ' + (rest.join(' ') || ''));
+      return this.submit('Use the skill "' + s.name + '" (read it with skill.read first). ' + request);
     }
     if (cmd === '/status') return this.push({type: 'status'});
-    if (cmd === '/init') return this.submit('このリポジトリを調べて、AGENTS.md を作ってください（ビルド・テスト方法、構成、規約、注意点を簡潔に）。既にあれば足りないところを更新してください。');
+    // In the user's language: it is their message in the chat, and AGENTS.md came out in Japanese for English users.
+    if (cmd === '/init') return this.submit(t('このリポジトリを調べて、AGENTS.md を作ってください（ビルド・テスト方法、構成、規約、注意点を簡潔に）。既にあれば足りないところを更新してください。'));
     this.note(t('知らないコマンド: {cmd}  （/help で一覧）', {cmd}));
   }
 }

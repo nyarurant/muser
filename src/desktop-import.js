@@ -13,7 +13,7 @@ const APP_DIR = path.join(process.env.APPDATA || '', 'Muse App');
 function unprotect(buf) {
   const script = 'Add-Type -AssemblyName System.Security;$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim());' +
     '[Console]::Out.Write([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)))';
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {input: buf.toString('base64'), encoding: 'utf8', windowsHide: true});
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {input: buf.toString('base64'), encoding: 'utf8', windowsHide: true, timeout: 15000});
   if (r.status !== 0) throw new Error(t('デスクトップ版の暗号鍵を開けませんでした。'));
   // The base64 input and r.stdout are JS strings and cannot be zeroed; the returned
   // Buffer is the decrypted key and the caller zeroes it (fill(0)) after use.

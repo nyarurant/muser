@@ -198,8 +198,11 @@ test('a git read runs unasked only when the repo config cannot make it run a pro
   const d = (mode, config) => decide({mode, kind: 'exec', params: {command: 'git status'}, gitConfig: () => config});
   assert.equal(d('default', ''), 'allow');
   assert.equal(d('default', 'core.repositoryformatversion=0\ncore.fsmonitor=true\nremote.origin.url=x'), 'allow', 'the built-in fsmonitor daemon is fine');
-  for (const bad of ['core.fsmonitor=echo pwned > x', 'diff.external=evil.exe', 'diff.x.textconv=evil', 'filter.lfs.process=evil', 'core.pager=evil', 'include.path=../evil'])
+  for (const bad of ['core.fsmonitor=echo pwned > x', 'diff.external=evil.exe', 'diff.x.textconv=evil', 'filter.lfs.process=evil', 'core.pager=evil', 'gpg.program=evil', 'filter.lfs.process=git-lfs-evil'])
     assert.equal(d('default', bad), 'ask', bad);
+  // Keys the read commands never act on (husky, deploy keys, editors, credentials) and git-lfs's own filter.
+  for (const fine of ['core.hookspath=.husky/_', 'core.sshcommand=ssh -i ~/.ssh/deploy', 'core.editor=code --wait', 'credential.helper=manager', 'include.path=../shared.gitconfig', 'filter.lfs.process=git-lfs filter-process', 'filter.lfs.clean=git-lfs clean -- %f'])
+    assert.equal(d('default', fine), 'allow', fine);
   assert.equal(d('plan', 'core.fsmonitor=evil'), 'deny');
   assert.equal(d('default', null), 'ask', 'config that cannot be read is not trusted');
 });
