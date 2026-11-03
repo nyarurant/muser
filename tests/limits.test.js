@@ -88,3 +88,38 @@ test('plan usage: a failing read crawls for the action id at most once an hour',
   for (let i = 0; i < 3; i++) await assert.rejects(usage.plan(web));
   assert.equal(crawls, 1, 'crawled once, not on every read');
 });
+
+// Audit #245 (1): a temporary failure of the read must not throw away a valid cached
+// id — the same id is retried once, and no crawl happens at all.
+test('plan usage: a transient read failure retries the cached id instead of discarding it', async t => {
+  usage.resetWeb();
+  const dir = tmp(t); process.env.MUSER_USAGE_FILE = path.join(dir, 'usage.json'); t.after(() => { delete process.env.MUSER_USAGE_FILE; });
+  fs.writeFileSync(path.join(dir, 'subscription-action.json'), JSON.stringify({id: 'cached'}));
+  const calls = [];
+  let crawls = 0;
+  const web = {
+    pageText: async () => { crawls++; throw new Error('must not crawl'); },
+    serverAction: async id => { calls.push(id); if (calls.length === 1) throw new Error('socket reset'); return {ok: true, text: '1:{"subscription":{"usage":{"percentUsed":33}}}\n'}; },
+  };
+  const p = await usage.plan(web);
+  assert.equal(p.percentUsed, 33);
+  assert.deepEqual(calls, ['cached', 'cached'], 'the same id was retried');
+  assert.equal(crawls, 0, 'no crawl was needed');
+});
+
+// Audit #245 (2): a failed action-id lookup stamps only a short retry delay, not the
+// once-an-hour gate — and the hour gate never applies while a cached id exists.
+test('plan usage: a failed lookup does not block a later read that has a cached id', async t => {
+  usage.resetWeb();
+  const dir = tmp(t); process.env.MUSER_USAGE_FILE = path.join(dir, 'usage.json'); t.after(() => { delete process.env.MUSER_USAGE_FILE; });
+  const web = {
+    pageText: async () => { throw new Error('site down'); },
+    serverAction: async () => ({ok: true, text: '1:{"subscription":{"usage":{"percentUsed":7}}}\n'}),
+  };
+  await assert.rejects(usage.plan(web), /site down/, 'the lookup failure itself is reported');
+  // The site recovers enough to serve the action; a cached id (written by another
+  // window, say) is used at once — the failed lookup did not gate it for an hour.
+  fs.writeFileSync(path.join(dir, 'subscription-action.json'), JSON.stringify({id: 'cached'}));
+  const p = await usage.plan(web);
+  assert.equal(p.percentUsed, 7);
+});

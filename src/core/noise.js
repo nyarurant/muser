@@ -104,7 +104,7 @@ class Transport {
   constructor(tx,rx) { this.tx=tx; this.rx=rx; this.next=1n; this.chunks=new Map(); }
   // Partial reassembly entries are timestamped at creation and dropped once they
   // are older than CHUNK_TTL_MS, so an abandoned multi-chunk frame cannot squat
-  // in the 16-entry table until (or unless) some unrelated frame arrives.
+  // in the reassembly table until (or unless) some unrelated frame arrives.
   sweepChunks(now = Date.now()) {
     for(const [key,v] of this.chunks) if(now-v.created>CHUNK_TTL_MS) { clearTimeout(v.expireTimer); this.chunks.delete(key); }
   }
@@ -135,8 +135,23 @@ class Transport {
     const now=Date.now(); this.sweepChunks(now);
     if(count<1||count>256||index<0||index>=count||payload.length>65489) throw new Error('Invalid Muse frame');
     let record=this.chunks.get(id);
-    if(!record) { if(this.chunks.size>=16) throw new Error('Too many Muse frames'); record={created:now,count,parts:new Map(),size:0}; this.chunks.set(id,record); this.expireChunkLater(id,record); }
-    if(record.count!==count||record.parts.has(index)) throw new Error('Duplicate or inconsistent Muse frame');
+    if(!record) {
+      // Audit #136: the table used to be capped at 16 with a throw, so 17
+      // concurrent multi-chunk responses — each legal, and the client allows
+      // 64 pendings — killed the whole connection. The cap is now 64 (the
+      // pending cap), and a new frame beyond it evicts the OLDEST incomplete
+      // reassembly (its request times out on its own) instead of throwing.
+      if(this.chunks.size>=64) { const oldest=this.chunks.keys().next().value; const stale=this.chunks.get(oldest); if(stale) clearTimeout(stale.expireTimer); this.chunks.delete(oldest); }
+      record={created:now,count,parts:new Map(),size:0}; this.chunks.set(id,record); this.expireChunkLater(id,record);
+    }
+    // Audit #137: a retransmitted chunk (the gateway resends when an ack is
+    // lost) used to be fatal to the connection. An identical duplicate is
+    // simply ignored; a conflicting one drops only its own reassembly.
+    if(record.count!==count) { clearTimeout(record.expireTimer); this.chunks.delete(id); return null; }
+    if(record.parts.has(index)) {
+      if(record.parts.get(index).equals(payload)) return null;
+      clearTimeout(record.expireTimer); this.chunks.delete(id); return null;
+    }
     record.parts.set(index,payload); record.size+=payload.length;
     if(record.size>16*1024*1024) throw new Error('Muse response too large');
     if(record.parts.size<count) return null;

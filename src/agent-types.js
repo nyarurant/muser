@@ -14,7 +14,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {t} = require('./i18n');
 
-const READ_TOOLS = ['code.read', 'code.grep', 'code.glob', 'skill.read', 'system.run', 'todo.write', 'mcp.*'];
+const READ_TOOLS = ['code.read', 'code.grep', 'code.glob', 'skill.read', 'system.run', 'todo.write', 'progress.report', 'spinner.set', 'mcp.*'];
 const BUILTIN = {
   general: {description: '何でもやる（既定）', readOnly: false, tools: null,
     prompt: 'You are a general-purpose agent. Complete the task end to end.'},
@@ -42,6 +42,17 @@ function parse(file) {
   return {name, def: {description: meta.description || name, readOnly: /^(true|yes|1)$/i.test(meta.readonly || ''), tools, prompt: (m ? m[2] : text).trim(), file}};
 }
 
+// Does the allowed pattern `a` cover the requested tool/pattern `x`? Exact match, or `a`
+// is a wildcard whose prefix covers `x` — where `x` may itself be a wildcard, in which case
+// its prefix must start with `a`'s prefix (so 'mcp.*' covers 'mcp.foo.*' and 'mcp.foo',
+// but 'mcp.foo.*' does not cover the broader 'mcp.*').
+function patternCovers(a, x) {
+  if (a === x) return true;
+  if (typeof a !== 'string' || typeof x !== 'string' || !a.endsWith('*')) return false;
+  const prefix = a.slice(0, -1);
+  return (x.endsWith('*') ? x.slice(0, -1) : x).startsWith(prefix) || x.startsWith(prefix);
+}
+
 // Each warning once per process: types are loaded again for every agent and /agent, and the same
 // notice piled up on the screen each time.
 const warned = new Set();
@@ -63,12 +74,19 @@ function load(cwd) {
         continue;
       }
       const {name, def} = parsed;
-      if (!name) continue;
+      // A name that sanitises to nothing (a Japanese file name and no frontmatter name, say)
+      // was skipped in silence: the agent simply never appeared, with no clue why. Parse errors
+      // and builtin shadowing already warn once; this does too.
+      if (!name) { warnOnce('noname:' + file, t('muser: エージェント定義をスキップしました（名前が決められません）: {file}', {file})); continue; }
       const before = types[name];
       if (fromProject && before?.readOnly) {
         def.readOnly = true;
         const allowed = before.tools;
-        def.tools = !def.tools ? allowed : allowed ? def.tools.filter(x => allowed.includes(x)) : def.tools;
+        // Narrowing is pattern-aware: an allowed entry may be a wildcard (READ_TOOLS has
+        // 'mcp.*'), and allowed.includes(x) dropped everything it covered except the literal
+        // pattern itself — a project type asking for 'mcp.fixture.echo' (covered by 'mcp.*')
+        // lost it, while one asking for a broader pattern than allowed must still be dropped.
+        def.tools = !def.tools ? allowed : allowed ? def.tools.filter(x => allowed.some(a => patternCovers(a, x))) : def.tools;
       }
       if (Object.prototype.hasOwnProperty.call(BUILTIN, name))
         warnOnce('shadow:' + file, t('muser: 組み込みエージェント {name} は {file} で上書きされます', {name, file}));
@@ -83,4 +101,4 @@ function allows(type, command) {
   return type.tools.some(t => t === command || (t.endsWith('*') && command.startsWith(t.slice(0, -1))));
 }
 
-module.exports = {load, allows, BUILTIN};
+module.exports = {load, allows, BUILTIN, patternCovers};

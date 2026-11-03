@@ -5,6 +5,17 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {EventEmitter} = require('node:events');
+
+// One test below writes ~/.muser/AGENTS.md (the user's instructions for every
+// project) in-process and deletes it afterwards without saving the prior
+// content — and src/agent reads homedir-derived config/state dynamically.
+// Point every folder at a throwaway one BEFORE loading any src module,
+// mirroring tests/accounts.test.js: `npm test` already isolates via
+// tests/setup.mjs, but a bare `node --test tests/agent.test.js` skips that
+// file and would otherwise clobber the user's real AGENTS.md.
+process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-agent-test-data-'));
+process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-agent-test-home-'));
+
 const {
   Agent, preamble, projectInstructions, routeFor, consumeToolCall, toolLimitMessage,
   resolveMaxToolCallsPerTurn, mcpEffectiveKind, pruneCollectedWorkers, MAX_PROJECT_INSTRUCTION_CHARS,
@@ -101,14 +112,14 @@ test('route: an explicit tag for an idle or unknown worker is refused, never fal
   assert.equal(a.route({agent: ' a2 '}), busy, 'tag is trimmed');
 });
 
-test('route: no-tag behaviour is unchanged (only active worker, else main with a turn)', (t) => {
+test('route: no-tag goes to the single active worker, else to main (main omits its tag); never guessed onto an agent', (t) => {
   const a = makeAgent(t);
   const w = fakeWorker('a1', {turn: {controller: new AbortController()}});
   a.workers.set('a1', w);
   assert.equal(a.route({}), w, 'the only active worker');
   assert.equal(a.route(), w);
   startTurn(a);
-  assert.equal(a.route({}), a.main, 'main wins when several turns are active');
+  assert.equal(a.route({}), a.main, 'main + an agent working: an untagged call is main\'s');
   a.main.turn = null; w.turn = null;
   assert.equal(a.route({}), null, 'nobody working');
   assert.equal(routeFor(a.workers, {agent: 'a1'}), null);
@@ -152,6 +163,43 @@ test('execute refuses the call that exceeds the per-turn budget without running 
   assert.equal(r.ok, false);
   assert.equal(r.error, toolLimitMessage(1));
   assert.equal(a.ctx.readFiles.size, 0, 'the tool never ran');
+});
+
+test('a message sent mid-turn rides the next tool result to Muse, once', async (t) => {
+  const a = makeAgent(t);
+  startTurn(a);
+  fs.writeFileSync(path.join(a.cwd, 'f.txt'), 'data\n');
+  const delivered = [];
+  a.on('steer', ({texts}) => delivered.push(texts));
+  a.queueSteer('change of plan: do Y instead');
+  a.queueSteer('and skip the tests');
+  const r = await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-steer-1');
+  assert.equal(r.ok, true);
+  assert.match(r.payload.user_message, /while you were working/);
+  assert.match(r.payload.user_message, /change of plan: do Y instead/);
+  assert.match(r.payload.user_message, /and skip the tests/);
+  assert.deepEqual(delivered, [['change of plan: do Y instead', 'and skip the tests']]);
+  assert.equal(a.steerQueue.length, 0, 'consumed by the delivery');
+  const r2 = await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-steer-2');
+  assert.equal(r2.payload.user_message, undefined, 'not delivered twice');
+  a.queueSteer('dropped again');
+  a.dropSteer('dropped again');
+  const r3 = await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-steer-3');
+  assert.equal(r3.payload.user_message, undefined, 'a dropped steer never rides');
+});
+
+test('postSteer sends a mid-turn message as a real chat message', async (t) => {
+  const a = makeAgent(t);
+  startTurn(a);
+  a.main.session = {id: 'sess-1', turns: 1};
+  const sent = [];
+  a.device = {send: async (body, id) => { sent.push([body, id]); return {message_id: 'm-2'}; }};
+  assert.equal(await a.postSteer('one more thing'), true);
+  assert.deepEqual(sent, [['one more thing', 'sess-1']], 'posted verbatim to the live session');
+  a.device = {send: async () => { throw new Error('busy'); }};
+  assert.equal(await a.postSteer('again'), false, 'a failed send reports false, so the caller falls back');
+  a.main.turn = null;
+  assert.equal(await a.postSteer('too late'), false, 'no live turn, no post');
 });
 
 // ---------- approval preview ----------
@@ -299,4 +347,41 @@ test('runTurn cancels the reply wait and closes the subscription when subscribeA
   await assert.rejects(a.send('hello'), /subscribe failed/);
   assert.equal(closed.length, 1, 'closeAgentSubscription ran on the subscribe-failure path');
   assert.equal(a.main.turn, null);
+});
+
+test('~/.muser/AGENTS.md applies in every project, even outside the home folder', (t) => {
+  const os = require('node:os');
+  const home = os.homedir(), dir = tmpdir(t);
+  fs.mkdirSync(path.join(home, '.muser'), {recursive: true});
+  fs.writeFileSync(path.join(home, '.muser', 'AGENTS.md'), 'write a DevNote\n');
+  t.after(() => fs.rmSync(path.join(home, '.muser', 'AGENTS.md'), {force: true}));
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), 'project rule\n');
+  const found = projectInstructions(dir);
+  assert.equal(found[0].file, path.join(home, '.muser', 'AGENTS.md'), 'listed first: the most general');
+  assert.equal(found[0].user, true);
+  assert.equal(found.at(-1).text, 'project rule\n');
+  const p = preamble(dir, []);
+  assert.match(p, /instructions for all projects, from .*AGENTS\.md:\nwrite a DevNote/);
+});
+
+test('a pending handoff rides the first turn after an account switch, once, and stays out of the transcript', async (t) => {
+  const a = makeAgent(t); // session.turns is 0, as on the fresh session a switch creates
+  a.ensureConnected = async () => {};
+  const bodies = [];
+  a.device = {connected: true, send: async body => { bodies.push(body); return {message_id: 'm' + bodies.length}; }};
+  a.pendingHandoff = 'HANDOFF-MARKER';
+  const sent1 = new Promise(r => a.once('sent', r));
+  const turn1 = a.send('first task').catch(() => {});
+  await sent1;
+  assert.ok(bodies[0].includes('[muser: 前のアカウントからの引き継ぎ]\nHANDOFF-MARKER'), 'the handoff block is in the body sent to Muse');
+  assert.ok(bodies[0].indexOf('HANDOFF-MARKER') < bodies[0].indexOf('first task'), 'ahead of the user text');
+  assert.equal(a.pendingHandoff, null, 'consumed once the turn is sent');
+  await a.interrupt(); await turn1;
+  const stored = require('../src/sessions').transcript('main-session');
+  assert.ok(stored.every(x => !String(x.user || '').includes('HANDOFF-MARKER')), 'the local transcript keeps only what the user typed');
+  const sent2 = new Promise(r => a.once('sent', r));
+  const turn2 = a.send('second task').catch(() => {});
+  await sent2;
+  assert.ok(!bodies[1].includes('HANDOFF-MARKER'), 'not sent twice');
+  await a.interrupt(); await turn2;
 });

@@ -28,7 +28,7 @@ test("two muser windows keep each other's input history", t => {
   t.after(() => fs.rmSync(home, {recursive: true, force: true}));
   const env = {...process.env, USERPROFILE: home, HOME: home, MUSER_LANG: 'ja'};
   delete env.MUSER_HISTORY_FILE; // the default place, inside the scratch home
-  execFileSync(process.execPath, ['-e', SCRIPT], {env, encoding: 'utf8'});
+  execFileSync(process.execPath, ['-e', SCRIPT], {env, encoding: 'utf8', timeout: 60000});
   const saved = JSON.parse(fs.readFileSync(path.join(home, '.muser', 'history.json'), 'utf8'));
   assert.deepEqual(saved, ['from window 1', 'from window 2', 'again from 1']);
 });

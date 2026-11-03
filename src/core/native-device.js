@@ -24,6 +24,11 @@ const MAX_CONCURRENT_INVOKES = 6;
 const MAX_CHAT_MESSAGE = 16 * 1024 * 1024 - 65536;
 const MAX_PENDING_REQUESTS = 64;
 const MAX_COMPLETED_INVOKES = 128;
+const MAX_REQUEST_TIMEOUT_MS = 600_000;
+// Tombstones for completed invoke ids whose payloads were evicted from the
+// 128-entry result cache (audit #131): the id stays known long after its
+// result is gone, so a re-send is answered, never re-executed.
+const MAX_SEEN_INVOKES = 8192;
 const CONNECT_TIMEOUT_MS = 25_000;
 const REQUEST_TIMEOUT_MS = 60_000;
 const PING_INTERVAL_MS = 20_000;
@@ -76,13 +81,19 @@ class ControlMessageDecoder {
       const raw = this.buffer.subarray(4, length + 4);
       this.buffer = this.buffer.subarray(length + 4);
       if (length === 0) continue;
+      // Audit #135: a corrupt payload used to be silently skipped, so a
+      // damaged registration response vanished and connect() hung for its
+      // full 25 s timeout. Corruption is a protocol error: fail at once and
+      // let the caller reconnect, instead of swallowing this message (and,
+      // when the length prefix itself is garbage, every message after it).
       let message;
       try {
         message = JSON.parse(raw.toString('utf8'));
       } catch {
-        continue;
+        throw safeError('protocol_error');
       }
-      if (isRecord(message)) messages.push(message);
+      if (!isRecord(message)) throw safeError('protocol_error');
+      messages.push(message);
     }
     if (this.buffer.length > this.maxMessageBytes + 4) {
       throw safeError('inbound_too_large');
@@ -155,6 +166,14 @@ class NativeDevice extends EventEmitter {
     // connection is answered from the record instead of running a second time.
     this._inflightInvokes = invokes?.inflight || new Map();
     this._completedInvokes = invokes?.completed || new Map();
+    // Shared alongside the invoke maps: ids whose result was already sent once
+    // for the in-flight completion (audit #130), and tombstone ids of every
+    // completed invoke, kept after payload eviction (audit #131).
+    this._sentInvokeResults = invokes?.sent || new Set();
+    if (invokes && !invokes.sent) invokes.sent = this._sentInvokeResults;
+    this._seenInvokeIds = invokes?.seen || new Set();
+    if (invokes && !invokes.seen) invokes.seen = this._seenInvokeIds;
+    this._lastInboundAt = 0;
     this._invokeBusy = false;
     this._streamFallback = 1n;
     this._sendQueue = Promise.resolve();
@@ -163,6 +182,7 @@ class NativeDevice extends EventEmitter {
     this._connectTimer = null;
     this._registerWait = null;
     this._pingTimer = null;
+    this._watchdogGraceMs = 30000; // extra time past an invoke's own timeout before the watchdog answers for it
   }
 
   get connected() {
@@ -205,7 +225,10 @@ class NativeDevice extends EventEmitter {
       return Promise.reject(safeError('node_id_required'));
     }
     if (this._connectPromise) return this._connectPromise;
-    if (this.connected && this._nodeId === nodeId) return Promise.resolve();
+    // Audit #127: the same nodeId with NEW credentials (a different VM or a
+    // rotated token) is not the connection we already have — falling through
+    // reconnects with the new ones instead of silently keeping the old VM.
+    if (this.connected && this._nodeId === nodeId && this._vmId === vm.vm_id && this._vmToken === vm.vm_auth_token) return Promise.resolve();
     if (this._ws || this._transport) this.disconnect();
 
     this._nodeId = nodeId;
@@ -271,11 +294,15 @@ class NativeDevice extends EventEmitter {
     // muser: a socket that went half-open (PC sleep, network change) never closes by itself;
     // treat missing pongs as a drop so the agent reconnects.
     let lastPong = Date.now();
+    this._lastInboundAt = Date.now();
     ws.on?.('pong', () => { lastPong = Date.now(); });
     this._pingTimer = setInterval(() => {
       if (!this._isCurrent(ws)) return;
       if (ws.readyState !== undefined && ws.readyState !== OPEN) return;
-      if (Date.now() - lastPong > PING_INTERVAL_MS * 2 + 5000) {
+      // Audit #129: any inbound frame is proof of life too. A peer that never
+      // answers pings but keeps sending normal frames used to be cut every
+      // ~45-65 s; only total silence (no pong AND no frame) is a drop.
+      if (Date.now() - Math.max(lastPong, this._lastInboundAt || 0) > PING_INTERVAL_MS * 2 + 5000) {
         this._failConnection('connection_timeout');
         return;
       }
@@ -298,6 +325,7 @@ class NativeDevice extends EventEmitter {
 
   _onMessage(ws, data) {
     if (!this._isCurrent(ws)) return;
+    this._lastInboundAt = Date.now(); // any inbound frame feeds the #129 watchdog
     try {
       if (this._phase === 'handshake') {
         if (typeof data === 'string') throw safeError('protocol_error');
@@ -425,6 +453,17 @@ class NativeDevice extends EventEmitter {
     return this._sendFrames(frames, ws);
   }
 
+  // Audit #134: a chat request given up on locally (timeout, oversized
+  // response) must also be reset on the gateway, or the stream lives on
+  // server-side and a re-send can enter the user's message twice.
+  _resetStream(id) {
+    try {
+      if (!this._transport || !this._ws) return;
+      const frames = this._transport.reset(BigInt(id));
+      this._sendFrames(frames).catch(() => {});
+    } catch {}
+  }
+
   _handleFrame(frame) {
     const id = String(frame.id);
     if (id === String(this._controlStreamId)) {
@@ -457,6 +496,7 @@ class NativeDevice extends EventEmitter {
     if (frame.body?.length) {
       pending.size += frame.body.length;
       if (pending.size > MAX_INBOUND_MESSAGE) {
+        this._resetStream(id); // #134: cancel it server-side too
         this._settlePending(id, safeError('response_too_large'));
         return;
       }
@@ -499,9 +539,20 @@ class NativeDevice extends EventEmitter {
       this._sendResult(invokeId, result).catch(() => {});
       return;
     }
+    // Audit #131: the result payload was evicted from the 128-entry cache,
+    // but the id is still tombstoned — answer that it already completed
+    // instead of running a non-idempotent command a second time.
+    if (this._seenInvokeIds.has(invokeId)) {
+      this._sendResult(invokeId, {ok: false, error: 'already_completed'}).catch(() => {});
+      return;
+    }
     const prior = this._inflightInvokes.get(invokeId);
     if (prior) {
-      prior.then((result) => this._sendResult(invokeId, result)).catch(() => {});
+      // Audit #130: the original task's completion handler sends the result;
+      // a duplicate waiter must not send it a second time. _sendResultOnce
+      // still lets this waiter deliver it if the original's send failed
+      // (e.g. that connection died and this duplicate arrived on the new one).
+      prior.then((result) => this._sendResultOnce(invokeId, result)).catch(() => {});
       return;
     }
     const command = typeof message.command === 'string' ? message.command : '';
@@ -521,16 +572,19 @@ class NativeDevice extends EventEmitter {
     // slot forever (counting against MAX_CONCURRENT_INVOKES) and leave the
     // duplicate-dedupe waiters above, which hold this same promise, unanswered.
     // Race it against a timeout result so the slot frees and every waiter is
-    // answered once with that result, which is also what gets remembered for
-    // later duplicates. Promise.race settles exactly once, so a late real
-    // completion after the watchdog fires cannot double-answer or crash here.
+    // answered once with that result. Promise.race settles exactly once, so a
+    // late real completion after the watchdog fires cannot double-answer the
+    // original waiter — but it does replace the remembered timeout (below), so
+    // a duplicate re-sent after the command actually finished is answered from
+    // the real result instead of getting 'invoke_timeout' from the record forever.
     let watchdog = null;
+    let timedOut = false;
     const task = Promise.race([
       executed,
       new Promise((resolve) => {
         watchdog = setTimeout(
-          () => resolve({ok: false, error: 'invoke_timeout'}),
-          (timeoutMs || 120000) + 30000,
+          () => { timedOut = true; resolve({ok: false, error: 'invoke_timeout'}); },
+          (timeoutMs || 120000) + this._watchdogGraceMs,
         );
         watchdog.unref?.();
       }),
@@ -541,16 +595,32 @@ class NativeDevice extends EventEmitter {
         watchdog = null;
       }
     };
-    executed.then(clearWatchdog, clearWatchdog);
+    let executedSettled = false;
+    executed.then((result) => {
+      executedSettled = true;
+      clearWatchdog();
+      if (timedOut) this._rememberCompleted(invokeId, result);
+      // Audit #132: if the watchdog already answered, the concurrency slot is
+      // released only now — while the command was still running as a zombie
+      // it kept counting against MAX_CONCURRENT_INVOKES.
+      if (this._inflightInvokes.get(invokeId) === task) this._inflightInvokes.delete(invokeId);
+    }, () => {
+      executedSettled = true;
+      clearWatchdog();
+      if (this._inflightInvokes.get(invokeId) === task) this._inflightInvokes.delete(invokeId);
+    });
     this._inflightInvokes.set(invokeId, task);
     task.then((result) => {
       this._rememberCompleted(invokeId, result);
-      return this._sendResult(invokeId, result);
+      return this._sendResultOnce(invokeId, result);
     }).catch(() => {
       // _executeInvoke converts command failures to structured results. This
       // catch only prevents a transport failure from becoming unhandled.
     }).finally(() => {
-      this._inflightInvokes.delete(invokeId);
+      // Normally the slot frees when the (possibly watchdog-raced) task
+      // settles; if the execute itself is still running, its own settlement
+      // above frees it instead (#132).
+      if (executedSettled && this._inflightInvokes.get(invokeId) === task) this._inflightInvokes.delete(invokeId);
     });
   }
 
@@ -582,14 +652,23 @@ class NativeDevice extends EventEmitter {
     while (this._completedInvokes.size > MAX_COMPLETED_INVOKES) {
       this._completedInvokes.delete(this._completedInvokes.keys().next().value);
     }
+    // Tombstone (#131): the id outlives its evicted payload.
+    this._seenInvokeIds.delete(id);
+    this._seenInvokeIds.add(id);
+    while (this._seenInvokeIds.size > MAX_SEEN_INVOKES) {
+      this._seenInvokeIds.delete(this._seenInvokeIds.values().next().value);
+    }
   }
 
+  // Returns true when a result (or its too-large fallback) was handed to the
+  // transport, false when the send failed.
   async _sendResult(id, result) {
     const message = {method: 'link.result', id, ...result};
     try {
       await this._sendControlMessage(message);
+      return true;
     } catch (error) {
-      if (error?.code !== 'outbound_too_large') return;
+      if (error?.code !== 'outbound_too_large') return false;
       try {
         await this._sendControlMessage({
           method: 'link.result',
@@ -597,10 +676,27 @@ class NativeDevice extends EventEmitter {
           ok: false,
           error: 'result_too_large',
         });
+        return true;
       } catch {
         // The connection cleanup path will reject all outstanding work.
+        return false;
       }
     }
+  }
+
+  // Audit #130: an in-flight invoke can gain several senders (the original
+  // task plus one waiter per duplicate re-send, possibly on different device
+  // instances sharing the invoke maps). Exactly one of them delivers the
+  // result; the claim is released when the send fails so another waiter on a
+  // live connection can still deliver it.
+  async _sendResultOnce(id, result) {
+    if (this._sentInvokeResults.has(id)) return;
+    this._sentInvokeResults.add(id);
+    while (this._sentInvokeResults.size > MAX_SEEN_INVOKES) {
+      this._sentInvokeResults.delete(this._sentInvokeResults.values().next().value);
+    }
+    const ok = await this._sendResult(id, result);
+    if (!ok) this._sentInvokeResults.delete(id);
   }
 
   send(text, sessionId = '', extra = {}) {
@@ -620,6 +716,9 @@ class NativeDevice extends EventEmitter {
     };
     if (sessionId) bodyObject.session_id = sessionId;
     if (extra.replyTo) bodyObject.in_reply_to = extra.replyTo;
+    // A chat command ("/usage on") travels as its own message kind: Muse
+    // acts on it account-wide instead of answering it as a prompt.
+    if (extra.command) bodyObject.message_kind = 'chat_command';
     let body;
     try {
       body = Buffer.from(JSON.stringify(bodyObject));
@@ -659,10 +758,14 @@ class NativeDevice extends EventEmitter {
       resolveRequest = resolve;
       rejectRequest = reject;
     });
-    const requestedTimeout = Number.isFinite(Number(timeoutMs))
-      ? Number(timeoutMs)
+    // Audit #133: null/0 are "no timeout given", not a 1 ms timeout
+    // (Number(null) is 0 and finite, so the old parse turned both into
+    // Math.max(1, 0)); and a request may ask for up to MAX_REQUEST_TIMEOUT_MS
+    // instead of being silently rounded down to the 60 s default.
+    const requestedTimeout = Number(timeoutMs);
+    const waitMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(MAX_REQUEST_TIMEOUT_MS, requestedTimeout)
       : REQUEST_TIMEOUT_MS;
-    const waitMs = Math.max(1, Math.min(REQUEST_TIMEOUT_MS, requestedTimeout));
     const pending = {
       resolve: resolveRequest,
       reject: rejectRequest,
@@ -673,6 +776,7 @@ class NativeDevice extends EventEmitter {
       size: 0,
     };
     pending.timer = setTimeout(() => {
+      this._resetStream(id); // #134: cancel it server-side too
       this._settlePending(id, safeError('request_timeout'));
     }, waitMs);
     pending.timer.unref?.();
@@ -766,7 +870,18 @@ class NativeDevice extends EventEmitter {
       try {
         ws.on?.('error', () => {});
         if (ws.readyState === 0 && typeof ws.terminate === 'function') ws.terminate();
-        else ws.close?.();
+        else {
+          ws.close?.();
+          // Audit #128: a half-open peer may never answer the close
+          // handshake, leaving the socket alive until the OS gives up.
+          // Terminate it if it is still not closed after ~2 s (mirrors
+          // muse-client's disconnect()).
+          if (typeof ws.terminate === 'function') {
+            const timer = setTimeout(() => { try { if (ws.readyState !== 3) ws.terminate(); } catch {} }, 2000);
+            timer.unref?.();
+            try { ws.once?.('close', () => clearTimeout(timer)); } catch {}
+          }
+        }
       } catch {
         // Closing an already-closed socket is harmless.
       }

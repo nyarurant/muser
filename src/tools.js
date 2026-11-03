@@ -33,13 +33,20 @@ function inside(root, file) { const r = path.relative(root, file); return !r.sta
 // ---- Sensitive-file guard (code.read / code.grep / code.glob and every read path below) ----
 // muser's coding tools must never read secrets back to the model: env files, private keys,
 // credential/secret files, SSH/AWS/GPG homes, .netrc, and muser's own encrypted store.
-function isSensitivePath(p) {
-  if (typeof p !== 'string' || !p) return false;
-  const norm = p.replace(/\\/g, '/');
-  const parts = norm.split('/').filter(Boolean);
-  const base = (parts[parts.length - 1] || '').toLowerCase();
-  const lower = parts.map(s => s.toLowerCase());
-  if (lower.some(s => s === '.ssh' || s === '.aws' || s === '.gnupg')) return true;
+// One path segment as Windows itself resolves it: an NTFS alternate data stream suffix
+// (name:stream) is not part of the file's name, and trailing dots and spaces are stripped
+// by the file system, so '.ssh.' / '.ssh ' ARE '.ssh' and 'id_rsa.' IS 'id_rsa' (audit #214).
+function winName(s) { return s.split(':')[0].replace(/[. ]+$/, ''); }
+// Backup copies of a secret are still the secret: id_rsa.bak, credentials.json.bak,
+// .env.old, cert.pem.bak~ … (audit #215). The names a backup suffix hides, longest first.
+function baseVariants(base) {
+  const out = [base]; let b = base;
+  for (let i = 0; i < 4; i++) { const m = /^(.*)(\.bak|\.backup|\.old|\.orig|\.save|~)$/.exec(b); if (!m || !m[1] || m[1] === b) break; b = m[1]; out.push(b); }
+  return out;
+}
+// The file-name rules of isSensitivePath, for one candidate base name; `lower` is the
+// (Windows-normalised, lower-cased) segment list, for the rules that pair a name with a folder.
+function baseSensitive(base, lower) {
   if (base === '.netrc' || base === '_netrc') return true;
   if (base === 'web.enc') return true;
   // muser's own DPAPI files (~/.muser, %LOCALAPPDATA%\muser, the npm token in muser-release).
@@ -58,12 +65,36 @@ function isSensitivePath(p) {
     return true;
   }
   if (base.endsWith('.pem') || base.endsWith('.key')) return true;
-  if ((base.startsWith('id_rsa') || base.startsWith('id_ed25519')) && !base.endsWith('.pub')) return true;
+  // SSH private keys by their usual names: id_rsa, id_dsa, id_ecdsa, id_ed25519, id_xmss, …
+  // (any id_<name> with no extension; the .pub half is public and stays readable).
+  if (/^id_[^./]+$/.test(base) && !base.endsWith('.pub')) return true;
+  if (base === 'logins.json') return true; // Firefox's saved-logins store
   // Credential files by their usual names only: a source file such as credentials_manager.js
   // or docs/secrets-handling.md is code to read, not a secret.
-  if (base === 'credentials' || base === 'credentials.json' || base === '.secrets') return true;
+  if (base === 'credentials' || base === '.secrets') return true;
+  if (/^credentials\.(json|ya?ml|toml|env|ini|xml)$/.test(base)) return true;
   if (/^secrets?\.(json|ya?ml|toml|env|txt)$/.test(base)) return true;
   return false;
+}
+function isSensitivePath(p) {
+  if (typeof p !== 'string' || !p) return false;
+  const norm = p.replace(/\\/g, '/');
+  const parts = norm.split('/').filter(Boolean).map(winName);
+  const base = (parts[parts.length - 1] || '').toLowerCase();
+  const lower = parts.map(s => s.toLowerCase());
+  if (lower.some(s => s === '.ssh' || s === '.aws' || s === '.gnupg' || s === '.azure')) return true;
+  // Google Cloud SDK credentials live under ~/.config/gcloud (legacy: the folder pair, in order).
+  if (lower.some((s, i) => s === 'gcloud' && i > 0 && lower[i - 1] === '.config')) return true;
+  // muser's own approval store, wherever it was moved to: policy.muserSettingsPath only
+  // knows the two fixed roots, so a permissions.json relocated with MUSER_PERMISSIONS_FILE
+  // could be rewritten through the coding tools to grant itself approvals (audit #220).
+  // The store is muser's own state, never project code: the tools neither read nor write it.
+  const permFile = process.env.MUSER_PERMISSIONS_FILE;
+  if (permFile) {
+    const normAbs = x => path.resolve(x).replace(/\\/g, '/').split('/').map(s => winName(s.toLowerCase())).join('/');
+    if (normAbs(p) === normAbs(permFile)) return true;
+  }
+  return baseVariants(base).some(b => baseSensitive(b, lower));
 }
 // Where a path really leads: junctions and symlinks resolved on the deepest part that exists (the
 // rest, not yet created, is kept as written). A junction inside the project that points at ~/.ssh
@@ -81,12 +112,15 @@ function realOf(p) {
 function assertNotSensitive(file) {
   if (isSensitivePath(file) || (typeof file === 'string' && file && isSensitivePath(realOf(file)))) throw new Error(t('機密ファイルのため読み取りを拒否しました: {file}（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）', {file}));
 }
-function readText(file) {
+function readBytes(file) {
   assertNotSensitive(file);
   let st; try { st = fs.statSync(file); } catch { /* let readFileSync raise the real error */ }
   if (st && st.size > MAX_READ_BYTES) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（{size} バイト; 上限は 10MB / {max} バイトです）', {file, size: st.size, max: MAX_READ_BYTES}));
   const buf = fs.readFileSync(file);
   if (buf.length > MAX_READ_BYTES) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（上限は 10MB です）', {file}));
+  return buf;
+}
+function decodeText(buf) {
   // UTF-16 with a BOM (what `>` writes in Windows PowerShell 5.1, and many Windows exports) is
   // text full of zero bytes; it was refused as binary. Writes keep the file's encoding (writeText).
   const utf16 = utf16Of(buf);
@@ -94,6 +128,8 @@ function readText(file) {
   if (buf.includes(0)) throw new Error('Binary file; use system.run to inspect it');
   return buf.toString('utf8');
 }
+function readText(file) { return decodeText(readBytes(file)); }
+function staleError(file) { return new Error(t('File changed on disk since it was read（読み取り後にファイルが変更されています）: {file} — re-read it with code.read before writing/editing', {file})); }
 function bomOf(buf) { return buf[0] === 0xff && buf[1] === 0xfe ? 'le' : buf[0] === 0xfe && buf[1] === 0xff ? 'be' : null; }
 function utf16Of(buf) {
   const bom = bomOf(buf);
@@ -112,7 +148,10 @@ function statsMap(ctx) {
 }
 function recordRead(ctx, file) {
   const m = statsMap(ctx); if (!m) return;
-  try { const st = fs.statSync(file); m.set(file, {mtimeMs: st.mtimeMs, size: st.size, hash: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}); } catch { m.delete(file); }
+  // The hash is taken only up to the read cap: a file past it was never readable through
+  // code.read, and hashing it whole re-read gigabytes just to remember it (audit #222).
+  // An over-cap file is remembered by size/mtime only (hash null).
+  try { const st = fs.statSync(file); m.set(file, {mtimeMs: st.mtimeMs, size: st.size, hash: st.size <= MAX_READ_BYTES ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null}); } catch { m.delete(file); }
 }
 function forgetRead(ctx, file) { statsMap(ctx)?.delete(file); }
 // A parallel agent starts from main's reads: what each file looked like goes with them, or the
@@ -125,12 +164,31 @@ function copyReads(from, to) {
 function assertNotStale(ctx, file) {
   const m = statsMap(ctx); const prev = m?.get(file); if (!prev) return;
   let cur = null;
-  try { const st = fs.statSync(file); cur = {mtimeMs: st.mtimeMs, size: st.size, hash: crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')}; } catch { return; }
-  if (cur.size !== prev.size || cur.hash !== prev.hash) throw new Error(t('File changed on disk since it was read（読み取り後にファイルが変更されています）: {file} — re-read it with code.read before writing/editing', {file}));
+  try { const st = fs.statSync(file); cur = {mtimeMs: st.mtimeMs, size: st.size, hash: st.size <= MAX_READ_BYTES ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null}; } catch { return; }
+  const changed = cur.size !== prev.size || (prev.hash || cur.hash ? cur.hash !== prev.hash : cur.mtimeMs !== prev.mtimeMs);
+  if (changed) throw staleError(file);
+}
+// Read a file for an edit/write in ONE read, and check the staleness record against the
+// very bytes the edit will be applied to. The check-then-read pair it replaces read the
+// file twice, and a change landing between the two reads was treated as "seen": the
+// staleness check passed on the first version and the edit silently applied to the
+// second, never-read one (audit #222).
+function readVerified(ctx, file) {
+  const buf = readBytes(file);
+  const prev = statsMap(ctx)?.get(file);
+  if (prev && (buf.length !== prev.size || !prev.hash || crypto.createHash('sha256').update(buf).digest('hex') !== prev.hash)) throw staleError(file);
+  return decodeText(buf);
 }
 // Edits keep the file's own line endings; Muse always works in \n.
 function eol(text) { return text.includes('\r\n') ? '\r\n' : '\n'; }
 function toLf(text) { return text.replace(/\r\n/g, '\n'); }
+// Writes get the same ceiling as reads (audit #217): an unbounded content filled the
+// disk or blew up the diff's memory. Checked before any diff is computed, and again in
+// writeText as the backstop for every write path.
+function checkWriteSize(text) {
+  const n = Buffer.byteLength(String(text ?? ''), 'utf8');
+  if (n > MAX_READ_BYTES) throw new Error('Content too large to write (' + n + ' bytes; the limit is ' + MAX_READ_BYTES + ' bytes, the same as the read limit)');
+}
 function writeText(file, lf, ending) {
   fs.mkdirSync(path.dirname(file), {recursive: true});
   let mode = null; try { mode = fs.statSync(file).mode; } catch {}
@@ -140,6 +198,8 @@ function writeText(file, lf, ending) {
   const text = ending === '\r\n' ? lf.replace(/\n/g, '\r\n') : lf;
   let data = text;
   if (bom) { const body = Buffer.from(text, 'utf16le'); if (bom === 'be') body.swap16(); data = Buffer.concat([Buffer.from(bom === 'le' ? [0xff, 0xfe] : [0xfe, 0xff]), body]); }
+  const bytes = Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data, 'utf8');
+  if (bytes > MAX_READ_BYTES) throw new Error('File too large to write: ' + file + ' (' + bytes + ' bytes; the limit is ' + MAX_READ_BYTES + ' bytes, the same as the read limit)');
   try {
     fs.writeFileSync(temp, data);
     if (mode !== null) { try { fs.chmodSync(temp, mode); } catch {} }
@@ -224,13 +284,17 @@ function applyHunks(text, hunks, name) {
   const lines = text.split('\n');
   let at = 0;
   for (const h of hunks) {
-    if (h.anchor) { const a = findBlock(lines, [h.anchor], at); if (a >= 0) at = a; }
+    // An @@ anchor that matches nothing must not be silently ignored: the hunk then
+    // applied wherever its context first fit, which may be another function entirely
+    // (audit #216).
+    if (h.anchor) { const a = findBlock(lines, [h.anchor], at); if (a < 0) throw new Error('Patch anchor not found in ' + name + ': ' + h.anchor.slice(0, 120)); at = a; }
     const old = h.lines.filter(l => l[0] !== '+').map(l => l.slice(1)), neu = h.lines.filter(l => l[0] !== '-').map(l => l.slice(1));
     const pos = old.length ? findBlock(lines, old, at) : lines.length - (lines[lines.length - 1] === '' ? 1 : 0);
     if (pos < 0) throw new Error('Patch context not found in ' + name + ' near: ' + (old.find(l => l.trim()) || '').slice(0, 120));
     // A context that fits more than one place was applied at the first one, silently, as code.edit
-    // refuses a non-unique old_string. Without an @@ anchor it must fit one place only.
-    if (old.length && !h.anchor && findBlock(lines, old, pos + 1) >= 0) throw new Error('Patch context in ' + name + ' fits more than one place (near: ' + (old.find(l => l.trim()) || '').slice(0, 80) + '); add more unchanged lines around the change, or an @@ line naming the function or section');
+    // refuses a non-unique old_string. It must fit one place only — an @@ anchor narrows
+    // where the search starts, it does not waive the uniqueness check (audit #216).
+    if (old.length && findBlock(lines, old, pos + 1) >= 0) throw new Error('Patch context in ' + name + ' fits more than one place (near: ' + (old.find(l => l.trim()) || '').slice(0, 80) + '); add more unchanged lines around the change, or an @@ line naming the function or section');
     lines.splice(pos, old.length, ...neu); at = pos + neu.length;
   }
   return lines.join('\n');
@@ -281,19 +345,52 @@ function heavyGlobs(root) {
   if (norm === os.homedir().replace(/\\/g, '/').toLowerCase()) globs.push('!AppData/**');
   return globs;
 }
-const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/*.pem', '!**/*.key', '!**/id_rsa*', '!**/id_ed25519*', '!**/credentials', '!**/credentials.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/.docker/config.json', '!**/.kube/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx'];
+const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/.envrc', '!**/*.pem', '!**/*.key', '!**/id_*', '!**/credentials', '!**/credentials.*', '!**/logins.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.azure/**', '!**/.config/gcloud/**', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/.docker/config.json', '!**/.kube/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx'];
+
+// The path an rg output line names, or null when the line carries none (a context
+// separator, or a hit in the single explicit file target, which was already vetted).
+// Hit lines are path:12:text, context lines path-12-text, files_only lines are the path.
+function grepLinePath(line, filesOnly) {
+  if (filesOnly) return line || null;
+  const bin = /^Binary file (.+) matches$/.exec(line); if (bin) return bin[1];
+  const m = /[:-]\d+[:-]/.exec(line);
+  return m ? line.slice(0, m.index) : null;
+}
+// The -g exclusions above are a first pass only: they are a hand-kept copy of
+// isSensitivePath and the two diverged (.envrc, id_ecdsa, credentials.yaml all
+// leaked). The output is therefore filtered again through the one canonical
+// check — a line naming a sensitive path (as written, resolved, or through a
+// junction) is dropped, text and all.
+function dropSensitiveLines(lines, ctx, filesOnly) {
+  const sensitive = named => {
+    if (isSensitivePath(named)) return true;
+    const abs = path.resolve(ctx.cwd, named);
+    return isSensitivePath(abs) || isSensitivePath(realOf(abs));
+  };
+  return lines.filter(line => {
+    const named = grepLinePath(line, filesOnly);
+    if (named) {
+      // A hit line's text can itself contain ':12:' sequences; if any prefix
+      // of the line reads as a sensitive path, the line goes (fail closed).
+      const prefixes = filesOnly || line.startsWith('Binary file ') ? [named] : [...line.matchAll(/[:-]\d+[:-]/g)].map(m => line.slice(0, m.index));
+      return !prefixes.some(sensitive);
+    }
+    return true;
+  });
+}
 
 function computeEdit(p, ctx) {
   const file = resolve(ctx, p.path);
   if (!ctx.readFiles.has(file)) throw new Error('Read the file with code.read before editing it');
-  assertNotStale(ctx, file);
-  const raw = readText(file), text = toLf(raw), old = toLf(String(p.old_string ?? '')), neu = toLf(String(p.new_string ?? ''));
+  const raw = readVerified(ctx, file), text = toLf(raw), old = toLf(String(p.old_string ?? '')), neu = toLf(String(p.new_string ?? ''));
+  checkWriteSize(neu);
   if (!old) throw new Error('old_string is empty');
   if (old === neu) throw new Error('old_string and new_string are the same');
   const count = text.split(old).length - 1;
   if (!count) throw new Error('old_string not found in the file (it must match exactly; re-read the file)');
   if (count > 1 && !p.replace_all) throw new Error('old_string occurs ' + count + ' times; add surrounding context to make it unique, or set replace_all');
   const after = p.replace_all ? text.split(old).join(neu) : text.replace(old, () => neu);
+  checkWriteSize(after);
   return {file, raw, text, after, count: p.replace_all ? count : 1};
 }
 function planPatch(p, ctx) {
@@ -301,25 +398,30 @@ function planPatch(p, ctx) {
   // so any error (bad hunk, unread file, existing move destination, stale file)
   // leaves every file in the patch untouched.
   const ops = parsePatch(String(p.patch || ''));
-  const dests = new Set();
+  const dests = new Set(), seen = new Set();
   return ops.map(o => {
     const file = resolve(ctx, o.path);
+    // One file, one operation per patch (audit #212): two operations on the same file
+    // were both planned against the original content and the later write silently
+    // discarded the earlier one's result at commit time.
+    if (seen.has(file) || dests.has(file)) throw new Error(o.path + ' is written twice by this patch; combine its changes into a single operation for that file');
     if (o.op === 'add') {
+      checkWriteSize(o.content);
       if (fs.existsSync(file)) throw new Error(o.path + ' already exists');
-      if (dests.has(file)) throw new Error(o.path + ' is written twice by this patch');
       dests.add(file);
       return {...o, file, before: '', after: o.content, ending: '\n'};
     }
     // Update / Delete must have been read first, like code.edit (Add of a new file is the only exception).
     if (!ctx.readFiles.has(file)) throw new Error('Read the file with code.read before patching it: ' + o.path);
-    assertNotStale(ctx, file);
-    const raw = readText(file), before = toLf(raw);
+    seen.add(file);
+    const raw = readVerified(ctx, file), before = toLf(raw);
     if (o.op === 'delete') return {...o, file, before, after: ''};
     const after = applyHunks(before, o.hunks, o.path);
+    checkWriteSize(after);
     const dest = o.moveTo ? resolve(ctx, o.moveTo) : file;
     if (o.moveTo) {
       if (dest !== file && fs.existsSync(dest)) throw new Error(t('Move destination already exists（移動先が既に存在します）: {path}', {path: o.moveTo}));
-      if (dest !== file && dests.has(dest)) throw new Error('Move destination is written twice by this patch: ' + o.moveTo);
+      if (dest !== file && (dests.has(dest) || seen.has(dest))) throw new Error('Move destination is written twice by this patch: ' + o.moveTo);
     }
     dests.add(dest);
     return {...o, file, before, after, ending: eol(raw), dest};
@@ -339,13 +441,25 @@ const TOOLS = {
       // with an empty line 3, and an empty file as 1 line).
       const all = text === '' ? [] : text.split('\n'); if (all.length > 1 && all[all.length - 1] === '') all.pop();
       const start = Math.max(1, p.offset | 0 || 1), n = Math.min(MAX_READ_LINES, Math.max(1, p.limit | 0 || MAX_READ_LINES));
-      const shown = all.slice(start - 1, start - 1 + n).map((l, i) => String(start + i).padStart(6) + '\t' + (l.length > MAX_LINE ? l.slice(0, MAX_LINE) + '…' : l));
+      const slice = all.slice(start - 1, start - 1 + n);
+      // The window is also bounded by characters, like every other tool's output
+      // (audit #218): 2,000 lines x 2,000 characters was ~4M characters in one reply,
+      // ~65x the MAX_OUT the exec/grep outputs are clipped to. Lines stop at the
+      // budget and next_offset points at the first line not shown, so paging through
+      // with offset reads the rest exactly where this stopped.
+      const shown = []; let used = 0;
+      for (let i = 0; i < slice.length; i++) {
+        const line = String(start + i).padStart(6) + '\t' + (slice[i].length > MAX_LINE ? slice[i].slice(0, MAX_LINE) + '…' : slice[i]);
+        if (shown.length && used + line.length + 1 > MAX_OUT) break;
+        shown.push(line); used += line.length + 1;
+      }
       ctx.readFiles.add(file); recordRead(ctx, file);
       // Cut lines were marked with one "…" and nothing said how to read the rest (offset counts
       // lines, so a minified line could not be read past 2,000 characters).
-      const cut = all.slice(start - 1, start - 1 + n).map((l, i) => l.length > MAX_LINE ? start + i : 0).filter(Boolean);
+      const cut = slice.slice(0, shown.length).map((l, i) => l.length > MAX_LINE ? start + i : 0).filter(Boolean);
       const longNote = cut.length ? {long_lines: cut.slice(0, 20), note: cut.length + ' line(s) longer than ' + MAX_LINE + ' characters are cut here (ending in …). To see one whole, use system.run, e.g. (Get-Content -LiteralPath <file>)[<line - 1>].Substring(<from>, 4000), or code.grep with a pattern from it.'} : {};
-      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(start - 1 + n < all.length ? {next_offset: start + n} : {}), ...longNote, ...encodingWarning(text)}, view: {lines: shown.length}};
+      const shownEnd = start - 1 + shown.length;
+      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(shownEnd < all.length ? {next_offset: start + shown.length} : {}), ...(shown.length < slice.length ? {truncated: true} : {}), ...longNote, ...encodingWarning(text)}, view: {lines: shown.length}};
     },
   },
   'code.write': {
@@ -354,14 +468,14 @@ const TOOLS = {
       required: {path: {type: 'string', description: 'File path.'}, content: {type: 'string', description: 'The complete file content.'}}, optional: {}},
     summary: p => p.path,
     target: (p, ctx) => resolve(ctx, p.path),
-    preview(p, ctx) { const file = resolve(ctx, p.path); if (fs.existsSync(file)) assertNotStale(ctx, file); return {diff: lineDiff(fs.existsSync(file) ? toLf(readText(file)) : '', toLf(String(p.content ?? ''))), created: !fs.existsSync(file)}; },
+    preview(p, ctx) { const file = resolve(ctx, p.path); checkWriteSize(p.content ?? ''); const exists = fs.existsSync(file); return {diff: lineDiff(exists ? toLf(readVerified(ctx, file)) : '', toLf(String(p.content ?? ''))), created: !exists}; },
     run(p, ctx) {
       const file = resolve(ctx, p.path);
       if (typeof p.content !== 'string') throw new Error('content is required');
+      checkWriteSize(p.content);
       const exists = fs.existsSync(file);
       if (exists && !ctx.readFiles.has(file)) throw new Error('Read the file with code.read before overwriting it');
-      if (exists) assertNotStale(ctx, file);
-      const rawBefore = exists ? readText(file) : '', before = toLf(rawBefore);
+      const rawBefore = exists ? readVerified(ctx, file) : '', before = toLf(rawBefore);
       writeText(file, toLf(p.content), exists ? eol(rawBefore) : (os.EOL === '\r\n' && /\r\n/.test(p.content) ? '\r\n' : '\n'));
       ctx.readFiles.add(file); recordRead(ctx, file);
       const diff = lineDiff(before, toLf(p.content));
@@ -441,7 +555,9 @@ const TOOLS = {
       args.push('-e', String(p.pattern), p.path ? resolve(ctx, p.path) : '.');
       // With context, rg also prints the lines around a hit (file-12-text) and "--" between groups;
       // counting every line reported 10 matches for 2. Hits are file:12:text (12:text for one file).
-      const out = (await rg(args, ctx.cwd)).trimEnd(), lines = out ? out.split('\n') : [];
+      const raw = (await rg(args, ctx.cwd)).trimEnd();
+      const lines = dropSensitiveLines(raw ? raw.split('\n') : [], ctx, !!p.files_only);
+      const out = lines.join('\n');
       const n = p.context && !p.files_only ? lines.filter(l => /^(?:(?:[A-Za-z]:)?[^:\r\n]*:)?\d+:/.test(l)).length : lines.length;
       return {payload: {matches: n, output: clip(out) || '(no matches)'}, view: {count: n}};
     },
@@ -497,9 +613,16 @@ const TOOLS = {
         const s = ctx.shells.start(p.command, {shell: p.shell, cwd});
         await new Promise(r => setTimeout(r, 1500)); // let startup errors and the first lines show
         const first = await ctx.shells.output(s.id);
-        return {payload: {shell_id: s.id, pid: s.pid, ...first, hint: 'Running in the background. Use shell.output with shell_id to read more, shell.kill to stop.'}, view: {background: s.id, tail: frames(first.output).trimEnd().split('\n').slice(-4)}};
+        return {payload: {shell_id: s.id, pid: s.pid, shell: p.shell || 'powershell', ...first, hint: 'Command running in background with ID: ' + s.id + '. You will be notified when it completes. To check interim output, use shell.output with shell_id ' + s.id + '; shell.kill stops it.'}, view: {background: s.id, tail: frames(first.output).trimEnd().split('\n').slice(-4)}};
       }
-      const r = await runOnce(p.command, {shell: p.shell, cwd, timeout, signal, onOutput, maxOut: MAX_OUT, clip});
+      // On timeout the run moves to the background instead of being killed (as in Claude Code),
+      // except a sleep-led command, whose whole point was the wait. Interrupts still kill.
+      const sleepLed = /^\s*(start-sleep|sleep)\b/i.test(p.command);
+      // The adopt call carries the shell choice with the run (audit #221): it used to pass
+      // only {cwd}, so a timed-out shell:'cmd' run was recorded and reported as a default
+      // PowerShell shell from then on.
+      const r = await runOnce(p.command, {shell: p.shell, cwd, timeout, signal, onOutput, maxOut: MAX_OUT, clip, adopt: (!sleepLed && ctx.shells) ? (child, out) => ctx.shells.adopt(p.command, {cwd, shell: p.shell}, child, out) : undefined});
+      if (r.backgrounded) return {payload: {shell_id: r.backgrounded, backgrounded: true, shell: p.shell || 'powershell', stdout: clip(r.stdout), stderr: clip(r.stderr, MAX_OUT / 3), hint: 'The command reached its timeout and was moved to the background as ' + r.backgrounded + ' instead of being stopped. You will be notified when it completes; shell.output reads it, shell.kill stops it.'}, view: {background: r.backgrounded, tail: frames(r.stdout + r.stderr).trimEnd().split('\n').slice(-4)}};
       return {payload: {exit_code: r.code, stdout: clip(r.stdout), stderr: clip(r.stderr, MAX_OUT / 3), ...(r.killed ? {killed: r.killed} : {})}, view: {exit: r.code, killed: r.killed, tail: frames(r.stdout + r.stderr).trimEnd().split('\n').slice(-4)}};
     },
   },
@@ -512,14 +635,16 @@ const TOOLS = {
     async run(p, ctx) { const r = await ctx.shells.output(p.shell_id, {since: Number.isSafeInteger(p.since) ? p.since : undefined, waitS: p.wait_s | 0, caller: p.caller || p.agent}); return {payload: r, view: {background: r.id, lines: r.output ? r.output.trimEnd().split('\n').length : 0, running: r.running}}; },
   },
   'shell.kill': {
-    // kind 'edit', not 'read'/'exec': policy.decide() auto-allows 'read' everywhere (incl. plan mode and
-    // read-only sub-agents), while 'exec' with no params.command is judged a read-only command and also
-    // allowed in plan mode. 'edit' is denied in plan mode and asks in default mode — killing a process
-    // changes state, so that is the kind that actually gates it with the existing decide() logic.
-    kind: 'edit',
+    // kind 'kill', its own: 'read' is auto-allowed everywhere (incl. plan mode and read-only
+    // sub-agents), and 'edit' was worse than it looked (audit #213) — auto-edit mode allowed
+    // every kill unasked, and a remembered "don't ask again" for edits (alwaysKey 'edit')
+    // silently covered kills too. decide() treats an unknown kind conservatively with no
+    // policy change: denied in plan mode, asked in default AND auto-edit mode, never
+    // remembered (alwaysKey returns null for it), allowed only in bypass.
+    kind: 'kill',
     def: {description: 'Stop a background shell (and its child processes).', required: {shell_id: {type: 'string', description: 'e.g. bg1'}}, optional: {}},
     summary: p => p.shell_id,
-    run(p, ctx) { const r = ctx.shells.kill(p.shell_id); return {payload: r, view: {background: r.id, killed: true}}; },
+    run(p, ctx) { const r = ctx.shells.kill(p.shell_id); return {payload: r, view: {background: r.id, killed: r.killed}}; },
   },
   'shell.list': {
     kind: 'read',
@@ -561,4 +686,4 @@ const TOOLS = {
 
 function commandsV2() { return Object.fromEntries(Object.entries(TOOLS).map(([k, t]) => [k, t.def])); }
 
-module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of};
+module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of, dropSensitiveLines};

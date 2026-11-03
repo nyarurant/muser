@@ -49,6 +49,12 @@ test('long Japanese command output arrives without broken characters (one-shot a
   assert.equal((r.stdout.match(BROKEN) || []).length, 0);
   assert.ok(r.stdout.length >= 160000);
   const sh = new Shells(), s = sh.start(cmd, {cwd: process.cwd()});
-  while (s.running) await new Promise(res => setTimeout(res, 100));
+  // This wait had no bound: a hung shell hung the whole suite with no diagnosis
+  // (audit #255). Bound it and say how far the output got.
+  const deadline = Date.now() + 120000;
+  while (s.running) {
+    if (Date.now() > deadline) assert.fail('the background shell did not finish within 120 s; output so far: ' + s.out.length + ' chars');
+    await new Promise(res => setTimeout(res, 100));
+  }
   assert.equal((s.out.match(BROKEN) || []).length, 0);
 });

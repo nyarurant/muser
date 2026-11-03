@@ -1,7 +1,10 @@
 'use strict';
 // Terminal basics: colors, display width (CJK / emoji are two cells), wrapping, truncation.
 const ESC = '\x1b[';
-const on = process.stdout.isTTY && !process.env.NO_COLOR;
+// Colours off with NO_COLOR or "color" off in /settings (from the next start). `muser serve` has
+// no terminal, but the GUI reads these SGR codes as the bold / heading / code styling of a reply
+// (md.mjs rows), so serve turns them on with MUSER_SGR=1 (set in bin/muser.js before this loads).
+const on = (process.stdout.isTTY || process.env.MUSER_SGR === '1') && require('../settings').switchValue('color');
 const sgr = (...codes) => s => on ? ESC + codes.join(';') + 'm' + s + ESC + '0m' : s;
 // Colour depth: 24-bit only when the terminal advertises it (COLORTERM=truecolor/24bit or a
 // *-direct / *-truecolor TERM); otherwise quantise to the xterm 256 palette (38;5;n).
@@ -15,7 +18,7 @@ function rgbTo256(r, g, b) {
   return 16 + 36 * Math.round(r / 51) + 6 * Math.round(g / 51) + Math.round(b / 51); // 6x6x6 cube 16-231
 }
 const rgb = (r, g, b) => truecolor ? sgr(38, 2, r, g, b) : sgr(38, 5, rgbTo256(r, g, b));
-const bg = (r, g, b) => sgr(48, 2, r, g, b);
+const bg = (r, g, b) => truecolor ? sgr(48, 2, r, g, b) : sgr(48, 5, rgbTo256(r, g, b)); // bg bypassed the quantisation rgb() applies (recovery scan)
 
 // One accent (Muse violet) on a monochrome base, like Claude Code / Codex.
 const c = {
@@ -39,7 +42,29 @@ function cp(ch) {
       (code >= 0x1f300 && code <= 0x1f64f) || (code >= 0x1f900 && code <= 0x1f9ff) || (code >= 0x1f680 && code <= 0x1f6ff) || (code >= 0x20000 && code <= 0x3fffd)) return 2;
   return 1;
 }
-function width(s) { let w = 0; for (const ch of strip(s)) w += cp(ch); return w; }
+// Width by grapheme cluster (Intl.Segmenter): a ZWJ sequence (👨‍👩‍👧), a base + skin-tone modifier,
+// or a letter + combining marks is ONE printed glyph, so only the cluster's first code point
+// counts — the old per-code-point sum counted the modifier / ZWJ parts again and over-measured.
+const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+function clusterWidth(cluster) {
+  if (cluster.includes('⃣')) return 2; // keycap sequences print wide
+  // A flag is two regional indicators in one cluster and prints 2 cells;
+  // cp() scores a lone regional indicator 1 (it is below the emoji ranges),
+  // so width('🇯🇵') came out 1 for a 2-cell glyph (recovery scan).
+  const cps = [...cluster];
+  if (cps.length >= 2 && cps[0].codePointAt(0) >= 0x1f1e6 && cps[0].codePointAt(0) <= 0x1f1ff && cps[1].codePointAt(0) >= 0x1f1e6 && cps[1].codePointAt(0) <= 0x1f1ff) return 2;
+  return cp(String.fromCodePoint(cluster.codePointAt(0)));
+}
+function width(s) {
+  const str = strip(s);
+  // Fast path: nothing that can join a cluster (combining marks, ZWJ, variation selectors,
+  // skin tones, regional indicators, keycap / tag sequences) — per-code-point is exact there,
+  // and width() is called per character by the wrapping code, so segmenting everything was slow.
+  let clustered = false;
+  for (const ch of str) { const code = ch.codePointAt(0); if ((code >= 0x300 && code <= 0x36f) || code === 0x200d || code === 0x20e3 || (code >= 0xfe00 && code <= 0xfe0f) || (code >= 0x1f1e6 && code <= 0x1f1ff) || (code >= 0x1f3fb && code <= 0x1f3ff) || (code >= 0xe0020 && code <= 0xe007f)) { clustered = true; break; } }
+  if (!clustered || !segmenter) { let w = 0; for (const ch of str) w += cp(ch); return w; }
+  let w = 0; for (const {segment} of segmenter.segment(str)) w += clusterWidth(segment); return w;
+}
 
 // Walk a styled string cell by cell, keeping escape codes attached.
 function tokens(s) {

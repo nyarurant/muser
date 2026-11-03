@@ -30,11 +30,13 @@ const SCRIPT = [
   'else{\'NONE\'}',
 ].join(';');
 
-// Files referenced by the clipboard, or [] when it holds no image.
+// Files referenced by the clipboard: resolves {files, error} — error is null on success and a
+// message when the clipboard could not be read at all, so "could not read" is not reported to
+// the user as "no images" (the old code resolved [] for both).
 function clipboardImages() {
   return new Promise(resolve => {
     execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-Command', SCRIPT], {windowsHide: true, encoding: 'utf8', timeout: 10000}, (err, out) => {
-      if (err) return resolve([]);
+      if (err) return resolve({files: [], error: String(err.message || err)});
       const files = [];
       for (const line of String(out).split(/\r?\n/)) {
         const m = /^(IMG|FILE) (.+)$/.exec(line.trim());
@@ -45,7 +47,7 @@ function clipboardImages() {
       const freshTemps = new Set(files.filter(f => f.temporary).map(f => f.path));
       dropPendingClipboardTemps(freshTemps);
       for (const p of freshTemps) pendingClipboardTemps.add(p);
-      resolve(files);
+      resolve({files, error: null});
     });
   });
 }
@@ -60,6 +62,12 @@ function pastedImagePaths(text) {
 }
 
 function attachment(file, temporary = false) {
+  // The type comes from the extension, and an unsupported one used to fall back to
+  // 'image/png' — a non-image file reached the API mislabelled as a PNG (audit #242).
+  // The drag-and-drop path checked isImage() first; the phone path did not, so the
+  // check belongs here. (The message string already exists for the controller's check.)
+  const type = IMAGE_TYPES[path.extname(file).toLowerCase()];
+  if (!type) throw new Error(t('画像ファイル（png / jpg / gif / webp / bmp）を指定してください'));
   // Stat before reading: an oversized file is rejected from its size alone,
   // without first loading all of it into memory.
   if (fs.statSync(file).size > MAX) {
@@ -70,7 +78,7 @@ function attachment(file, temporary = false) {
   if (data.length > MAX) throw new Error(t('{file} は 10 MB を超えています', {file: path.basename(file)}));
   const name = temporary ? 'clipboard.png' : path.basename(file);
   if (temporary) { pendingClipboardTemps.delete(file); try { fs.unlinkSync(file); } catch {} }
-  return {name, type: IMAGE_TYPES[path.extname(file).toLowerCase()] || 'image/png', size: data.length, data: data.toString('base64')};
+  return {name, type, size: data.length, data: data.toString('base64')};
 }
 
 // What the chat API takes (same shape as the muse.ai web client).

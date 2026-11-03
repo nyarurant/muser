@@ -5,6 +5,18 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {spawnSync} = require('node:child_process');
+
+// src/mcp resolves ~/.muser/mcp.json (and discover() reads ~/.claude.json and
+// ~/.codex) from the home dir, and the vault lives under %LOCALAPPDATA% — the
+// discover/redact tests below write and DELETE those files in-process. Point
+// every folder at a throwaway one BEFORE loading any src module, mirroring
+// tests/accounts.test.js: `npm test` already isolates via tests/setup.mjs, but
+// a bare `node --test tests/mcp.test.js` skips that file and would otherwise
+// overwrite the user's real ~/.claude.json, rm -rf their real ~/.codex, delete
+// their real ~/.muser/mcp.json and empty the real mcp-secrets.enc vault.
+process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-mcp-test-data-'));
+process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-mcp-test-home-'));
+
 const {McpHub, params, checkRemoteUrl} = require('../src/mcp');
 
 test('stdio MCP server: tools become device commands, nested args travel as JSON', async () => {
@@ -74,7 +86,7 @@ test('corrupt config is backed up; secrets move to the secure-store as $secret r
     assert.equal(mcp.load().mcpServers.plain.env.TOKEN, 'plain-value-9', 'legacy plaintext config still loads');
     console.log('CHILD OK');
   `);
-  const r = spawnSync(process.execPath, [script], {encoding: 'utf8',
+  const r = spawnSync(process.execPath, [script], {encoding: 'utf8', timeout: 60000,
     env: {...process.env, USERPROFILE: home, HOME: home, LOCALAPPDATA: local, MUSER_REPO: path.join(__dirname, '..')}});
   assert.equal(r.status, 0, r.stderr || r.stdout);
   assert.match(r.stdout, /CHILD OK/);
@@ -201,6 +213,94 @@ test('remote URL check: non-https is refused except loopback, and surfaces as er
   assert.equal(hub.servers.get('remote').status, 'error');
   assert.match(hub.servers.get('remote').error, /headers may carry secrets/);
   await hub.close();
+});
+
+// Audit #235: a 'string' parameter was the one schema type call() never checked, so a
+// value the gateway had already coerced (123, true) reached the server type-changed.
+test('coercion errors: a string parameter rejects non-string values before the server is called', async () => {
+  const {hub, calls} = fakeHub({content: [{type: 'text', text: 'ok'}]});
+  for (const args of [{s: 123}, {s: true}, {s: null}, {s: ['x']}, {s: {a: 1}}]) {
+    const r = await hub.call('mcp.fake.do', args);
+    assert.equal(r.isError, true, JSON.stringify(args));
+    assert.match(r.text, /Invalid argument "s" for MCP tool do: expected string/);
+  }
+  assert.equal(calls.length, 0, 'server never called');
+  assert.equal((await hub.call('mcp.fake.do', {s: 'fine'})).isError, false);
+  await hub.close();
+});
+
+// Audit #236: discover() imported servers the user had disabled in Claude Code
+// (the Codex branch already honoured enabled:false; the Claude branch checked nothing).
+test('discover: servers disabled in Claude Code or Codex are not imported', t => {
+  const home = os.homedir();
+  const claudeFile = path.join(home, '.claude.json'), codexDir = path.join(home, '.codex'), codexFile = path.join(codexDir, 'config.toml');
+  t.after(() => { fs.rmSync(claudeFile, {force: true}); fs.rmSync(codexDir, {recursive: true, force: true}); });
+  fs.rmSync(path.join(home, '.muser', 'mcp.json'), {force: true});
+  fs.writeFileSync(claudeFile, JSON.stringify({mcpServers: {
+    'claude-on': {command: 'a'},
+    'claude-off': {command: 'b', disabled: true},
+    'claude-off2': {command: 'c', enabled: false},
+  }}));
+  fs.mkdirSync(codexDir, {recursive: true});
+  fs.writeFileSync(codexFile, '[mcp_servers.codex-on]\ncommand = "a"\n\n[mcp_servers.codex-off]\ncommand = "b"\nenabled = false\n');
+  const {discover} = require('../src/mcp');
+  assert.deepEqual(discover().map(f => f.name).sort(), ['claude-on', 'codex-on']);
+});
+
+// Audits #232/#233 (child process, temp home): save() prunes vault entries whose
+// server/key is gone, and a $secret reference the vault lacks is reported — and
+// refuses the connect — instead of reaching the server as an empty string.
+test('save prunes orphaned vault secrets; a missing vault entry refuses the connect (child process)', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-mcp-home-'));
+  const local = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-mcp-local-'));
+  const script = path.join(home, 'child.js');
+  fs.writeFileSync(script, `
+    const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
+    const assert = require('node:assert');
+    const mcp = require(process.env.MUSER_REPO + '/src/mcp.js');
+    const store = require(process.env.MUSER_REPO + '/src/secure-store.js');
+    const dir = path.join(os.homedir(), '.muser'), file = path.join(dir, 'mcp.json');
+    fs.mkdirSync(dir, {recursive: true});
+    mcp.save({mcpServers: {demo: {command: 'node', env: {API_KEY: 'k1-value'}, headers: {Authorization: 'Bearer t1'}}}});
+    let vault = store.load('mcp-secrets.enc');
+    assert.deepEqual(Object.keys(vault).sort(), ['demo:env:API_KEY', 'demo:headers:Authorization']);
+    mcp.save({mcpServers: {demo: {command: 'node', headers: {Authorization: 'Bearer t1'}}}}); // env key cleared
+    vault = store.load('mcp-secrets.enc');
+    assert.deepEqual(Object.keys(vault), ['demo:headers:Authorization'], 'the cleared key was pruned from the vault');
+    mcp.save({mcpServers: {}}); // server deleted
+    vault = store.load('mcp-secrets.enc');
+    assert.deepEqual(vault, {}, 'the deleted server left no secrets behind');
+    // A reference with nothing behind it: load reports it, connect refuses it.
+    fs.writeFileSync(file, JSON.stringify({mcpServers: {ghost: {command: process.execPath, args: [], env: {API_KEY: {$secret: 'ghost:env:API_KEY'}}}}}));
+    const loaded = mcp.load();
+    assert.deepEqual(mcp.missingSecrets('ghost'), ['ghost:env:API_KEY']);
+    (async () => {
+      const hub = new mcp.McpHub();
+      await assert.rejects(hub.connect('ghost', loaded.mcpServers.ghost), /not found in the secure store/);
+      assert.equal(hub.servers.get('ghost').status, 'error');
+      await hub.close();
+      console.log('CHILD OK');
+    })().catch(e => { console.error(e); process.exit(1); });
+  `);
+  const r = spawnSync(process.execPath, [script], {encoding: 'utf8', timeout: 60000,
+    env: {...process.env, USERPROFILE: home, HOME: home, LOCALAPPDATA: local, MUSER_REPO: path.join(__dirname, '..')}});
+  assert.equal(r.status, 0, r.stderr || r.stdout);
+  assert.match(r.stdout, /CHILD OK/);
+});
+
+// Audit #234: redaction notes only secret-looking keys, replaces longest first (a
+// short prefix must not leave a longer secret's tail), and covers short secrets as
+// whole tokens.
+test('redact: secret keys only, longest first, short secrets as whole tokens', t => {
+  const mcp = require('../src/mcp');
+  const store = require('../src/secure-store');
+  t.after(() => { fs.rmSync(mcp.FILE, {force: true}); try { store.save('mcp-secrets.enc', {}); } catch {} });
+  mcp.save({mcpServers: {demo: {command: 'node', env: {API_TOKEN: 'abcdefgh', ALT_TOKEN: 'abcd', SHORT_TOKEN: 'ab', NODE_ENV: 'production'}}}});
+  mcp.load(); // noting happens on resolve
+  assert.equal(mcp.redact('the token abcdefgh leaked'), 'the token *** leaked', 'longest first: no tail survives');
+  assert.equal(mcp.redact('running in production mode'), 'running in production mode', 'a plain config value under a non-secret key is not redacted');
+  assert.equal(mcp.redact('pin ab here'), 'pin *** here', 'a short secret is redacted as a whole token');
+  assert.equal(mcp.redact('abc stays'), 'abc stays', 'but not as a substring of a longer word');
 });
 
 test('setEnabled on a started hub connects/disconnects live (child process, temp home)', async () => {

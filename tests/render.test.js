@@ -20,7 +20,12 @@ async function setup() {
   const show = async el => {
     const out = fakeOut();
     const app = render(el, {stdout: out, debug: true, patchConsole: false, exitOnCtrlC: false});
-    await new Promise(r => setTimeout(r, 200)); app.unmount();
+    // Poll for the first frame instead of a fixed 200 ms sleep: the baseline
+    // run showed every show() costing ~210 ms (the sleep, not the render), and
+    // on a loaded machine 200 ms can elapse before the frame lands at all.
+    const start = Date.now();
+    while (!out.out) { if (Date.now() - start > 5000) throw new Error('timed out waiting for the first frame'); await new Promise(r => setTimeout(r, 20)); }
+    app.unmount();
     return out.out;
   };
   return {h: React.createElement, Entry, Live, ctrl, show};
@@ -34,6 +39,27 @@ test('writing a 200,000-line file renders its diff (first rows and a count)', as
   const out = await show(h(Entry, {e: {type: 'tool', call: {id: '1', command: 'code.write', kind: 'edit', ok: true, summary: 'big.txt', view: {diff, created: true}}}, ctrl, W: 100}));
   assert.match(out, /line 0/);
   assert.match(out, /ほか \d+ 行/);
+});
+
+// Every tool row used to start with ⏺, so the kind of action was only in the title text.
+test('tool rows carry a glyph per kind: edits ✎, runs ▶, searches ≡, reads keep ⏺', async () => {
+  const {glyphFor} = await import('../src/ui/view.mjs');
+  assert.equal(glyphFor({command: 'code.edit'}), '✎');
+  assert.equal(glyphFor({command: 'code.write'}), '✎');
+  assert.equal(glyphFor({command: 'code.apply_patch'}), '✎');
+  assert.equal(glyphFor({command: 'system.run'}), '▶');
+  assert.equal(glyphFor({command: 'shell.output'}), '▶');
+  assert.equal(glyphFor({command: 'shell.kill'}), '■');
+  assert.equal(glyphFor({user: true, command: 'system.run'}), '▶');
+  assert.equal(glyphFor({command: 'code.grep'}), '≡');
+  assert.equal(glyphFor({command: 'code.glob'}), '☰');
+  assert.equal(glyphFor({kind: 'mcp', command: 'mcp.s.t'}), '⚙');
+  assert.equal(glyphFor({kind: 'agent', command: 'agent.spawn'}), '◆');
+  assert.equal(glyphFor({command: 'code.read'}), '⏺');
+  assert.equal(glyphFor({command: 'skill.read'}), '⏺');
+  const {h, Entry, ctrl, show} = await setup();
+  const out = await show(h(Entry, {e: {type: 'tool', call: {id: '1', command: 'code.edit', kind: 'edit', ok: true, summary: 'a.js', view: {diff: [{t: ' ', n: 1, s: 'x'}]}}}, ctrl, W: 100}));
+  assert.ok(out.includes('✎'), 'the rendered edit row shows ✎');
 });
 
 // The approval box showed the first 12 lines of a command and said nothing about the rest.
@@ -60,11 +86,13 @@ test('running agents show beside an open todo list', async () => {
 test('a long paste shows a window of the input around the caret, not every line', async () => {
   const {h, Live, ctrl, show} = await setup();
   ctrl.paste(Array.from({length: 3000}, (_, i) => 'log line ' + i).join('\n'));
-  const t0 = Date.now(), out = await show(h(Live, {s: ctrl.get(), ctrl, W: 100}));
+  const out = await show(h(Live, {s: ctrl.get(), ctrl, W: 100}));
   assert.ok(out.includes('log line 2999'), 'the caret line is shown');
   assert.ok(!out.includes('log line 100\n') && !out.includes('log line 10 '), 'far lines are not drawn');
   assert.match(out, /↑ ほか \d+ 行（全部で 3000 行）/);
-  assert.ok(Date.now() - t0 < 400, 'drawn quickly');
+  // No wall-clock assert here: an absolute bound (< 400 ms) failed on a loaded or
+  // cold-JIT machine with no rendering regression at all (audit #253). What this test
+  // pins is the windowing above — only the caret's window is drawn, however long it takes.
   assert.equal(ctrl.get().text.split('\n').length, 3000, 'the text itself is whole');
 });
 
@@ -111,4 +139,44 @@ test('25 running agents fit the screen with the input still visible', async () =
   const at = frame.findIndex(l => l.includes('Muse が作業中'));
   assert.ok(at > 0 && at < 40, 'input at row ' + at);
   assert.ok(frame.some(l => /ほか \d+ 件（\/agents で一覧）/.test(l)));
+});
+
+// Several windows share one device name; the status view says which node slot this one holds.
+test('the status entry names this window node slot when it holds one', async () => {
+  const {h, Entry, ctrl, show} = await setup();
+  const before = await show(h(Entry, {e: {type: 'status'}, ctrl, W: 100}));
+  assert.ok(!/窓 \d/.test(before), 'no slot before the device connects');
+  ctrl.agent.nodeSlot = {slot: 2, nodeId: 'test-2'};
+  const after = await show(h(Entry, {e: {type: 'status'}, ctrl, W: 100}));
+  assert.match(after, /窓 2/);
+});
+
+test('the status entry names the account this window talks to, aligned with the other rows', async () => {
+  const {h, Entry, ctrl, show} = await setup();
+  ctrl.agent.accountId = 'sub'; ctrl.agent.accountLabel = 'Sub';
+  const out = (await show(h(Entry, {e: {type: 'status'}, ctrl, W: 100}))).split('\n');
+  const acct = out.find(l => l.includes('アカウント')), place = out.find(l => l.includes('場所'));
+  assert.match(acct, /アカウント\s{2,}Sub {2}sub/);
+  const {width} = require('../src/tui/term.js');
+  assert.equal(width(acct.slice(0, acct.indexOf('Sub'))), width(place.slice(0, place.search(/[A-Za-z]:|\//))), 'values start in the same column');
+});
+
+// The real token windows (/usage's numbers) are checkable from /status too,
+// once any turn has carried a live [usage] line.
+test('the status entry shows the real token windows once any were recorded', async () => {
+  const {h, Entry, ctrl, show} = await setup();
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-status-usage-'));
+  const prev = process.env.MUSER_USAGE_FILE;
+  process.env.MUSER_USAGE_FILE = path.join(dir, 'usage.json');
+  try {
+    require('../src/usage').record({usage: {inputTokens: 2048, outputTokens: 64}});
+    const out = await show(h(Entry, {e: {type: 'status'}, ctrl, W: 100}));
+    assert.match(out, /実績 1時間\s+2k in \/ 64 out/);
+    assert.match(out, /実績 今日\s+2k in \/ 64 out/);
+    assert.match(out, /実績 累計\s+2k in \/ 64 out/);
+  } finally {
+    if (prev === undefined) delete process.env.MUSER_USAGE_FILE; else process.env.MUSER_USAGE_FILE = prev;
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
 });

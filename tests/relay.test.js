@@ -100,3 +100,15 @@ test('a handed call whose answer is lost is not reported as "muser is idle"', as
   assert.doesNotMatch(r.error, /muser is idle/);
   assert.match(r.error, /another muser window/);
 });
+
+// Multi-account: a call is never handed to a window on another Muse account, while windows that
+// do not say their account (older muser) are still reached.
+test('a call is not handed to a window on another account', async t => {
+  const dir = tmp(t, 'muser-relay-');
+  const idle = new Relay({dir, takes: () => false, run: async () => ({}), account: () => 'default'}).start(); t.after(() => idle.stop());
+  const other = new Relay({dir, takes: () => true, run: async () => assert.fail('another account must not run it'), account: () => 'second'}).start(); t.after(() => other.stop());
+  assert.deepEqual(await idle.forward('code.glob', {}, 1000, 'x'), {takers: 0});
+  other.stop();
+  relay(t, dir, () => true, async () => ({ok: true}));
+  assert.deepEqual(await idle.forward('code.glob', {}, 1000, 'y'), {result: {ok: true}});
+});

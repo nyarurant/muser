@@ -6,6 +6,16 @@ const {waitForReply} = require('../src/core/agent-reply');
 const {NativeDevice} = require('../src/core/native-device');
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
+// Poll for a condition instead of sleeping a fixed time on a thin margin: under parallel
+// load the fixed sleeps in this file (250 ms for a 100 ms run, 2300 ms for a 2 s retry,
+// 20/50 ms around a dispatch) asserted before correct code finished (audit #252).
+const waitFor = async (cond, what, timeoutMs = 15000) => {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > timeoutMs) assert.fail('timed out after ' + timeoutMs + ' ms waiting for ' + what);
+    await wait(20);
+  }
+};
 
 // A gateway that has the reply ready but is offline until `online` is set.
 function fakeClient() {
@@ -43,9 +53,9 @@ test('an invoke re-sent on the reconnected device is answered from the record, n
   const before = new NativeDevice({execute, invokes}), after = new NativeDevice({execute, invokes});
   before._dispatchInvoke({id: 'inv1', command: 'code.edit', params: {}}); // socket drops mid-run
   after._dispatchInvoke({id: 'inv1', command: 'code.edit', params: {}});  // Muse re-sends it
-  await wait(200);
+  await waitFor(() => invokes.completed.has('inv1'), 'the single run (~100 ms) to complete');
   after._dispatchInvoke({id: 'inv1', command: 'code.edit', params: {}});  // and again after it finished
-  await wait(50);
+  await wait(50); // a wrongly re-run invoke would have started by now; runs is the check
   assert.equal(runs, 1);
   assert.deepEqual(invokes.completed.get('inv1'), {ok: true, payload: {n: 1}});
 });
@@ -100,13 +110,19 @@ test('a /chat/subscribe stream the gateway ends is opened again; other streams e
   c.emit('stream-end', {path: '/chat/stream'}); // a send finishing: nothing to do
   c.emit('stream-end', {path: '/chat/subscribe'});
   assert.equal(a.subscribed, false);
-  await wait(2300); // ended soon after it opened: the first retry waits 2 s
+  // Ended soon after it opened: the first retry waits 2 s. A fixed 2300 ms sleep
+  // asserted on a 300 ms margin (audit #252); poll for the retry instead.
+  await waitFor(() => c.subscribes === 2, 'the subscribe retry after the 2 s backoff');
   assert.equal(c.subscribes, 2, 'subscribed again');
   assert.equal(a.subscribed, true);
   const reopened = [];
   c.subscribeAgent = async (sid, scope) => { reopened.push(scope); };
   a.main.turn = {owner: 'muser-x', waiting: {refresh() {}}};
   c.emit('stream-error', {path: '/chat/subscribe', scope: 'muser-x', message: 'reset'});
+  // Audit #11: a scoped stream is reopened after a per-scope backoff (1 s at first),
+  // not at once — an instant resubscribe looped tightly when the gateway kept ending
+  // it. Poll for the reopen like the main-subscription retry above (#252).
+  await waitFor(() => reopened.length === 1, 'the scoped resubscribe after its backoff');
   assert.deepEqual(reopened, ['muser-x'], "a running turn's own subscription is reopened");
   a.main.turn = null; a.close();
 });
@@ -121,11 +137,12 @@ test("a call refused as 'busy' runs when it is sent again after a slot frees up"
   d._sendResult = async (id, r) => { sent.push([id, r.ok ? 'ok' : r.error]); };
   for (let i = 0; i < 6; i++) d._dispatchInvoke({id: 'slow' + i, command: 'slow', params: {}});
   d._dispatchInvoke({id: 'x', command: 'fast', params: {}});
-  await wait(20);
+  await waitFor(() => sent.some(([id]) => id === 'x'), 'the busy refusal for x');
   assert.deepEqual(sent.find(([id]) => id === 'x'), ['x', 'busy']);
-  release(); await wait(50);
+  release();
+  await waitFor(() => sent.filter(([id]) => id.startsWith('slow')).length === 6, 'the six slow invokes to finish and free their slots');
   d._dispatchInvoke({id: 'x', command: 'fast', params: {}});
-  await wait(50);
+  await waitFor(() => sent.filter(([id]) => id === 'x').length > 1, 'the re-sent x to be answered');
   assert.deepEqual(sent.filter(([id]) => id === 'x').pop(), ['x', 'ok'], 'ran this time');
   assert.equal(runs, 7);
 });

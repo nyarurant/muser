@@ -14,33 +14,71 @@ function key(cwd) { return path.resolve(cwd || '.').replace(/[\\/]+$/, '').toLow
 
 // {bad: true} when the file is there but is not a permissions file (a hand edit with a stray comma):
 // the next change wrote back only its own folder and erased every other folder's mode and keys.
+// Only a missing file is "nothing remembered yet": any other read error left an empty set that the
+// next change wrote back, erasing every other folder. It now reads as {unreadable}, never written.
 function readAll() {
-  let raw; try { raw = fs.readFileSync(file(), 'utf8'); } catch { return {version: 1, folders: {}}; }
-  try { const j = require('./config').parseJson(raw); if (j && j.folders && typeof j.folders === 'object' && !Array.isArray(j.folders)) return j; } catch {}
+  let raw;
+  try { raw = fs.readFileSync(file(), 'utf8'); }
+  catch (e) { return {version: 1, folders: {}, ...(e?.code === 'ENOENT' ? {} : {unreadable: true})}; }
+  try {
+    const j = require('./config').parseJson(raw);
+    if (j && j.folders && typeof j.folders === 'object' && !Array.isArray(j.folders)) {
+      // Nested entries are validated too (audit #219): one folder's entry written as a
+      // string, a number, or {allow: "edit"} by a hand edit used to survive parsing, and
+      // update() then threw setting properties on it — a throw its catch-all swallowed,
+      // so saveMode/addAllow reported success and nothing was ever persisted. A malformed
+      // entry is replaced by an empty one; a malformed allow list keeps only its strings.
+      const folders = {};
+      for (const [k, v] of Object.entries(j.folders)) {
+        folders[k] = v && typeof v === 'object' && !Array.isArray(v)
+          ? {...v, mode: typeof v.mode === 'string' ? v.mode : null, allow: Array.isArray(v.allow) ? v.allow.filter(x => typeof x === 'string') : []}
+          : {mode: null, allow: []};
+      }
+      return {...j, folders};
+    }
+  } catch {}
   return {version: 1, folders: {}, bad: !!raw.trim()};
 }
 function writeAll(data) {
   const f = file(), temp = f + '.tmp-' + crypto.randomBytes(6).toString('hex');
   fs.mkdirSync(path.dirname(f), {recursive: true});
-  try { fs.writeFileSync(temp, JSON.stringify(data, null, 1)); fs.renameSync(temp, f); }
+  // Retried: a rename over a file another window is reading fails with EPERM on Windows, and
+  // update() keeps quiet about failures, so /mode said "remembered" and nothing was saved.
+  try { fs.writeFileSync(temp, JSON.stringify(data, null, 1)); require('./config').renameRetry(temp, f); }
   catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
 }
+// permissions.json is read, changed and written by every muser window; two
+// windows doing it at the same moment dropped one's update (one folder's mode
+// and "don't ask again" keys erased the other's). A lock file serializes the
+// change — config.withLock's: an ownership token (this lock removed whatever lock
+// file was there at the end, another window's too after a timed-out wait), and
+// EPERM on a lock being deleted counts as taken, not as "no locking here".
+function locked(fn) { return require('./config').withLock(file(), fn); }
+// Returns whether the change was actually written. The catch-all stays (remembering is
+// a convenience and must never break a session), but it no longer reports success for a
+// save that never landed (audit #219): callers can see false for an unreadable file, a
+// failed write, or an entry fn() rejected.
 function update(cwd, fn) {
-  try {
-    const data = readAll(), k = key(cwd);
-    if (data.bad) { try { fs.renameSync(file(), file() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} delete data.bad; }
-    const entry = data.folders[k] || {mode: null, allow: []};
-    fn(entry); entry.updatedAt = new Date().toISOString();
-    data.folders[k] = entry; writeAll(data);
-  } catch {} // remembering is a convenience; it never breaks a session
+  return locked(() => {
+    try {
+      const data = readAll(), k = key(cwd);
+      if (data.unreadable) return false; // never write over a file that could not be read
+      if (data.bad) { try { fs.renameSync(file(), file() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} delete data.bad; }
+      const entry = data.folders[k] || {mode: null, allow: []};
+      fn(entry); entry.updatedAt = new Date().toISOString();
+      data.folders[k] = entry; writeAll(data);
+      return true;
+    } catch { return false; } // remembering is a convenience; it never breaks a session
+  });
 }
 
 function load(cwd) {
-  const e = readAll().folders[key(cwd)] || {};
+  const raw = readAll().folders[key(cwd)];
+  const e = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   return {mode: typeof e.mode === 'string' && MODES.includes(e.mode) ? e.mode : null, allow: Array.isArray(e.allow) ? e.allow.filter(x => typeof x === 'string') : []};
 }
-function saveMode(cwd, mode) { if (MODES.includes(mode)) update(cwd, e => { e.mode = mode; }); }
-function addAllow(cwd, k) { if (k) update(cwd, e => { if (!e.allow.includes(k)) e.allow.push(k); }); }
-function clearAllow(cwd) { update(cwd, e => { e.allow = []; }); }
+function saveMode(cwd, mode) { return MODES.includes(mode) ? update(cwd, e => { e.mode = mode; }) : false; }
+function addAllow(cwd, k) { return k ? update(cwd, e => { if (!e.allow.includes(k)) e.allow.push(k); }) : false; }
+function clearAllow(cwd) { return update(cwd, e => { e.allow = []; }); }
 
 module.exports = {load, saveMode, addAllow, clearAllow, file, key};

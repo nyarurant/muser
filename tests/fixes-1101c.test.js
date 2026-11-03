@@ -49,7 +49,7 @@ test('@ in backticks or code blocks is not a file mention', () => {
 
 test('an unknown short option before the prompt is an error; -v is the version; inside a prompt it is a word', () => {
   const bin = path.join(__dirname, '..', 'bin', 'muser.js');
-  const run = (...args) => { try { return execFileSync(process.execPath, [bin, ...args], {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: {...process.env, MUSER_LANG: 'en'}}); } catch (e) { return String(e.stdout) + String(e.stderr); } };
+  const run = (...args) => { try { return execFileSync(process.execPath, [bin, ...args], {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, env: {...process.env, MUSER_LANG: 'en', MUSER_CLIENT: ''}}); } catch (e) { return String(e.stdout) + String(e.stderr); } };
   assert.match(run('-v'), /^\d+\.\d+\.\d+/);
   assert.match(run('-x'), /Unknown option: -x/);
   assert.doesNotMatch(run('fix', 'the', '-x', 'flag'), /Unknown option/);
@@ -256,7 +256,7 @@ test('--mode takes --mode=value and the same spellings as /mode', () => {
   const {modeFrom} = require('../src/policy');
   assert.deepEqual(['Bypass', 'auto', 'read-only', 'ask', 'plan', 'nope'].map(modeFrom), ['bypass', 'auto-edit', 'plan', 'default', 'plan', null]);
   const {spawnSync} = require('node:child_process');
-  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'muser.js'), '--mode=nope', 'hi'], {encoding: 'utf8', env: {...process.env, MUSER_LANG: 'en'}});
+  const r = spawnSync(process.execPath, [path.join(__dirname, '..', 'bin', 'muser.js'), '--mode=nope', 'hi'], {encoding: 'utf8', timeout: 30000, env: {...process.env, MUSER_LANG: 'en', MUSER_CLIENT: ''}});
   assert.match(r.stderr + r.stdout, /--mode must be one of/, 'read as --mode nope, not as an unknown option');
 });
 
@@ -275,6 +275,7 @@ test('a broken permissions.json is moved aside, not overwritten with one folder'
 
 test('a long !command output reaches Muse with its end and stderr, and says where it was cut', async t => {
   const {ctrl} = await controller(t);
+  const settings = require('../src/settings'); settings.setSwitch('bangAutoSend', false, {save: false}); t.after(() => settings.reloadSwitches());
   // 30,000 lines of stdout, then an error on stderr.
   await ctrl.bang('1..3000 | % { "line $_ of the build output" }; [Console]::Error.WriteLine("ERROR at the end")');
   const note = ctrl.bangNotes.at(-1);
@@ -286,6 +287,7 @@ test('a long !command output reaches Muse with its end and stderr, and says wher
 
 test('a !command\'s whole output can be read with /output', async t => {
   const {ctrl} = await controller(t);
+  const settings = require('../src/settings'); settings.setSwitch('bangAutoSend', false, {save: false}); t.after(() => settings.reloadSwitches());
   await ctrl.bang('1..40 | % { "row $_" }');
   const kept = ctrl.outputs.at(-1);
   assert.equal(kept.text.split('\n').length, 40);
@@ -311,4 +313,60 @@ test('esc stops a running !command', async t => {
   await done;
   assert.ok(Date.now() - t0 < 10000, 'stopped, not waited out: ' + (Date.now() - t0) + ' ms');
   assert.equal(ctrl.s.bangRunning, null);
+});
+
+test('a "! command" pasted with the indent it had on screen still runs in the shell', async t => {
+  const {ctrl} = await controller(t);
+  const ran = []; ctrl.bang = async cmd => { ran.push(cmd); };
+  await ctrl.submit('    ! git status');
+  assert.deepEqual(ran, ['git status']);
+  const {preamble} = require('../src/agent');
+  assert.match(preamble(tmp(t), []), /prefixed with "!"/, 'Muse is told to hand such commands over as "! …"');
+});
+
+test('a finished !command goes to Muse on its own, as in Claude Code; during a turn, when the turn ends', async t => {
+  const {ctrl, a} = await controller(t);
+  const settings = require('../src/settings'); settings.reloadSwitches(); t.after(() => settings.reloadSwitches());
+  const sent = []; a.send = async (body, opts) => { sent.push({body, display: opts.display}); };
+  await ctrl.bang('"hello from the shell"');
+  assert.equal(sent.length, 1, 'sent without the user typing anything');
+  assert.match(sent[0].body, /The user ran this in the terminal: "hello from the shell"/);
+  assert.match(sent[0].body, /hello from the shell/);
+  assert.equal(sent[0].display, '! "hello from the shell"');
+  assert.equal(ctrl.s.entries.filter(e => e.type === 'user').length, 0, 'no extra message bubble');
+  assert.equal(ctrl.s.busy, true, 'Muse is answering');
+
+  // During a turn: held until the turn ends, then sent.
+  await ctrl.bang('"second"');
+  assert.equal(sent.length, 1);
+  a.emit('turn-end', {ok: true, text: 'ok'});
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].body, /second/);
+
+  // A turn stopped with esc: the output waits for the next message instead.
+  await ctrl.bang('"third"');
+  a.emit('turn-end', {ok: false, aborted: true});
+  assert.equal(sent.length, 2);
+  assert.equal(ctrl.bangNotes.length, 1);
+
+  // Off in /settings: kept for the next message, as before.
+  settings.setSwitch('bangAutoSend', false, {save: false});
+  ctrl.bangNotes = [];
+  await ctrl.bang('"fourth"');
+  assert.equal(sent.length, 2);
+  assert.equal(ctrl.bangNotes.length, 1);
+});
+
+test('the spinner word comes from muser\'s own list, changes between turns and holds within one', async () => {
+  const {THINKING_WORDS, WRITING_WORDS, spinnerWord} = await import('../src/ui/view.mjs');
+  const seen = new Set();
+  for (let start = 1730000000000; start < 1730000000000 + 50; start++) {
+    const w = spinnerWord(THINKING_WORDS, start);
+    assert.ok(THINKING_WORDS.includes(w.slice(0, -1)), w);
+    assert.equal(spinnerWord(THINKING_WORDS, start), w, 'the same turn keeps its word');
+    seen.add(w);
+  }
+  assert.equal(seen.size, THINKING_WORDS.length, 'every word turns up over consecutive turns');
+  assert.ok(WRITING_WORDS.includes(spinnerWord(WRITING_WORDS, 7).slice(0, -1)));
+  assert.equal(spinnerWord(THINKING_WORDS, undefined), THINKING_WORDS[0] + '…', 'no start time: still a word');
 });

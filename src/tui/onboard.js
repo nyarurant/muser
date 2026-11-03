@@ -35,11 +35,15 @@ function clackUi() {
 }
 
 // Returns once web login and device registration are both in place.
+// needDevice may be a function: it is asked again AFTER the login step, because
+// the login can change whose device registration is in place (recovery scan).
 async function onboard({needLogin, needDevice, login, register}) {
-  if (!needLogin && !needDevice) return;
+  const deviceWanted = () => typeof needDevice === 'function' ? !!needDevice() : !!needDevice;
+  let deviceNow = deviceWanted();
+  if (!needLogin && !deviceNow) return;
   const steps = [
     {key: 'login', label: 'muse.ai にログイン', state: needLogin ? 'now' : 'done'},
-    {key: 'device', label: 'この PC を登録', state: needLogin ? 'later' : needDevice ? 'now' : 'done'},
+    {key: 'device', label: 'この PC を登録', state: needLogin ? 'later' : deviceNow ? 'now' : 'done'},
     {key: 'go', label: 'はじめる', state: 'later'},
   ];
   header(steps);
@@ -50,8 +54,9 @@ async function onboard({needLogin, needDevice, login, register}) {
     const s = p.spinner(); s.start(t('ログインを待っています'));
     try { await login(msg => s.message(msg)); s.stop(t('ログインしました')); }
     catch (e) { s.stop(c.red(e.message), 2); throw e; }
+    deviceNow = deviceWanted(); // re-ask under the login that just landed
   }
-  if (needDevice) {
+  if (deviceNow) {
     p.log.step(c.bold(t('この PC を Muse の端末として登録')));
     p.log.message(t('Muse がこの PC でファイルを読んだりコマンドを動かしたりするための登録です。') + '\n' + c.faint(t('Muse の 設定 › デバイス に「{host} CLI (muser)」として出ます。', {host: require('node:os').hostname()})));
     await register(clackUi());

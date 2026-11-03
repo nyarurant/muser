@@ -17,8 +17,8 @@ const EDGE = [
 const PROFILE = path.join(store.DIR, 'browser');
 const HOSTS = ['https://muse.ai/', 'https://gadgets.muse.ai/'];
 
-async function waitForPort(timeoutMs = 20000) {
-  const portFile = path.join(PROFILE, 'DevToolsActivePort'), until = Date.now() + timeoutMs;
+async function waitForPort(timeoutMs = 20000, profile = PROFILE) {
+  const portFile = path.join(profile, 'DevToolsActivePort'), until = Date.now() + timeoutMs;
   while (Date.now() < until) {
     try { const port = Number(fs.readFileSync(portFile, 'utf8').split('\n')[0]); if (port) return port; } catch {}
     await new Promise(r => setTimeout(r, 250));
@@ -26,18 +26,20 @@ async function waitForPort(timeoutMs = 20000) {
   throw new Error(t('Edge のログイン窓を開けませんでした。'));
 }
 
-async function login({log = console.log, timeoutMs = 5 * 60 * 1000} = {}) {
+// profile / jarFile: one Edge profile and one saved jar per Muse account (src/accounts.js);
+// the defaults are the first account's historic single profile and jar.
+async function login({log = console.log, timeoutMs = 5 * 60 * 1000, profile = PROFILE, jarFile} = {}) {
   const edge = EDGE.find(p => fs.existsSync(p));
   if (!edge) throw new Error(t('Microsoft Edge が見つかりません。'));
-  fs.mkdirSync(PROFILE, {recursive: true});
-  try { fs.unlinkSync(path.join(PROFILE, 'DevToolsActivePort')); } catch {}
-  const proc = spawn(edge, ['--user-data-dir=' + PROFILE, '--remote-debugging-port=0', '--no-first-run',
+  fs.mkdirSync(profile, {recursive: true});
+  try { fs.unlinkSync(path.join(profile, 'DevToolsActivePort')); } catch {}
+  const proc = spawn(edge, ['--user-data-dir=' + profile, '--remote-debugging-port=0', '--no-first-run',
     '--no-default-browser-check', '--app=https://muse.ai/', '--window-size=520,760'], {detached: true, stdio: 'ignore'});
   proc.unref();
   const {chromium} = require('playwright-core');
   let browser;
   try {
-    browser = await chromium.connectOverCDP('http://127.0.0.1:' + await waitForPort());
+    browser = await chromium.connectOverCDP('http://127.0.0.1:' + await waitForPort(20000, profile));
   } catch (e) {
     // No CDP handle exists to close Edge with, so kill the detached process tree instead.
     try { spawnSync('taskkill', ['/pid', String(proc.pid), '/t', '/f'], {windowsHide: true}); } catch {}
@@ -45,28 +47,8 @@ async function login({log = console.log, timeoutMs = 5 * 60 * 1000} = {}) {
     throw e;
   }
   log(t('Edge の窓でログインを待っています'));
-  const until = Date.now() + timeoutMs;
-  let last = '';
   try {
-    while (Date.now() < until) {
-      const context = browser.contexts()[0];
-      const cookies = context ? await context.cookies(HOSTS) : [];
-      if (cookies.some(c => c.domain.endsWith('muse.ai'))) {
-        const jar = web.jarFromCookies(cookies);
-        // Poll the session only: probe() also fetches the hatch token with force_refresh,
-        // which is wasteful (and mints a token) on every 2s tick while the user signs in.
-        // Run the full probe once the session looks usable (same checks as probe()).
-        let stage;
-        try {
-          const session = await web.createWeb(jar).fetchJson('/api/session?vm_state=true');
-          stage = session?.endpoint_url && session?.vm_id ? await web.probe(jar).catch(() => 'error') : 'session';
-        } catch (e) { stage = e.network ? 'error' : 'waiting'; }
-        if (stage !== last) { last = stage; if (stage !== 'waiting') log('  … ' + ({session: t('ログインを確認、VM 情報を取得中'), token: t('接続用トークンを取得中'), ready: t('完了'), error: t('確認中')})[stage]); }
-        if (stage === 'ready') { web.saveJar(jar); return true; }
-      }
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    throw new Error(t('ログインが完了する前に時間切れになりました。'));
+    return await pollLogin(browser, {log, timeoutMs, jarFile});
   } finally {
     // Closing over CDP really quits this Edge profile (killing the launcher pid does not).
     await browser.newBrowserCDPSession().then(s => s.send('Browser.close')).catch(() => {});
@@ -74,6 +56,44 @@ async function login({log = console.log, timeoutMs = 5 * 60 * 1000} = {}) {
   }
 }
 
-function logout() { store.remove('web.enc'); store.remove('session.enc'); }
+// Poll the Edge window until the login is usable. If the user closes the window (or Edge
+// otherwise disconnects) the poll used to keep waiting on an empty context list until the
+// 5-minute timeout; it now aborts at once with a clear message.
+async function pollLogin(browser, {log = () => {}, timeoutMs = 5 * 60 * 1000, intervalMs = 2000, jarFile} = {}) {
+  const until = Date.now() + timeoutMs;
+  let last = '';
+  let disconnected = false;
+  try { browser.on?.('disconnected', () => { disconnected = true; }); } catch {}
+  const gone = () => disconnected || (typeof browser.isConnected === 'function' && !browser.isConnected());
+  const goneError = () => new Error(t('Edge のログイン窓を開けませんでした。'));
+  while (Date.now() < until) {
+    if (gone()) throw goneError();
+    let cookies = [];
+    try {
+      const context = browser.contexts()[0];
+      cookies = context ? await context.cookies(HOSTS) : [];
+    } catch (e) { if (gone()) throw goneError(); throw e; }
+    if (cookies.some(c => c.domain.endsWith('muse.ai'))) {
+      const jar = web.jarFromCookies(cookies);
+      // Poll the session only: probe() also fetches the hatch token with force_refresh,
+      // which is wasteful (and mints a token) on every 2s tick while the user signs in.
+      // Run the full probe once the session looks usable (same checks as probe()).
+      let stage;
+      try {
+        const session = await web.createWeb(jar, {file: jarFile}).fetchJson('/api/session?vm_state=true');
+        stage = session?.endpoint_url && session?.vm_id ? await web.probe(jar, jarFile).catch(() => 'error') : 'session';
+      } catch (e) { stage = e.network ? 'error' : 'waiting'; }
+      if (stage !== last) { last = stage; if (stage !== 'waiting') log('  … ' + ({session: t('ログインを確認、VM 情報を取得中'), token: t('接続用トークンを取得中'), ready: t('完了'), error: t('確認中')})[stage]); }
+      if (stage === 'ready') { web.saveJar(jar, jarFile); return true; }
+    }
+    // Sleep in short slices so a disconnect during the wait is still prompt.
+    const sleepUntil = Date.now() + intervalMs;
+    while (Date.now() < sleepUntil && Date.now() < until) { if (gone()) throw goneError(); await new Promise(r => setTimeout(r, Math.min(100, intervalMs))); }
+  }
+  if (gone()) throw goneError();
+  throw new Error(t('ログインが完了する前に時間切れになりました。'));
+}
 
-module.exports = {login, logout, PROFILE};
+function logout(files) { store.remove(files?.web || 'web.enc'); store.remove(files?.session || 'session.enc'); }
+
+module.exports = {login, logout, PROFILE, pollLogin};

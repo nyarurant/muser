@@ -21,12 +21,28 @@ const FILE = path.join(DIR, 'mcp.json');
 const SECRETS_FILE = 'mcp-secrets.enc';
 const CONNECT_TIMEOUT = 15000, CALL_TIMEOUT = 120000, MAX_RESULT = 60000, MAX_LIST_PAGES = 20;
 
-// Values that must never appear verbatim in an error message or a log line.
+// Values that must never appear verbatim in an error message or a log line. Only values
+// under a secret-looking KEY are noted (audit #234): noting every env value also redacted
+// plain configuration — NODE_ENV=production, a port, a URL — from every error message.
+// Secrets shorter than 4 characters ARE noted: they used to leak verbatim.
 const knownSecrets = new Set();
-function noteSecret(v) { if (typeof v === 'string' && v.length >= 4) knownSecrets.add(v); }
+const SECRET_KEY = /key|token|secret|passw|auth|cred|private|session|cookie/i;
+function noteSecret(v, key) {
+  if (typeof v !== 'string' || !v) return;
+  if (key !== undefined && !SECRET_KEY.test(String(key))) return;
+  knownSecrets.add(v);
+}
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 function redact(text) {
   let out = String(text ?? '');
-  for (const v of knownSecrets) out = out.split(v).join('***');
+  // Longest first: replacing a short secret that prefixes a longer one ('abcd' before
+  // 'abcdefgh') left the longer one's tail in the clear (audit #234).
+  for (const v of [...knownSecrets].sort((a, b) => b.length - a.length)) {
+    if (v.length >= 4) out = out.split(v).join('***');
+    // A short secret is replaced only as a whole token, so a 2-3 character value does
+    // not garble every word that happens to contain it.
+    else out = out.replace(new RegExp('(^|[^A-Za-z0-9])' + escapeRe(v) + '(?![A-Za-z0-9])', 'g'), '$1***');
+  }
   return out;
 }
 function isSecretRef(v) { return !!v && typeof v === 'object' && typeof v.$secret === 'string'; }
@@ -44,24 +60,36 @@ function load() {
   }
   return resolveSecrets(cfg);
 }
+// $secret references the vault did not have, per server, from the latest resolveSecrets().
+// A missing entry used to become an empty string, so the server started with API_KEY=""
+// and failed upstream with an opaque auth error (audit #233); connect() refuses with a
+// clear message instead, using this record.
+let missingByServer = new Map();
+function missingSecrets(name) { return missingByServer.get(name) || []; }
+
 // Replace {"$secret": key} references in env/headers with values from the secure-store.
 // Plaintext values pass through untouched (backward compat) and are noted for redaction.
 function resolveSecrets(cfg) {
+  missingByServer = new Map();
   let hasRefs = false;
   for (const s of Object.values(cfg.mcpServers || {})) {
     for (const kind of ['env', 'headers']) {
-      for (const v of Object.values(s?.[kind] || {})) {
-        if (isSecretRef(v)) hasRefs = true; else noteSecret(v);
+      for (const [k, v] of Object.entries(s?.[kind] || {})) {
+        if (isSecretRef(v)) hasRefs = true; else noteSecret(v, k);
       }
     }
   }
   if (!hasRefs) return cfg;
   const vault = store.load(SECRETS_FILE) || {};
-  for (const s of Object.values(cfg.mcpServers || {})) {
+  for (const [name, s] of Object.entries(cfg.mcpServers || {})) {
     for (const kind of ['env', 'headers']) {
       if (!s?.[kind]) continue;
       for (const [k, v] of Object.entries(s[kind])) {
-        if (isSecretRef(v)) { const val = vault[v.$secret]; s[kind][k] = typeof val === 'string' ? val : ''; noteSecret(val); }
+        if (isSecretRef(v)) {
+          const val = vault[v.$secret];
+          if (typeof val === 'string') { s[kind][k] = val; noteSecret(val, k); }
+          else { s[kind][k] = ''; if (!missingByServer.has(name)) missingByServer.set(name, []); missingByServer.get(name).push(v.$secret); }
+        }
       }
     }
   }
@@ -72,26 +100,38 @@ function save(cfg) {
   const out = JSON.parse(JSON.stringify(cfg ?? {mcpServers: {}}));
   const vault = {};
   let vaultLoaded = false, dirty = false;
+  const loadVault = () => { if (!vaultLoaded) { Object.assign(vault, store.load(SECRETS_FILE) || {}); vaultLoaded = true; } };
   for (const [name, s] of Object.entries(out.mcpServers || {})) {
     for (const kind of ['env', 'headers']) {
       if (!s?.[kind]) continue;
       for (const [k, v] of Object.entries(s[kind])) {
         if (isSecretRef(v) || typeof v !== 'string' || !v) continue;
-        if (!vaultLoaded) { Object.assign(vault, store.load(SECRETS_FILE) || {}); vaultLoaded = true; }
+        loadVault();
         const key = name + ':' + kind + ':' + k;
-        vault[key] = v; noteSecret(v); s[kind][k] = {$secret: key}; dirty = true;
+        vault[key] = v; noteSecret(v, k); s[kind][k] = {$secret: key}; dirty = true;
       }
     }
   }
+  // Prune the vault to the references this config actually keeps (audit #232): deleting a
+  // server or clearing a key used to leave the old secret in mcp-secrets.enc for ever.
+  // If the vault cannot be read, skip pruning rather than fail the config save.
+  let pruned = false;
+  try {
+    loadVault();
+    const live = new Set();
+    for (const s of Object.values(out.mcpServers || {})) for (const kind of ['env', 'headers']) for (const v of Object.values(s?.[kind] || {})) if (isSecretRef(v)) live.add(v.$secret);
+    for (const key of Object.keys(vault)) if (!live.has(key)) { delete vault[key]; pruned = true; }
+  } catch { pruned = false; }
   // Secrets first: if the vault write fails, mcp.json is left untouched rather than
   // pointing at references that would resolve to nothing.
-  if (dirty) store.save(SECRETS_FILE, vault);
+  if (dirty || pruned) store.save(SECRETS_FILE, vault);
   fs.mkdirSync(DIR, {recursive: true});
   const temp = FILE + '.tmp-' + crypto.randomBytes(6).toString('hex');
   try {
     fs.writeFileSync(temp, JSON.stringify(out, null, 2));
     try { fs.chmodSync(temp, 0o600); } catch {}
-    fs.renameSync(temp, FILE);
+    // Retried: EPERM while another window has mcp.json open for reading (src/config.js).
+    require('./config').renameRetry(temp, FILE);
   } catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
 }
 
@@ -101,7 +141,12 @@ function discover() {
   const found = [];
   try {
     const j = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude.json'), 'utf8'));
-    for (const [name, s] of Object.entries(j.mcpServers || {})) found.push({name, from: 'Claude Code', server: s});
+    for (const [name, s] of Object.entries(j.mcpServers || {})) {
+      // A server the user disabled in Claude Code stays disabled here: the Codex branch
+      // below already honours enabled:false, the Claude branch imported them anyway (#236).
+      if (s?.disabled === true || s?.enabled === false) continue;
+      found.push({name, from: 'Claude Code', server: s});
+    }
   } catch {}
   try {
     const toml = require('smol-toml').parse(fs.readFileSync(path.join(os.homedir(), '.codex', 'config.toml'), 'utf8'));
@@ -110,9 +155,12 @@ function discover() {
       found.push({name, from: 'Codex', server: {...(s.url ? {type: 'http', url: s.url, ...(s.http_headers ? {headers: s.http_headers} : {})} : {command: s.command, args: s.args || [], ...(s.env ? {env: s.env} : {}), ...(s.cwd ? {cwd: s.cwd} : {})})}});
     }
   } catch {}
-  // One entry per name; the same server is often in both.
-  const seen = new Set(Object.keys(load().mcpServers || {}));
-  return found.filter(f => !seen.has(f.name) && !seen.has(f.name.toLowerCase()) && (seen.add(f.name), true));
+  // One entry per name; the same server is often in both. Names compare case-insensitively
+  // (server names are matched loosely elsewhere too), so the seen set holds lowercase only:
+  // it used to hold raw names while the check looked up lowercase, so a case variant of an
+  // already-configured (or already-found) server slipped through as a duplicate.
+  const seen = new Set(Object.keys(load().mcpServers || {}).map(n => String(n).toLowerCase()));
+  return found.filter(f => { const key = String(f.name).toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
 }
 function importServers(list) {
   const cfg = load(); cfg.mcpServers = cfg.mcpServers || {};
@@ -185,10 +233,17 @@ class McpHub {
     if (this.servers.get(entry.name) !== entry || entry.status !== 'connected') return;
     entry.status = 'error';
     entry.error = redact(reason?.message || String(reason || 'connection closed'));
+    // Capture the handles before clearing them and close them best-effort: dropping the
+    // references alone leaked the transport (and, for stdio, the server process behind it).
+    const client = entry.client, transport = entry.transport;
     entry.client = undefined; entry.transport = undefined; entry.tools = [];
     this.index();
     this._log(entry.name + ': ' + entry.error);
     this._notify(entry.name);
+    for (const h of [client, transport]) {
+      if (!h || typeof h.close !== 'function') continue;
+      try { const r = h.close(); if (r && typeof r.catch === 'function') r.catch(() => {}); } catch {}
+    }
   }
   // Live counterpart of setEnabled() for an already-started hub: enabling connects the
   // server now, disabling disconnects it now. Fire-and-forget; outcomes surface on the
@@ -199,9 +254,20 @@ class McpHub {
     this._notify(name);
   }
   async connect(name, s) {
-    await this.disconnect(name);
+    // Reserve the generation synchronously, as the first statement: this used to await
+    // disconnect() before minting it, so a disable/close (or a newer connect) that landed
+    // during that await was overtaken by this connect when it resumed and minted a fresh
+    // generation afterwards. The previous entry is closed inline instead of via
+    // disconnect(), which would bump the generation again and invalidate this one.
     const gen = (this.gens.get(name) || 0) + 1;
     this.gens.set(name, gen);
+    const prev = this.servers.get(name);
+    if (prev) {
+      this.servers.delete(name);
+      this.index();
+      try { await prev.client?.close(); } catch {}
+      if (this.gens.get(name) !== gen) return; // overtaken while closing the old entry
+    }
     const entry = {name, status: 'connecting', tools: [], error: '', stderrTail: ''};
     this.servers.set(name, entry);
     // A connect/listTools that resolves after its timeout — or after a newer connect or
@@ -209,8 +275,12 @@ class McpHub {
     const stale = () => this.gens.get(name) !== gen || this.servers.get(name) !== entry;
     let client;
     try {
-      for (const v of Object.values(s.env || {})) noteSecret(v);
-      for (const v of Object.values(s.headers || {})) noteSecret(v);
+      // A $secret reference the vault no longer has must not reach the server as an
+      // empty string (audit #233): fail here, where the reason can be said plainly.
+      const missing = missingSecrets(name);
+      if (missing.length) throw new Error('Secret(s) not found in the secure store (' + SECRETS_FILE + '): ' + missing.join(', ') + '. The server was not started with an empty value; save its config again to store the secret.');
+      for (const [k, v] of Object.entries(s.env || {})) noteSecret(v, k);
+      for (const [k, v] of Object.entries(s.headers || {})) noteSecret(v, k);
       const {Client} = require('@modelcontextprotocol/sdk/client/index.js');
       let transport;
       if (s.url || s.type === 'http' || s.type === 'sse') {
@@ -242,7 +312,11 @@ class McpHub {
       // server is gone (crash, exit, dropped connection) — see _markDead. Intentional
       // disconnects bump the generation / replace the entry first, so stale() wins.
       client.onclose = () => { if (!stale()) this._markDead(entry, new Error('MCP server connection closed')); };
-      client.onerror = e => { if (!stale()) this._markDead(entry, e); };
+      // Only onclose counts as death: onerror also fires for non-fatal protocol/request
+      // errors on a connection that is still usable, and marking the server dead for each
+      // one dropped a working server (and its tools) until a manual reconnect. A fatal
+      // error is always followed by a close, which _markDead handles.
+      client.onerror = e => { if (!stale()) this._log(name + ': ' + redact(e?.message || String(e || 'error'))); };
     } catch (e) {
       const tail = entry.stderrTail ? entry.stderrTail.trim().slice(-500) : '';
       const msg = redact(e.message + (tail ? '\n[stderr] ' + tail : ''));
@@ -256,7 +330,14 @@ class McpHub {
   index() {
     this.commands.clear();
     const used = new Set();
-    for (const e of this.servers.values()) for (const t of e.tools || []) {
+    // Allocate command keys deterministically: iterating the servers Map in insertion
+    // order made slug-collision suffixes (-2, -3, ...) depend on connect order, so a
+    // reconnect (delete + set moves a server to the end) swapped which server owned the
+    // unsuffixed key. Sorting servers and tools by name (codepoint order, not locale)
+    // keeps the assignment stable across reconnects and restarts.
+    const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    const entries = [...this.servers.values()].sort((x, y) => byName(x.name, y.name));
+    for (const e of entries) for (const t of [...(e.tools || [])].sort((x, y) => byName(x.name, y.name))) {
       let key = 'mcp.' + slug(e.name) + '.' + slug(t.name);
       // Distinct servers/tools can slug to the same command name; suffix instead of overwriting.
       if (used.has(key)) { let n = 2; while (used.has(key + '-' + n)) n++; key = key + '-' + n; }
@@ -306,6 +387,10 @@ class McpHub {
       else if (t === 'boolean' && typeof v !== 'boolean') return bad();
       else if (t === 'array' && !Array.isArray(v)) return bad();
       else if (t === 'object' && (v === null || typeof v !== 'object' || Array.isArray(v))) return bad();
+      // A string parameter was the one type never checked: a value the gateway had
+      // already coerced to a number/boolean ("123" -> 123, "true" -> true) was forwarded
+      // with its type changed (audit #235).
+      else if (t === 'string' && typeof v !== 'string') return bad();
       args[k] = v;
     }
     const r = await e.client.callTool({name: c.tool, arguments: args}, undefined, {signal, timeout: CALL_TIMEOUT});
@@ -329,4 +414,4 @@ class McpHub {
 
 function withTimeout(p, ms, msg) { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })]).finally(() => clearTimeout(t)); }
 
-module.exports = {McpHub, load, save, discover, importServers, setEnabled, FILE, redact, params, checkRemoteUrl};
+module.exports = {McpHub, load, save, discover, importServers, setEnabled, FILE, redact, params, checkRemoteUrl, missingSecrets};

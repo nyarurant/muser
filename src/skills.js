@@ -58,13 +58,22 @@ function frontmatter(text) {
   return {meta, body: m[2]};
 }
 
+const SELF_SKILLS = new Set(['muser-exec']);
+
 function skillFile(dir) {
   try { const f = fs.readdirSync(dir).find(n => n.toLowerCase() === 'skill.md'); return f ? path.join(dir, f) : null; } catch { return null; }
 }
 
+// Skills load() skipped, and why: a name collision after normalisation, or a SKILL.md over
+// the size limit. Both used to vanish silently — the skill just looked absent (audit #229,
+// #230). Kept per load() like mentions' listDiag, so callers and tests can surface the reason.
+let lastDiag = [];
+function diagnostics() { return lastDiag; }
+
 // Every skill found, first source winning per name; enabled reflects the user's settings.
 function load(cwd) {
   const conf = settings(), seen = new Map();
+  lastDiag = [];
   for (const src of sources(cwd)) {
     let dirs = [];
     try { dirs = fs.readdirSync(src.dir, {withFileTypes: true}).filter(e => e.isDirectory() || e.isSymbolicLink()); } catch { continue; }
@@ -72,9 +81,19 @@ function load(cwd) {
       const dir = path.join(src.dir, e.name), file = skillFile(dir);
       if (!file) continue;
       let meta = {};
-      try { ({meta} = frontmatter(fs.readFileSync(file, 'utf8'))); } catch { continue; }
+      try {
+        const size = fs.statSync(file).size;
+        if (size > MAX_FILE) { lastDiag.push({name: String(e.name).trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '-'), dir, file, source: src.id, reason: 'too-large', size}); continue; }
+        ({meta} = frontmatter(fs.readFileSync(file, 'utf8')));
+      } catch { continue; }
       const name = String(meta.name || e.name).trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '-');
-      if (!name || seen.has(name)) continue;
+      if (!name) continue;
+      // Name normalisation can merge two different skills ('Foo Bar' and 'foo-bar'): the
+      // first still wins, but the dropped one is recorded instead of disappearing quietly.
+      if (seen.has(name)) { lastDiag.push({name, dir, file, source: src.id, reason: 'name-collision', keptDir: seen.get(name).dir}); continue; }
+      // muser's own skill for OTHER agents (skills/muser-exec: Claude Code / Codex hand work to Muse
+      // through `muser exec`). Offered to Muse it would only send Muse's work back to Muse.
+      if (SELF_SKILLS.has(name)) continue;
       const sourceOn = conf.sources[src.id] !== false;
       seen.set(name, {name, description: String(meta.description || '').replace(/\s+/g, ' ').trim(), dir, file, source: src.id, enabled: sourceOn && !conf.disabled.has(name)});
     }
@@ -91,26 +110,44 @@ function preambleLines(cwd) {
     ...(on.length > shown.length ? ['- … and ' + (on.length - shown.length) + ' more (skill.read with a name still works)'] : [])];
 }
 
+// The guards every skill.read target passes, SKILL.md itself included: the real
+// path stays inside the skill's real folder, the file is not a secret, and it
+// is at most MAX_FILE. SKILL.md used to skip all of this — it was read raw, so
+// a SKILL.md that was a link out of the folder (or into ~/.ssh), or simply a
+// huge file, went straight to Muse.
+function guardSkillFile(skill, target) {
+  const {realOf, isSensitivePath} = require('./tools');
+  const real = realOf(target), realDir = realOf(skill.dir), realRel = path.relative(realDir, real);
+  // Only a '..' SEGMENT escapes: a name that merely starts with the characters '..'
+  // (a '..foo' folder inside the skill) is a legitimate inside path (audit #231).
+  if (!realRel || realRel === '..' || realRel.startsWith('..' + path.sep) || path.isAbsolute(realRel)) throw new Error('path must be a file inside the skill folder');
+  if (isSensitivePath(target) || isSensitivePath(real)) throw new Error('Refused to read a sensitive file: ' + path.relative(skill.dir, target));
+  const st = fs.statSync(target);
+  if (st.size > MAX_FILE) throw new Error('File too large to read here (' + st.size + ' bytes)');
+}
+
 // skill.read: the SKILL.md (with the list of files in the skill) or one file inside the skill.
 function read(cwd, {name, path: rel} = {}) {
   const want = String(name || '').trim().toLowerCase();
   const skill = load(cwd).find(s => s.name === want);
-  if (!skill) throw new Error('No skill named "' + name + '". Skills: ' + load(cwd).filter(s => s.enabled).map(s => s.name).join(', '));
+  if (!skill) {
+    // A SKILL.md over the size limit is skipped by load(): say so, instead of the
+    // misleading "no skill named" the user got for a skill that is right there (#230).
+    const big = lastDiag.find(d => d.reason === 'too-large' && d.name === want);
+    if (big) throw new Error('The skill "' + name + '" was skipped: its SKILL.md is ' + big.size + ' bytes, over the ' + MAX_FILE + '-byte limit.');
+    throw new Error('No skill named "' + name + '". Skills: ' + load(cwd).filter(s => s.enabled).map(s => s.name).join(', '));
+  }
   if (!skill.enabled) throw new Error('The skill "' + skill.name + '" is turned off by the user.');
   if (rel) {
     const target = path.resolve(skill.dir, String(rel));
     const inside = path.relative(skill.dir, target);
-    if (!inside || inside.startsWith('..') || path.isAbsolute(inside)) throw new Error('path must be a file inside the skill folder');
+    if (!inside || inside === '..' || inside.startsWith('..' + path.sep) || path.isAbsolute(inside)) throw new Error('path must be a file inside the skill folder');
     // skill.read runs unasked, and a project's .claude/skills comes with the repository: a link
     // inside a skill must not lead out of it, nor to a secret.
-    const {realOf, isSensitivePath} = require('./tools');
-    const real = realOf(target), realDir = realOf(skill.dir), realRel = path.relative(realDir, real);
-    if (realRel.startsWith('..') || path.isAbsolute(realRel)) throw new Error('path must be a file inside the skill folder');
-    if (isSensitivePath(target) || isSensitivePath(real)) throw new Error('Refused to read a sensitive file: ' + inside);
-    const st = fs.statSync(target);
-    if (st.size > MAX_FILE) throw new Error('File too large to read here (' + st.size + ' bytes)');
+    guardSkillFile(skill, target);
     return {name: skill.name, path: inside.replace(/\\/g, '/'), content: fs.readFileSync(target, 'utf8')};
   }
+  guardSkillFile(skill, skill.file);
   const files = [];
   (function walk(dir, depth) {
     if (depth > 3 || files.length > 200) return;
@@ -125,4 +162,4 @@ function read(cwd, {name, path: rel} = {}) {
 function setEnabled(name, on) { saveSettings(s => { if (on) s.disabled.delete(name); else s.disabled.add(name); }); }
 function setSourceEnabled(id, on) { saveSettings(s => { if (on) delete s.sources[id]; else s.sources[id] = false; }); }
 
-module.exports = {load, read, preambleLines, frontmatter, setEnabled, setSourceEnabled, sources};
+module.exports = {load, read, preambleLines, frontmatter, setEnabled, setSourceEnabled, sources, diagnostics};

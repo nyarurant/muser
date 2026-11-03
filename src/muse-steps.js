@@ -12,7 +12,9 @@ const TERMINAL = new Set(['SUCCESS', 'FAILED', 'ERROR', 'CANCELLED']);
 // web results for best Android devices"). Records this misses are still dropped by duringToolCall.
 const DEVICE = /\b(paired devices?|device commands?|devices? (?:link|tools?|calls?)|homelink-\w+|muser cli|tool namespace)\b|cli \(muser\)/i; // device names are "<hostname> CLI (muser)"
 
-const clean = s => String(s || '').replace(/[⁦-⁩]/g, '').replace(/\s+/g, ' ').trim();
+// Strip Unicode bidi isolate controls U+2066..U+2069 (written as escapes: the literal
+// characters are invisible in source and easy to corrupt in an editor).
+const clean = s => String(s || '').replace(/[\u2066-\u2069]/g, '').replace(/\s+/g, ' ').trim();
 
 class MuseSteps {
   constructor(client, onStep) {
@@ -63,8 +65,16 @@ class MuseSteps {
     // up, all at once, after the reply.
     try { feed = await this.client.request('GET', '/activity', {limit: 30, capabilities: CAPS}); } catch { return; }
     const items = (feed?.days || []).flatMap(d => d.activities || []);
+    // Group the feed by agent id once, instead of filtering the whole feed per turn.
+    const byAgent = new Map();
+    for (const x of items) {
+      const aid = x.details?.activity_thread_agent_id;
+      if (!aid) continue;
+      if (!byAgent.has(aid)) byAgent.set(aid, []);
+      byAgent.get(aid).push(x);
+    }
     for (const t of turns) {
-      const actions = items.filter(x => x.details?.activity_thread_agent_id === t.muse.agentId)
+      const actions = (byAgent.get(t.muse.agentId) || [])
         .flatMap(x => x.details.goal_actions || []).filter(a => String(a.id || '').includes(t.muse.messageId))
         .sort((a, b) => (a.action_index ?? 0) - (b.action_index ?? 0));
       t.muse.pending = actions.filter(a => !t.muse.shown.has(a.id));

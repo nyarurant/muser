@@ -5,9 +5,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const types = require('../src/agent-types');
+const {after} = require('node:test');
+
+const madeDirs = [];
+after(() => { for (const d of madeDirs) fs.rmSync(d, {recursive: true, force: true}); });
+const tmpDir = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-')); madeDirs.push(d); return d; };
 
 test('agent types: builtins, custom .md types, tool allowlist with mcp.* pattern', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  const dir = tmpDir();
   fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
   fs.writeFileSync(path.join(dir, '.muser', 'agents', 'docs.md'), '---\nname: docs\ndescription: Writes docs\ntools: code.read, code.edit\nreadonly: false\n---\nYou write documentation.\n');
   const t = types.load(dir);
@@ -27,7 +32,7 @@ function captureErrors(fn) {
 }
 
 test('agent types: unclosed frontmatter is reported, not loaded as a prompt', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  const dir = tmpDir();
   fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
   const bad = path.join(dir, '.muser', 'agents', 'broken.md');
   fs.writeFileSync(bad, '---\nname: broken\ndescription: No closing delimiter\nThis was meant to be the prompt.\n');
@@ -41,7 +46,7 @@ test('agent types: unclosed frontmatter is reported, not loaded as a prompt', ()
 });
 
 test('agent types: overriding a builtin name prints a shadow notice', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  const dir = tmpDir();
   fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
   const file = path.join(dir, '.muser', 'agents', 'general.md');
   fs.writeFileSync(file, '---\nname: general\ndescription: Custom general\n---\nCustom general prompt.\n');
@@ -53,7 +58,7 @@ test('agent types: overriding a builtin name prints a shadow notice', () => {
 
 // A repo's .muser/agents/review.md turned the read-only built-in reviewer into one that writes.
 test('a project type that replaces a read-only type stays read-only', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  const dir = tmpDir();
   fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
   fs.writeFileSync(path.join(dir, '.muser', 'agents', 'review.md'), '---\nname: review\nreadonly: false\ntools: code.read, code.write, system.run\n---\nReview and fix everything.\n');
   let t; captureErrors(() => { t = types.load(dir); });
@@ -63,7 +68,7 @@ test('a project type that replaces a read-only type stays read-only', () => {
 });
 
 test('a type file saved with a BOM keeps its frontmatter (readonly is not lost)', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  const dir = tmpDir();
   fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
   fs.writeFileSync(path.join(dir, '.muser', 'agents', 'auditor.md'), String.fromCharCode(0xfeff) + '---\nname: auditor\nreadonly: true\n---\nAudit only.\n');
   let t; captureErrors(() => { t = types.load(dir); });
@@ -72,7 +77,7 @@ test('a type file saved with a BOM keeps its frontmatter (readonly is not lost)'
 });
 
 test('the same agent-type notice is printed once, not on every load', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-types-'));
+  const dir = tmpDir();
   fs.mkdirSync(path.join(dir, '.muser', 'agents'), {recursive: true});
   fs.writeFileSync(path.join(dir, '.muser', 'agents', 'plan.md'), '---\nname: plan\n---\nMy plan.\n');
   const lines = captureErrors(() => { for (let i = 0; i < 5; i++) types.load(dir); });

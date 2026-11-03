@@ -47,10 +47,14 @@ function checkArgs(args, spec) {
       const eq = tok.indexOf('=');
       const name = (eq >= 0 ? tok.slice(2, eq) : tok.slice(2)).toLowerCase();
       if (valueLong.has(name)) {
-        // Consume a separate value when one is present. A few of these flags
-        // take an optional value (--porcelain, --dirty, --short), so running
-        // out of tokens here is not by itself a failure.
-        if (eq < 0 && i + 1 < args.length) i++;
+        // Consume a separate value only when it does not look like a flag.
+        // Several of these flags take an OPTIONAL value (--color, --porcelain,
+        // --dirty, --short), and git itself treats a following --flag as a new
+        // flag for those; swallowing it here hid it from validation, so
+        // `git grep --color --open-files-in-pager=…` passed as read-only while
+        // handing the output to a pager program. A value that starts with '-'
+        // must use the --name=value form, where it is checked as a value.
+        if (eq < 0 && i + 1 < args.length && !args[i + 1].startsWith('-')) i++;
         continue;
       }
       if (boolLong.has(name) && eq < 0) continue;
@@ -107,8 +111,10 @@ const GIT_SPECS = {
     positional: true, numericDash: true,
   },
   blame: {
+    // No --contents: it prints the named file's contents as the blamed text,
+    // which is an arbitrary-file read wearing a read-only subcommand (audit #211).
     boolLong: ['line-porcelain', 'porcelain', 'incremental', 'show-name', 'show-number', 'show-email', 'show-stats', 'root', 'reverse', 'first-parent'],
-    valueLong: ['date', 'contents', 'abbrev', 'ignore-rev', 'ignore-revs-file', 'color-lines', 'color-by-age'],
+    valueLong: ['date', 'abbrev', 'ignore-rev', 'ignore-revs-file', 'color-lines', 'color-by-age'],
     boolShort: ['p', 'l', 't', 's', 'n', 'e', 'w', 'f', 'b'],
     valueShort: ['L', 'S', 'C', 'M'],
     positional: true,
@@ -179,10 +185,17 @@ function gitReadOnly(tokens) {
   const sub = (tokens[i] || '').toLowerCase();
   const args = tokens.slice(i + 1);
   if (sub === 'remote') {
-    // Only listing remotes: bare, -v/--verbose, or `show` of one name.
+    // Only listing remotes: bare, -v/--verbose, or `show -n` of one name.
+    // Plain `show <name>` contacts the remote (ls-remote), which runs the
+    // repo config's core.sshCommand and credential helpers — code execution
+    // from repo config, like the helpers gitConfigRuns guards against — so
+    // only the -n form, which never contacts the remote, is read-only.
     if (args.length === 0) return true;
     if (args.length === 1 && (args[0] === '-v' || args[0] === '--verbose')) return true;
-    if (args[0] === 'show' && args.length <= 2 && !args.slice(1).some(a => a.startsWith('-'))) return true;
+    if (args[0] === 'show') {
+      const rest = args.slice(1);
+      return rest.includes('-n') && rest.filter(a => a !== '-n').length <= 1 && !rest.some(a => a.startsWith('-') && a !== '-n');
+    }
     return false;
   }
   const spec = GIT_SPECS[sub];
@@ -231,6 +244,11 @@ function readOnlyCommand(command) {
 const SHELL_SYNTAX = /[|;&<>`$(){}\r\n]/;
 // Programs that run whatever their arguments say; remembering one would remember everything.
 const RUNS_ANYTHING = new Set(['powershell', 'pwsh', 'cmd', 'bash', 'sh', 'wsl', 'iex', 'invoke-expression', 'start-process', 'saps', 'start', 'node', 'deno', 'bun', 'python', 'python3', 'py', 'ruby', 'perl', 'cscript', 'wscript', 'mshta', 'rundll32', 'regsvr32', 'npx', 'pnpx', 'bunx', 'call']);
+// Dispatcher verbs: the word after the program names only a family, and the NEXT
+// word is what actually runs (`npm run <script>`, `npm exec <pkg>`, `docker run
+// <image>`, `yarn dlx <pkg>`). An alwaysKey for one of these must name that third
+// word too, or remembering one script remembers them all (audit #210).
+const DISPATCH_VERBS = new Set(['run', 'exec', 'x', 'dlx']);
 
 // The "don't ask again" key, or null when this call must not be remembered.
 function alwaysKey(kind, params, command) {
@@ -246,7 +264,14 @@ function alwaysKey(kind, params, command) {
     // remembers `npm exec` / `git push`. With a flag or path in its place (`git -C x push`), the
     // subcommand cannot be told, and the call is not remembered at all.
     if (parts.length === 1) return 'exec:' + first;
-    return /^[a-z][a-z0-9_-]*$/i.test(parts[1]) ? `exec:${first} ${parts[1].toLowerCase()}` : null;
+    if (!/^[a-z][a-z0-9_-]*$/i.test(parts[1])) return null;
+    const second = parts[1].toLowerCase();
+    if (DISPATCH_VERBS.has(second)) {
+      const third = (parts[2] || '').toLowerCase();
+      if (!/^[a-z0-9][a-z0-9@:._/-]*$/.test(third)) return null;
+      return `exec:${first} ${second} ${third}`;
+    }
+    return `exec:${first} ${second}`;
   }
   return null;
 }
@@ -294,11 +319,40 @@ function readsSecrets(command, cwd) {
   if (head === 'rg' && tokens.some(t => RG_UNHIDE.test(t))) return true;
   if (head === 'git' && tokens.includes('--no-index')) return true;
   const {isSensitivePath, realOf} = require('./tools');
+  const path = require('node:path'), fs = require('node:fs'), root = path.resolve(cwd);
   return tokens.slice(1).some(t => {
     const v = t.replace(/^--?[\w-]+=/, '');
-    if (!/[\\/~.]|^[a-z]:/i.test(v) || /^-/.test(v)) return false;
-    const p = require('node:path').resolve(cwd, v.replace(/^~(?=[\\/]|$)/, require('node:os').homedir()));
-    return isSensitivePath(p) || isSensitivePath(realOf(p));
+    if (!v || /^-/.test(v)) return false;
+    // A git rev:path token (HEAD:.env, HEAD~2:src/.env) names a file inside a
+    // revision, not on disk: check the part after the ':' as the path it is,
+    // or `git show HEAD:.env` printed a secret while looking like a plain rev.
+    const candidates = [v];
+    if (head === 'git' && v.includes(':')) candidates.push(v.slice(v.indexOf(':') + 1));
+    // A glob pathspec (`*.env`, `**/*.key`) is expanded by git/rg, not by the
+    // lexical checks below: test the name the glob stands for as well (audit #209).
+    if (/[*?]/.test(v)) candidates.push(v.replace(/[*?]/g, ''));
+    return candidates.some(c => {
+      if (!c) return false;
+      // Bare names are checked too, by the path they resolve to from cwd:
+      // `rg -e . id_rsa` with the shell already inside the secret's folder
+      // named no separator and used to slip past (audit #209).
+      const p = path.resolve(root, c.replace(/^~(?=[\\/]|$)/, require('node:os').homedir()));
+      if (isSensitivePath(p) || isSensitivePath(realOf(p)) || isSensitivePath(c)) return true;
+      // A search ROOTED at a directory outside the working folder prints
+      // whatever sensitive-named files live inside it — credentials.json in
+      // ~/Documents is neither hidden nor git-ignored, so rg shows it. The
+      // contents cannot be vetted from the command, so it asks (audit #208).
+      // Roots at or under cwd are the workspace itself and stay trusted.
+      if (head === 'rg' || head === 'git') {
+        try {
+          if (fs.statSync(p).isDirectory()) {
+            const rel = path.relative(root, p);
+            if (rel.startsWith('..') || path.isAbsolute(rel)) return true;
+          }
+        } catch {}
+      }
+      return false;
+    });
   });
 }
 
@@ -309,6 +363,15 @@ function muserSettingsPath(file) {
   const roots = [path.join(os.homedir(), '.muser'), path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser')];
   const f = path.resolve(String(file || '')).toLowerCase();
   return roots.some(r => { const rel = path.relative(r.toLowerCase(), f); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); });
+}
+
+// Writes under .git/ change how every later git command behaves: .git/config
+// can name helper programs (see gitConfigRuns) and .git/hooks/ is code git
+// runs itself. Like muser's own settings, such a write always asks outside
+// bypass, even in auto-edit and even when edits were remembered.
+function gitInternalPath(file) {
+  const parts = String(file || '').replace(/\\/g, '/').split('/').map(s => s.toLowerCase());
+  return parts.includes('.git');
 }
 
 // gitConfig(command, cwd) -> the repo's config text (null when it cannot be read); injectable for tests.
@@ -326,7 +389,7 @@ function decide({mode, kind, command, params, outside, always = new Set(), cwd =
   }
   if (mode === 'plan') return ro ? 'allow' : 'deny';
   if (ro) return 'allow';
-  if (kind === 'edit' && (outside || targets.some(muserSettingsPath))) return 'ask';
+  if (kind === 'edit' && (outside || targets.some(t => muserSettingsPath(t) || gitInternalPath(t)))) return 'ask';
   // Remembered for this folder, so only here: "npm test" allowed in one project ran another's
   // test script unasked when Muse set cwd to that project.
   const key = alwaysKey(kind, params), rel = require('node:path').relative(root, cwd);
@@ -336,4 +399,4 @@ function decide({mode, kind, command, params, outside, always = new Set(), cwd =
   return 'ask';
 }
 
-module.exports = {MODES, modeFrom, LABELS, decide, alwaysKey, readOnlyCommand, gitConfigRuns, muserSettingsPath};
+module.exports = {MODES, modeFrom, LABELS, decide, alwaysKey, readOnlyCommand, gitConfigRuns, muserSettingsPath, gitInternalPath};

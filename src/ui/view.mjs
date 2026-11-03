@@ -10,29 +10,51 @@ import {Controller, COMMANDS} from './controller.mjs';
 import {createMd} from './md.mjs';
 import {sanitizeEmbeds} from './sanitize.mjs';
 const require = createRequire(import.meta.url);
-const {c, width, truncate, pad} = require('../tui/term.js');
+const {c, width, truncate, pad, wrap: wrapText} = require('../tui/term.js');
 const {logo} = require('../tui/logo.js');
 const {LABELS} = require('../policy.js');
-const {fragmentAt: mentionAt, complete: mentionComplete, listDiag: mentionDiag, loading: mentionLoading} = require('../mentions.js');
+const {fragmentAt: mentionAt, complete: mentionComplete, listDiag: mentionDiag, loading: mentionLoading, COMPLETE_LIMIT} = require('../mentions.js');
 const {t} = require('../i18n.js');
+// Grapheme clusters for the composer's caret math (audit recovery): layout()
+// used to measure per code point, so a ZWJ emoji counted 6 cells instead of 2
+// and the caret landed columns away from where the text was drawn.
+const graphemeSegmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+const graphemesOf = s => graphemeSegmenter ? [...graphemeSegmenter.segment(s)].map(g => g.segment) : [...s];
 
 const h = React.createElement;
 // NO_COLOR (no-color.org): Ink colours everything through this chalk, which does not look at it.
-if (process.env.NO_COLOR) chalk.level = 0;
-// MUSER_REDUCED_MOTION=1: spinners stand still.
-const MOTION = process.env.MUSER_REDUCED_MOTION !== '1';
+if (!require('../settings.js').switchValue('color')) chalk.level = 0;
+// Spinners stand still with "motion" off in /settings (or MUSER_REDUCED_MOTION=1).
+const {switchValue} = require('../settings.js');
 const ACCENT = '#b4a0ff', DIM = '#5f5f69', GRAY = '#8c8c96';
 const SPIN = ['✻', '✽', '✶', '✳', '✢', '·', '✢', '✳', '✶', '✽'];
 const TITLES = {'shell.output': 'Output', 'shell.kill': 'Kill', 'shell.list': 'Shells', 'code.read': 'Read', 'code.grep': 'Search', 'code.glob': 'Glob', 'code.edit': 'Update', 'code.write': 'Write', 'code.apply_patch': 'Patch', 'todo.write': 'Todo', 'skill.read': 'Skill'};
 const title = call => call.user ? '! ' + (call.params?.shell === 'cmd' ? 'Cmd' : 'PowerShell') : call.kind === 'agent' ? (call.command === 'agent.spawn' ? 'Agent' : 'Wait') : call.kind === 'mcp' ? 'MCP' : call.command === 'system.run' ? (call.params?.shell === 'cmd' ? 'Cmd' : 'PowerShell') : call.command === 'code.write' && call.view?.created ? 'Create' : TITLES[call.command] || call.command;
+// The marker in front of a tool row. It used to be ⏺ for everything, so what KIND of
+// thing happened was carried only by the title text. Reads (and anything unlisted) keep
+// ⏺; the rest get a glyph of their own. Colour still says ok (green) or failed (red).
+export const glyphFor = call => {
+  if (call.user) return '▶'; // a !command the user ran
+  if (call.kind === 'agent') return '◆';
+  if (call.kind === 'mcp') return '⚙';
+  switch (call.command) {
+    case 'system.run': return '▶';
+    case 'shell.kill': return '■';
+    case 'code.edit': case 'code.write': case 'code.apply_patch': return '✎';
+    case 'code.grep': return '≡';
+    case 'code.glob': return '☰';
+    default: return call.command?.startsWith('shell.') ? '▶' : '⏺';
+  }
+};
 const elapsed = ms => { const s = Math.floor(ms / 1000); return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's'; };
 const T = (props, ...kids) => h(Text, props, ...kids);
 const Line = ({children, ...p}) => h(Text, {wrap: 'truncate-end', ...p}, children);
 
 // ---------- pieces ----------
 function Row({prefix, text, code}) {
-  // Opt-in: MUSER_CODE_WRAP=1 wraps long code/table rows instead of truncating them (default unchanged).
-  const wrap = code && process.env.MUSER_CODE_WRAP !== '1' ? 'truncate-end' : 'wrap';
+  // Opt-in ("wrap long code lines" in /settings, or MUSER_CODE_WRAP=1): long code/table rows wrap
+  // instead of being cut.
+  const wrap = code && !switchValue('codeWrap') ? 'truncate-end' : 'wrap';
   return h(Box, null, h(Text, null, prefix), h(Box, {flexShrink: 1}, h(Text, {wrap}, text || ' ')));
 }
 function Md({rows, first}) {
@@ -62,8 +84,11 @@ function Tool({call, cwd, W}) {
   const res = (kid, k = 'r') => h(Box, {key: k}, h(Text, {color: DIM}, '  ⎿  '), h(Box, {flexShrink: 1}, kid));
   if (call.command === 'todo.write' && call.ok) return h(Box, {flexDirection: 'column', marginBottom: 1},
     h(Text, null, c.green('⏺ ') + c.bold('Todo')), ...(v.todos || []).map((t, i) => h(Box, {key: i}, h(Text, {color: DIM}, i ? '     ' : '  ⎿  '), h(Text, {wrap: 'wrap'}, todoLine(t)))));
-  const kids = [h(Line, {key: 'h'}, (call.ok ? c.green('⏺ ') : c.red('⏺ ')) + c.bold(title(call)) + c.gray('(' + (call.summary || '') + ')'))];
-  if (!call.ok) kids.push(res(h(Text, {color: call.declined ? '#f06e6e' : '#f06e6e', wrap: 'wrap'}, call.declined ? t('断りました') + (call.error.includes('declined this:') ? t('（理由を Muse に伝えました）') : '') : t('エラー: {error}', {error: call.error}))));
+  // The marker's colour says how it went: a command that ran but exited non-zero is not green, and
+  // a step the user declined is their choice (yellow), not a failure (red).
+  const mark = call.declined ? c.yellow : !call.ok || (call.command === 'system.run' && v.exit) ? c.red : c.green;
+  const kids = [h(Line, {key: 'h'}, mark(glyphFor(call) + ' ') + c.bold(title(call)) + c.gray('(' + (call.summary || '') + ')'))];
+  if (!call.ok) kids.push(res(h(Text, {color: call.declined ? '#e6be64' : '#f06e6e', wrap: 'wrap'}, call.declined ? t('断りました') + (call.error.includes('declined this:') ? t('（理由を Muse に伝えました）') : '') : t('エラー: {error}', {error: call.error}))));
   else if (v.background && call.command === 'system.run') kids.push(res(h(Box, {flexDirection: 'column'}, h(Text, null, c.accent('⚙ ') + c.gray(t('バックグラウンドで実行中') + ' ') + c.bold(v.background) + c.faint('   ' + t('/bg で確認'))), ...(v.tail || []).filter(l => l.trim()).map((l, i) => h(Line, {key: i, color: DIM}, l)))));
   else if (call.command === 'shell.output') kids.push(res(h(Text, {color: GRAY}, v.background + ': ' + t('{n} 行', {n: v.lines}) + (v.running ? t('（実行中）') : t('（終了）')))));
   else if (call.command === 'shell.kill') kids.push(res(h(Text, {color: GRAY}, t('{id} を停止', {id: v.background}))));
@@ -87,7 +112,8 @@ function Keycap({k, label}) { return h(Box, {flexShrink: 0}, h(Text, null, h(Tex
 function Banner({ctrl}) {
   const a = ctrl.agent, mark = logo();
   return h(Box, {flexDirection: 'column', marginTop: 1, marginBottom: 1},
-    h(Box, null, h(Box, {flexDirection: 'column', marginLeft: 2, marginRight: 3}, h(Text, null, mark[0]), h(Text, null, mark[1])),
+    // The wordmark never shrinks: on a narrow terminal it was squeezed and its two rows split apart.
+    h(Box, null, h(Box, {flexDirection: 'column', flexShrink: 0, marginLeft: 2, marginRight: 3}, h(Text, null, mark[0]), h(Text, null, mark[1])),
       h(Box, {flexDirection: 'column', flexShrink: 1},
         h(Line, null, c.bold(ctrl.museName) + c.gray(t(' と作業します')) + c.faint('   v' + ctrl.version)),
         h(Line, {color: GRAY}, a.cwd))),
@@ -104,23 +130,45 @@ function Entry({e, ctrl, W}) {
       ...(e.missing?.length ? [h(Line, {key: 'miss'}, '  ' + c.yellow(t('見つからない: {list}', {list: e.missing.join(', ')})))] : []),
       ...(e.images?.length ? [h(Line, {key: 'img'}, '  ' + e.images.map((n, i) => c.accent('▣ ') + c.gray(t('画像 {i} {name}', {i: i + 1, name: n}))).join('   '))] : []));
     case 'md': return h(Md, {rows: e.rows, first: e.first});
+    case 'progress': return h(Box, {marginBottom: 1, width: W},
+      h(Text, {color: ACCENT}, '⏺ '),
+      h(Box, {flexShrink: 1, flexDirection: 'column'}, h(Text, {wrap: 'wrap'}, sanitizeEmbeds(e.message)),
+        e.agent && e.agent !== 'main' ? h(Text, {color: DIM}, e.agent) : null));
+    case 'focus': {
+      // Compact by default: one dim line, so a turn ends with the reply text as its last
+      // substantial block. The full panel (goal, every criterion, reasons, evidence) is what
+      // /focus asks for explicitly (full: true).
+      if (!e.full) {
+        const cs = e.focus.criteria || [], met = cs.filter(x => x.status === 'met').length, open = cs.filter(x => x.status !== 'met').map(x => x.id);
+        const warn = ['needs_input', 'blocked', 'stalled', 'limit'].includes(e.focus.status);
+        return h(Box, {width: W}, h(Text, {color: warn ? '#e6be64' : DIM, wrap: 'wrap'},
+          t('Focus: {status}', {status: focusLabel(e.focus.status)}) + ' · ✓ ' + met + '/' + cs.length + (e.focus.maxRounds > 1 ? ' · ' + e.focus.round + '/' + e.focus.maxRounds : '') + (open.length ? t(' · 未完: {ids}', {ids: open.join(', ')}) : '')));
+      }
+      return h(Box, {flexDirection: 'column', marginY: 1, width: W},
+        h(Text, {color: ACCENT}, t('Focus: {status} · {round}/{max}', {status: focusLabel(e.focus.status), round: e.focus.round, max: e.focus.maxRounds})),
+        h(Text, {wrap: 'wrap'}, t('目標: {goal}', {goal: e.focus.goal})),
+        ...e.focus.criteria.map(check => h(Text, {key: check.id, wrap: 'wrap', color: check.status === 'met' ? '#78cd82' : GRAY},
+          (check.status === 'met' ? '✓ ' : '□ ') + check.id + ' ' + check.text + (check.reason ? ' — ' + check.reason : '') + (check.evidence.length ? ' [' + check.evidence.join(', ') + ']' : ''))),
+        e.focus.reason ? h(Text, {color: DIM, wrap: 'wrap'}, e.focus.reason) : null);
+    }
     case 'gap': return h(Text, null, ' ');
     case 'shellout': return h(Box, {flexDirection: 'column', marginBottom: 1},
       h(Line, null, c.accent('⚙ ') + c.bold(e.id) + c.gray(e.running ? t('  実行中') : t('  終了 exit {exit}', {exit: e.exit}))),
+      ...(e.cut ? [h(Line, {key: 'cut', color: DIM}, '  │ ' + t('⋮ 前の出力は省略（/output で全文）'))] : []),
       ...(e.lines.filter(l => l.length).length ? e.lines : [t('(出力なし)')]).map((l, i) => h(Line, {key: i, color: GRAY}, '  │ ' + l)));
     case 'agent': {
       const x = e.snap, ok = x.state === 'done', mark = ok ? c.green('✓') : x.state === 'stopped' ? c.yellow('■') : c.red('✗');
       const body = sanitizeEmbeds(String(ok ? x.result : x.error || t('停止しました')).trim()).split('\n'), md = createMd(), max = e.full ? 200 : 12;
       return h(Box, {flexDirection: 'column', marginBottom: 1, borderStyle: 'round', borderColor: ok ? '#3c5a46' : '#5a3c3c', paddingX: 1, width: W},
         h(Line, null, mark + ' ' + c.accent(c.bold(t('エージェント {tag}', {tag: x.tag}))) + c.faint(' ' + (x.type || '')) + c.gray('  ' + x.title) + c.faint('   ' + elapsed((x.ended || Date.now()) - x.started))),
-        ...body.slice(0, max).map((l, i) => { const r = md.row(l); return h(Row, {key: i, prefix: r.prefix, text: r.text, code: r.code}); }),
+        ...md.rows(body.slice(0, max)).map((r, i) => h(Row, {key: i, prefix: r.prefix, text: r.text, code: r.code})),
         ...(body.length > max ? [h(Line, {key: 'more', color: DIM}, t('… ほか {n} 行（/agents で全文）', {n: body.length - max}))] : []));
     }
     case 'tool': return h(Tool, {call: e.call, cwd: a.cwd, W});
     case 'past': { // tools and Muse steps of a turn shown again on resume, compact
       const lines = [
         ...e.steps.map(s => (s.failed ? c.red('⏺ ') : c.faint('⏺ ')) + c.gray(s.title) + c.faint('  (Muse)')),
-        ...e.tools.map(t => (t.ok ? c.faint('⏺ ') : c.red('⏺ ')) + c.gray(String(t.command).replace(/^code\./, '') + (t.summary ? ' ' + t.summary : '')) + (t.ok ? '' : c.red('  ' + String(t.error || '').slice(0, 60)))),
+        ...e.tools.map(t => (t.ok ? c.faint(glyphFor(t) + ' ') : c.red(glyphFor(t) + ' ')) + c.gray(String(t.command).replace(/^code\./, '') + (t.summary ? ' ' + t.summary : '')) + (t.ok ? '' : c.red('  ' + String(t.error || '').slice(0, 60)))),
       ];
       return h(Box, {flexDirection: 'column', marginBottom: 1}, ...lines.slice(0, 6).map((l, i) => h(Line, {key: i}, l)),
         ...(lines.length > 6 ? [h(Line, {key: 'more', color: DIM}, t('  … ほか {n} 件', {n: lines.length - 6}))] : []));
@@ -131,30 +179,73 @@ function Entry({e, ctrl, W}) {
     case 'sources': return h(Box, {flexDirection: 'column', marginBottom: 1}, h(Text, {color: DIM}, t('  出典')),
       ...e.items.slice(0, 6).map((s, i) => h(Line, {key: i, color: GRAY}, '  ' + (i + 1) + '. ' + (s.label || s.domain) + c.faint('  ' + s.uri))),
       ...(e.items.length > 6 ? [h(Line, {key: 'more', color: DIM}, t('  … ほか {n} 件', {n: e.items.length - 6}))] : []));
-    case 'end': return h(Box, null, e.ok ? h(Text, {color: DIM}, '  ✻ ' + elapsed(e.ms)) : h(Text, {color: e.aborted ? '#e6be64' : '#f06e6e', wrap: 'wrap'}, '  ⎿  ' + (e.aborted ? t('中断しました') : e.error)));
-    case 'note': return h(Box, {flexDirection: 'column', marginBottom: 1}, e.lines.map((l, i) => h(Text, {key: i, color: GRAY, wrap: 'wrap'}, '  ' + l)));
-    case 'help': return h(Box, {flexDirection: 'column', marginBottom: 1}, h(Text, {bold: true}, t('コマンド')),
-      ...COMMANDS.map(([n, d]) => h(Line, {key: n}, '  ' + c.accent(pad(n, 14)) + c.gray(t(d)))), h(Text, null, ' '), h(Text, {bold: true}, t('キー')),
-      h(Text, {color: GRAY, wrap: 'wrap'}, t('  enter 送信 · {bs}+enter / ctrl+j 改行 · ↑↓ 履歴 · esc 中断 · shift+tab 承認モード · tab コマンド補完 · ctrl+c ×2 終了', {bs: '\\'})),
-      h(Text, {color: GRAY, wrap: 'wrap'}, t('  ctrl+a / ctrl+e 行頭・行末 · ctrl+u / ctrl+k カーソルの前・後ろを消す · ctrl+w 単語を消す · alt+v 画像を貼る · @ ファイル · ! シェル')));
+    case 'end': { const usage = e.usage ? (e.usage.formatted || (require('../turn-usage').formatTokens(e.usage.inputTokens || 0) + ' in / ' + require('../turn-usage').formatTokens(e.usage.outputTokens || 0) + ' out')) : null; return h(Box, null, e.ok ? h(Text, {color: DIM}, '  ✻ ' + elapsed(e.ms) + (usage ? ' · ' + usage : '')) : h(Text, {color: e.aborted ? '#e6be64' : '#f06e6e', wrap: 'wrap'}, '  ⎿  ' + (e.aborted ? t('中断しました') : e.error))); }
+    case 'note': return h(Box, {flexDirection: 'column', marginBottom: 1}, e.lines.map((l, i) => h(Text, {key: i, color: e.level === 'error' ? '#f06e6e' : GRAY, wrap: 'wrap'}, '  ' + l)));
+    case 'help': {
+      // Descriptions wrap under themselves instead of being cut with …: /help is where they are read
+      // in full. The keys are one per cell of a grid; as one run-on paragraph they wrapped to the
+      // left edge and were hard to scan.
+      const keys = [t('  enter 送信 · {bs}+enter / ctrl+j 改行 · ↑↓ 履歴（@ 補完中は候補の移動） · esc 中断 · esc ×2 入力を消す · shift+tab 承認モード · tab コマンド補完 · ctrl+c ×2 終了 · ctrl+d ×2 終了', {bs: '\\'}),
+        t('  ctrl+a / ctrl+e 行頭・行末 · ctrl+u / ctrl+k カーソルの前・後ろを消す · ctrl+w 単語を消す · ctrl+o 直近の出力を全文 · alt+v / ctrl+v 画像を貼る · 空の入力で backspace 添付を外す · @ ファイル · ! シェル')]
+        .flatMap(s => s.trim().split(' · '));
+      const cellW = Math.min(W - 2, Math.max(...keys.map(k => width(k))) + 3);
+      return h(Box, {flexDirection: 'column', marginBottom: 1}, h(Text, {bold: true}, t('コマンド')),
+        // term.js wrap breaks at spaces and drops the one at the break (Ink's kept it, so English
+        // continuation lines started one column in).
+        ...COMMANDS.map(([n, d]) => h(Box, {key: n, paddingLeft: 2}, h(Box, {flexShrink: 0, width: 14}, h(Text, {color: ACCENT}, n)),
+          h(Box, {flexShrink: 1, flexDirection: 'column'}, ...wrapText(t(d), Math.max(8, W - 17)).map((l, i) => h(Text, {key: i, color: GRAY, wrap: 'truncate-end'}, l))))),
+        h(Text, null, ' '), h(Text, {bold: true}, t('キー')),
+        h(Box, {paddingLeft: 2, flexWrap: 'wrap', width: W}, ...keys.map((k, i) => h(Box, {key: i, width: cellW, flexShrink: 0}, h(Text, {color: GRAY, wrap: 'truncate-end'}, k)))));
+    }
     case 'todos': return h(Box, {flexDirection: 'column', marginBottom: 1}, e.todos.length ? e.todos.map((td, i) => h(Text, {key: i, wrap: 'wrap'}, '  ' + todoLine(td))) : h(Text, {color: GRAY}, t('  Todo はまだありません。')));
-    case 'status': return h(Box, {flexDirection: 'column', marginBottom: 1}, ...[
-      ['Muse', ctrl.museName + c.faint('  ' + t('ゲートウェイ') + ' ' + a.client.status)], [t('端末'), a.constructor.DEVICE + '  ' + (a.device?.connected ? c.green(t('接続中')) : c.red(t('未接続')))],
+    case 'status': { const rows = [
+      ['Muse', ctrl.museName + c.faint('  ' + t('ゲートウェイ') + ' ' + a.client.status)], [t('端末'), a.constructor.DEVICE + (a.nodeSlot?.slot ? c.faint('  ' + t('窓 {n}', {n: a.nodeSlot.slot})) : '') + '  ' + (a.device?.connected ? c.green(t('接続中')) : c.red(t('未接続')))],
       [t('会話'), (a.session.title || t('(新規)')) + c.faint('  ' + a.session.id)], [t('場所'), a.cwd], [t('承認'), t(LABELS[a.mode])],
-    ].map(([k, v]) => h(Line, {key: k}, '  ' + c.gray(pad(k, 6)) + v)));
+      // Which account's Muse this window talks to (several accounts: src/accounts.js).
+      ...(a.accountId ? [[t('アカウント'), (a.accountLabel || a.accountId) + c.faint('  ' + a.accountId)]] : []),
+      // The real token counts by window (the same numbers /usage shows), once
+      // any turn has carried a live [usage] line.
+      ...usageWindowRows(),
+    ];
+    // The label column fits the widest label (アカウント is wider than the old fixed 6).
+    const kw = Math.max(6, ...rows.map(([k]) => width(k) + 2));
+    return h(Box, {flexDirection: 'column', marginBottom: 1}, ...rows.map(([k, v]) => h(Line, {key: k}, '  ' + c.gray(pad(k, kw)) + v))); }
     default: return null;
   }
 }
 
+// The real token counts by window for /status (src/usage.js): the last hour,
+// today, the last 7 days and all time. Empty until a turn has carried a live
+// [usage] line; a broken tally must never break the status view.
+function usageWindowRows() {
+  try {
+    const s = require('../usage.js').summary();
+    if (!(s.allTime.realInTokens || s.allTime.realOutTokens)) return [];
+    const f = require('../turn-usage').formatTokens;
+    const fmt = b => f(b.realInTokens || 0) + ' in / ' + f(b.realOutTokens || 0) + ' out';
+    return [[t('実績 1時間'), fmt(s.lastHour)], [t('実績 今日'), fmt(s.today)], [t('実績 7日'), fmt(s.last7)], [t('実績 累計'), fmt(s.allTime)]];
+  } catch { return []; }
+}
+
 // ---------- live area ----------
+function focusLabel(status) {
+  return t(({running: '確認中', complete: '条件の根拠が揃いました', needs_input: '確認・判断待ち', stalled: '進展がないため停止', limit: '上限で停止', stopped: '中断', blocked: '続行できません'})[status] || '確認中');
+}
 function useTick(active, ms = 100) {
   const [n, setN] = useState(0);
-  useEffect(() => { if (!active || !MOTION) return; const t = setInterval(() => setN(x => x + 1), ms); return () => clearInterval(t); }, [active, ms]);
+  const motion = switchValue('motion');
+  useEffect(() => { if (!active || !motion) return; const t = setInterval(() => setN(x => x + 1), ms); return () => clearInterval(t); }, [active, ms, motion]);
   return n;
 }
+// The spinner word: Muse's own, from spinner.set; until it sends one, a word from this list —
+// English in both languages, a different one each turn, kept for the whole turn (picked from when
+// it started) so the line does not flicker between words.
+export const THINKING_WORDS = ['Musing', 'Daydreaming', 'Mulling', 'Wondering', 'Stargazing', 'Imagining', 'Conjuring', 'Woolgathering', 'Tinkering', 'Sparking'];
+export const WRITING_WORDS = ['Composing', 'Penning', 'Inking', 'Scribbling', 'Drafting', 'Weaving'];
+export const spinnerWord = (list, seed) => list[Math.abs(Math.floor(Number(seed) || 0)) % list.length] + '…';
 function Working({s}) {
   const n = useTick(true);
-  const what = s.status === 'waiting_for_approval' ? t('Muse 側で承認待ち（muse.ai を確認）') : s.museRunning ? s.museRunning + '…' : s.activity ? s.activity + '…' : s.stream?.partial ? t('書いています…') : t('考え中…');
+  const what = s.status === 'waiting_for_approval' ? t('Muse 側で承認待ち（muse.ai を確認）') : s.museRunning ? s.museRunning + '…' : s.activity ? s.activity + '…' : s.spinnerWord ? s.spinnerWord + '…' : s.stream?.partial ? spinnerWord(WRITING_WORDS, s.turnStart) : spinnerWord(THINKING_WORDS, s.turnStart);
   return h(Box, {marginTop: 1}, h(Text, {color: ACCENT}, SPIN[n % SPIN.length] + ' ' + what), h(Text, {color: DIM}, '  ' + elapsed(Date.now() - s.turnStart) + t(' · esc で中断')));
 }
 function Running({r}) {
@@ -224,11 +315,16 @@ function Menu({m, W}) {
         const n = m.options.length, start = n <= MENU_ROWS ? 0 : Math.max(0, Math.min(m.index - Math.floor(MENU_ROWS / 2), n - MENU_ROWS)), end = Math.min(n, start + MENU_ROWS);
         return [
           ...(start > 0 ? [h(Text, {key: 'up', color: DIM}, '  ' + t('↑ ほか {n} 件', {n: start}))] : []),
-          ...m.options.slice(start, end).map((o, j) => {
+          ...m.options.slice(start, end).flatMap((o, j) => {
             const i = start + j, on = i === m.index, mark = o.mark || o.value === m.current ? c.green(' ✓') : '';
             const label = (i + 1) + '. ' + o.label, col = o.danger ? c.red : c.text;
-            return h(Box, {key: i}, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {width: labelW, flexShrink: 0}, h(Line, null, (on ? c.bold(col(label)) : col(label)) + mark)),
+            const row = h(Box, {key: i}, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {width: labelW, flexShrink: 0}, h(Line, null, (on ? c.bold(col(label)) : col(label)) + mark)),
               h(Box, {flexShrink: 1}, h(Text, {color: on ? GRAY : DIM, wrap: 'truncate-end'}, o.desc || '')));
+            // A genre header when the group changes (/settings groups its rows):
+            // display only — numbering and picking stay per option. The first
+            // visible row always gets its header, so a scrolled window still
+            // says which genre it is in.
+            return o.group && (j === 0 || m.options[i - 1]?.group !== o.group) ? [h(Text, {key: 'h' + i, bold: true, color: ACCENT}, o.group), row] : [row];
           }),
           ...(end < n ? [h(Text, {key: 'down', color: DIM}, '  ' + t('↓ ほか {n} 件', {n: n - end}))] : []),
         ];
@@ -238,7 +334,7 @@ function Menu({m, W}) {
 // Wraps the buffer by display cells so the caret position is exact.
 function layout(text, pos, max) {
   const lines = [''], widths = [0]; let cur = {row: 0, col: 0}, i = 0;
-  for (const ch of text) {
+  for (const ch of graphemesOf(text)) {
     if (i === pos) cur = {row: lines.length - 1, col: widths[widths.length - 1]};
     i += ch.length;
     if (ch === '\n') { lines.push(''); widths.push(0); continue; }
@@ -278,7 +374,7 @@ function useBoxPosition(ref) {
 }
 function Prompt({s, W}) {
   const ref = useRef(null), box = useBoxPosition(ref), {setCursorPosition} = useCursor();
-  const reason = !!s.reasonFor, bang = !reason && s.text.startsWith('!'), head = reason ? t('理由 ') : '❯ ', inner = W - 4 - width(head);
+  const reason = !!s.reasonFor, bang = !reason && s.text.trimStart().startsWith('!'), head = reason ? t('理由 ') : '❯ ', inner = W - 4 - width(head);
   const {lines: all, cur} = layout(s.text, s.pos, inner);
   // A window of rows around the caret: a 3,000-line paste drew 3,000 rows on every key (0.5 s a
   // frame, far taller than the terminal). The text itself is untouched.
@@ -288,10 +384,13 @@ function Prompt({s, W}) {
   // Set during render, not in an effect: Ink applies it to the frame being written, while an
   // effect lands one frame late and leaves the caret on the previous position.
   if (box) setCursorPosition({x: box.left + 2 + width(head) + cur.col, y: box.top + 1 + (above ? 1 : 0) + cur.row - start});
-  const placeholder = reason ? t('Muse に伝えること（空なら理由なしで断る）') : s.busy ? t('Muse が作業中（送った文は次のターンになります）') : t('何をしますか？   / でコマンド');
+  // On the account-add screen the composer answers the screen, it does not chat: its hint
+  // says so instead of the chat's placeholder.
+  const placeholder = s.addFlow ? (s.promptFor ? t('ここに入力して Enter') : t('アカウントを追加しています…')) : reason ? t('断る理由（空でも可）') : s.busy ? t('Muse が作業中 · 送ると作業中の Muse に伝えます') : t('何をしますか？   / でコマンド');
   return h(Box, {ref, flexDirection: 'column', borderStyle: 'round', borderColor: reason || bang ? '#e6be64' : s.busy ? '#3c3c44' : DIM, paddingX: 1, width: W, marginTop: 1},
     ...(above ? [h(Text, {key: 'above', color: DIM}, ' '.repeat(width(head)) + t('↑ ほか {n} 行（全部で {total} 行）', {n: above, total: all.length}))] : []),
-    ...lines.map((l, i) => h(Box, {key: i}, h(Text, {color: reason ? '#e6be64' : ACCENT}, i + start ? ' '.repeat(width(head)) : head),
+    // The ❯ never shrinks: a placeholder wider than the box squeezed out the space after it.
+    ...lines.map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: reason ? '#e6be64' : ACCENT}, i + start ? ' '.repeat(width(head)) : head)),
       h(Text, {wrap: 'truncate-end', color: !s.text ? DIM : undefined}, !s.text && i === 0 ? placeholder : l || ' '))),
     ...(below ? [h(Text, {key: 'below', color: DIM}, ' '.repeat(width(head)) + t('↓ ほか {n} 行', {n: below}))] : []));
 }
@@ -299,26 +398,70 @@ function Footer({s, ctrl, W}) {
   const m = s.mode, color = m === 'bypass' ? '#f06e6e' : m === 'plan' ? '#78aaf0' : m === 'auto-edit' ? ACCENT : GRAY;
   const at = mentionAt(s.text, s.pos);
   if (at) {
-    const list = mentionComplete(at.fragment, ctrl.agent.cwd, 6, () => ctrl.set({}));
+    const list = mentionComplete(at.fragment, ctrl.agent.cwd, COMPLETE_LIMIT, () => ctrl.set({}));
+    const diag = mentionDiag();
+    // The listing diagnostic matters whenever it is not a clean rg run — a walk fallback or an
+    // error explains odd results even when there ARE matches, not only when there are none.
+    const diagNote = (diag.error || diag.source === 'walk' || diag.source === 'none')
+      ? h(Text, {key: 'diag', color: DIM}, t('ファイル一覧: {source}{error}', {source: diag.source, error: diag.error ? '（' + diag.error + '）' : ''})) : null;
     if (!list.length) {
-      const diag = mentionDiag();
       if (mentionLoading(ctrl.agent.cwd)) return h(Box, {paddingX: 2}, h(Text, {color: DIM}, t('ファイルを探しています…')));
-      return h(Box, {paddingX: 2}, h(Text, {color: DIM}, diag.source === 'none' ? t('ファイル一覧を取得できませんでした（{error}）', {error: diag.error}) : t('一致するファイルがありません')));
+      return h(Box, {flexDirection: 'column', paddingX: 2},
+        h(Text, {color: DIM}, diag.source === 'none' ? t('ファイル一覧を取得できませんでした（{error}）', {error: diag.error}) : t('一致するファイルがありません')), diagNote);
     }
     const sel = ctrl.atIndex(at.fragment, list.length);
-    return h(Box, {flexDirection: 'column', paddingX: 2}, list.map((f, i) => h(Line, {key: f}, (i === sel ? c.accent('◇ ' + f) : c.gray('  ' + f)) + (i === sel ? c.faint(t('   ↑↓ で選択 · enter / tab で補完')) : ''))));
+    // The keys go on a line of their own: on the selected row they ran off a narrow screen.
+    return h(Box, {flexDirection: 'column', paddingX: 2}, list.map((f, i) => h(Line, {key: f}, i === sel ? c.accent('◇ ' + f) : c.gray('  ' + f))),
+      h(Line, {key: 'keys', color: DIM}, '  ' + t('   ↑↓ で選択 · enter / tab で補完').trim()), diagNote);
   }
-  if (s.text.startsWith('!')) return h(Box, {paddingX: 1}, h(Line, null, c.yellow(t('! シェルモード')) + c.faint(t('   PowerShell で今すぐ実行（Muse を通さない）· 出力は次のメッセージで Muse に渡ります'))));
+  if (s.text.trimStart().startsWith('!')) return h(Box, {paddingX: 1}, h(Line, null, c.yellow(t('! シェルモード')) + c.faint(require('../settings.js').switchValue('bangAutoSend') ? t('   PowerShell で実行 · 終わったら出力を Muse へ') : t('   PowerShell で実行 · 出力は次のメッセージで Muse へ'))));
   if (s.text.startsWith('/') && !s.text.includes(' ')) {
-    const list = COMMANDS.filter(([n]) => n.startsWith(s.text)).slice(0, 7);
-    return h(Box, {flexDirection: 'column', paddingX: 2}, list.map(([n, d], i) => h(Line, {key: n}, (i === 0 ? c.accent(pad(n, 14)) : c.gray(pad(n, 14))) + c.faint(t(d)))));
+    const list = COMMANDS.filter(([n]) => n.startsWith(s.text));
+    const sel = ctrl.slashIndex(s.text, list.length);
+    // A window of rows around the highlight: every command is reachable by ↑↓, but the footer
+    // never shows more than 7 candidate rows (⋮ marks more above or below).
+    const WIN = 7, start = Math.max(0, Math.min(sel - 3, list.length - WIN));
+    const shown = list.slice(start, start + WIN);
+    // The selected row has a ❯ (with colour off it was the only thing that told it apart), and the
+    // keys go on a line of their own: after a long description they were cut off the screen.
+    return h(Box, {flexDirection: 'column', paddingX: 2},
+      ...(start > 0 ? [h(Line, {key: 'up', color: DIM}, '  ⋮')] : []),
+      ...shown.map(([n, d], i) => h(Line, {key: n}, start + i === sel ? c.accent('❯ ' + pad(n, 14)) + c.gray(t(d)) : '  ' + c.gray(pad(n, 14)) + c.faint(t(d)))),
+      ...(start + WIN < list.length ? [h(Line, {key: 'down', color: DIM}, '  ⋮')] : []),
+      ...(list.length ? [h(Line, {key: 'keys', color: DIM}, '  ' + t('   ↑↓ で選択 · enter / tab で補完').trim())] : []));
   }
+  // The status lane, element by element (/settings): the window slot is internal
+  // bookkeeping, so it starts hidden — /status and doctor still name it.
+  const lane = [], slotNo = ctrl.agent.nodeSlot?.slot;
+  if (switchValue('footerDevice')) lane.push(ctrl.agent.constructor.DEVICE + (switchValue('footerSlot') && slotNo ? ' ' + t('窓 {n}', {n: slotNo}) : ''));
+  else if (switchValue('footerSlot') && slotNo) lane.push(t('窓 {n}', {n: slotNo}));
+  if (switchValue('footerCwd') && ctrl.agent.cwd) lane.push(path.basename(ctrl.agent.cwd));
+  if (switchValue('footerName')) lane.push(ctrl.museName);
+  if (s.account?.label) lane.push(s.account.label);
+  if (s.accountReserved) lane.push(t('→ {label} に切替予定', {label: s.accountReserved}));
+  if (switchValue('footerUsage') && s.plan?.percentUsed != null) lane.push(t('週 {n}%', {n: s.plan.percentUsed}));
+  if (switchValue('footerSession') && ctrl.agent.session?.turns && ctrl.agent.client?.status !== 'demo') lane.push(ctrl.agent.session.id.slice(0, 8));
+  if (switchValue('footerVersion')) lane.push('v' + ctrl.version);
+  if (switchValue('footerClock')) { const d = new Date(); lane.push(d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0')); }
+  // One row at any width: on a narrow terminal both halves wrapped to two lines each. The
+  // "shift+tab" hint goes first, then the status lane is cut at its end (the dot and the
+  // warnings stay in front of it).
+  const modeText = (m === 'default' ? '' : '⏵⏵ ') + t(LABELS[m]), hint = t('   shift+tab で切替');
+  const running = s.shells.filter(x => x.running).length;
+  const right = [
+    ...(running ? [c.accent('⚙ ' + t('{n} 実行中', {n: running}) + '   ')] : []),
+    ...(s.update?.checking ? [c.faint(t('更新を確認中…') + '   ')] : s.update?.latest ? [c.accent('⬆ v' + s.update.latest + ' · /update   ')] : []),
+    ...(s.loginNeeded ? [c.red(t('ログインが必要（/login）  '))] : []),
+    (s.deviceOk ? c.green('● ') : c.red('● ')) + c.faint(lane.join(' · ')),
+  ].join('');
+  const leftW = s.flash ? width(s.flash) : width(modeText) + width(hint);
+  const showHint = !s.flash && width(modeText) + width(hint) + 2 + Math.min(width(right), 24) <= W - 2;
   return h(Box, {paddingX: 1, width: W, justifyContent: 'space-between'},
-    s.flash ? h(Text, {color: '#e6be64'}, s.flash) : h(Text, null, h(Text, {color}, (m === 'default' ? '' : '⏵⏵ ') + t(LABELS[m])), h(Text, {color: DIM}, t('   shift+tab で切替'))),
-    h(Text, null, s.shells.some(x => x.running) ? h(Text, {color: ACCENT}, '⚙ ' + t('{n} 実行中', {n: s.shells.filter(x => x.running).length}) + '   ') : '',
-      ...(s.update?.checking ? [h(Text, {color: DIM}, t('更新を確認中…') + '   ')] : s.update?.latest ? [h(Text, {color: ACCENT}, '⬆ v' + s.update.latest + ' · /update   ')] : []), ...(s.loginNeeded ? [h(Text, {color: '#f06e6e'}, t('ログインが必要（/login）  '))] : []), h(Text, {color: s.deviceOk ? '#78cd82' : '#f06e6e'}, '● '), h(Text, {color: DIM}, ctrl.agent.constructor.DEVICE + ' · ' + ctrl.museName + (s.plan?.percentUsed != null ? ' · ' + t('週 {n}%', {n: s.plan.percentUsed}) : ''))));
+    h(Box, {flexShrink: 0, marginRight: 2}, s.flash ? h(Text, {color: '#e6be64', wrap: 'truncate-end'}, leftW > W - 4 ? truncate(s.flash, W - 4) : s.flash)
+      : h(Text, null, h(Text, {color}, modeText), showHint ? h(Text, {color: DIM}, hint) : '')),
+    h(Box, {flexShrink: 1}, h(Text, {wrap: 'truncate-end'}, right)));
 }
-function AgentCards({list}) {
+function AgentCards({list, words}) {
   const n = useTick(list.some(x => x.state === 'working'));
   if (!list.length) return null;
   // As many as fit: 25 running agents (no limit set) took 50 rows and pushed the input off the
@@ -330,24 +473,46 @@ function AgentCards({list}) {
     ...shown.map(x => {
       const working = x.state === 'working', mark = working ? c.accent(SPIN[(n + x.tag.length) % SPIN.length]) : x.state === 'done' ? c.green('✓') : x.state === 'stopped' ? c.yellow('■') : c.red('✗');
       const last = String(x.text || '').trim().split('\n').pop() || '';
-      const what = working ? (x.lastTool ? c.gray(x.lastTool) : c.gray(t('考え中…'))) : c.faint(x.state === 'done' ? t('完了') : x.state === 'stopped' ? t('停止') : t('失敗'));
+      const what = working ? (x.lastTool ? c.gray(x.lastTool) : c.gray(words?.[x.tag] ? words[x.tag] + '…' : spinnerWord(THINKING_WORDS, x.started))) : c.faint(x.state === 'done' ? t('完了') : x.state === 'stopped' ? t('停止') : t('失敗'));
       return h(Box, {key: x.tag, flexDirection: 'column'},
         h(Line, null, mark + ' ' + c.bold(x.tag) + c.faint(' ' + (x.type || '')) + ' ' + x.title + c.faint('  ' + elapsed((working ? Date.now() : x.ended) - x.started)) + '  ' + what),
         working && last && !compact ? h(Line, {color: DIM}, '   ' + last) : null);
     }));
 }
+// The account add's own screen: while it is up, the live region is this panel (plus the
+// composer / menus that answer it) instead of the chat's working rows — the questions and
+// steps land here, and the chat above only keeps the outcome.
+function AddScreen({f, W}) {
+  return h(Box, {flexDirection: 'column', marginTop: 1},
+    h(Box, {flexDirection: 'column', borderStyle: 'round', borderColor: ACCENT, paddingX: 1, width: W},
+      h(Line, null, c.accent(c.bold(t('アカウントを追加')))),
+      h(Text, null, ' '),
+      ...f.lines.map((l, i) => h(Line, {key: i}, l)),
+      f.busy ? h(Line, {key: 'busy', color: DIM}, f.busy + '…') : null));
+}
 function Live({s, ctrl, W}) {
+  if (s.addFlow) return h(Box, {flexDirection: 'column', width: W},
+    h(AddScreen, {f: s.addFlow, W}),
+    s.approval ? h(Approval, {a: s.approval, ctrl, W}) : s.menu ? h(Menu, {m: s.menu, W}) : h(Prompt, {s, W}),
+    h(Footer, {s, ctrl, W}));
   const preview = ctrl.previewRow(), open = s.todos.filter(t => t.status !== 'completed');
   return h(Box, {flexDirection: 'column', width: W},
-    preview ? h(Row, {prefix: (preview.first ? '⏺ ' : '  ') + preview.row.prefix, text: preview.row.text, code: preview.row.code}) : null,
+    // A table still being written: set as a whole here, printed above once it ends.
+    ...(preview?.table || []).slice(-Math.max(4, (process.stdout.rows || 30) - 16)).map((r, i) => h(Row, {key: 'tb' + i, prefix: (preview.first && i === 0 ? '⏺ ' : '  ') + r.prefix, text: r.text, code: true})),
+    preview?.row ? h(Row, {key: 'pv', prefix: (preview.first && !preview.table?.length ? '⏺ ' : '  ') + preview.row.prefix, text: preview.row.text, code: preview.row.code}) : null,
     s.bangRunning && !s.approval ? h(Running, {r: s.bangRunning}) : null,
     s.running && !s.approval ? h(Running, {r: s.running}) : null,
     s.busy && !s.running && !s.approval ? h(Working, {s}) : null,
+    s.busy && s.focus?.status === 'running' && !s.approval ? h(Text, {color: DIM}, t('Focus {round}/{max} · 根拠あり {met}/{total}', {round: s.focus.round, max: s.focus.maxRounds, met: s.focus.criteria.filter(c => c.status === 'met').length, total: s.focus.criteria.length})) : null,
+    s.queue?.length && !s.approval ? h(Box, {marginTop: 1, paddingX: 2}, h(Text, {color: DIM}, t('キュー {n} 件: {first}', {n: s.queue.length, first: s.queue.map(q => String(q).split('\n')[0]).join(' · ').slice(0, 80)}))) : null,
     s.todos.length && open.length && !s.approval ? h(Box, {flexDirection: 'column', marginTop: 1}, s.todos.slice(0, 8).map((t, i) => h(Text, {key: i, wrap: 'truncate-end'}, '  ' + todoLine(t)))) : null,
-    h(AgentCards, {list: s.agents.filter(x => x.state === 'working' || Date.now() - x.ended < 8000)}),
-    s.approval || s.menu ? null : h(Chips, {list: s.attachments}),
-    s.approval ? h(Approval, {a: s.approval, ctrl, W}) : s.menu ? h(Menu, {m: s.menu, W}) : h(Prompt, {s, W}),
-    s.approval || s.menu ? null : h(Footer, {s, ctrl, W}));
+    h(AgentCards, {words: s.agentWords, list: s.agents.filter(x => x.state === 'working' || Date.now() - x.ended < 8000)}),
+    s.approval || s.menu || s.limitInput ? null : h(Chips, {list: s.attachments}),
+    s.approval ? h(Approval, {a: s.approval, ctrl, W}) : s.menu ? h(Menu, {m: s.menu, W}) : s.limitInput ? h(Box, {flexDirection: 'column'},
+      h(Text, {color: ACCENT}, s.limitInput.label || (s.limitInput.key === 'concurrent' ? t('同時に動かすエージェント数') : t('1タスクで起動できる合計数'))),
+      h(Prompt, {s: {...s, text: s.limitInput.text, pos: s.limitInput.text.length, busy: false, reasonFor: null}, W}),
+      h(Text, {color: DIM}, s.flash || (s.limitInput.hint || t('0 は無制限')) + ' · ' + t('enter で確定 · esc で戻る'))) : h(Prompt, {s, W}),
+    s.approval || s.menu || s.limitInput ? null : h(Footer, {s, ctrl, W}));
 }
 
 function Root({ctrl}) {
@@ -364,16 +529,40 @@ function Root({ctrl}) {
 
 export {Entry, Live};
 
-export function run({agent, museName, version, initial, connect}) {
+export function run({agent, museName, version, initial, connect, onReload, remoteCtrl}) {
   let app;
-  const ctrl = new Controller({agent, museName, version, onExit: async () => {
+  // Client mode (remote/DESIGN.md step 4): the conversation lives in the
+  // resident server and remoteCtrl (src/ui/remote-controller.mjs) already
+  // mirrors it; the view renders it exactly like a local Controller. The
+  // facade stands in for the agent everywhere the view reads one.
+  if (remoteCtrl) agent = remoteCtrl.agent;
+  const ctrl = remoteCtrl || new Controller({agent, museName, version, onExit: async () => {
     app.unmount();
     const id = agent.session.turns && agent.client.status !== 'demo' ? agent.session.id.slice(0, 8) : '';
     if (id) process.stdout.write(c.faint(t('再開するには: muser resume {id}', {id})) + '\n');
     // Leaving mid-turn only closed the sockets: Muse went on working for nobody.
     if (agent.busy && agent.cancelAll) { process.stdout.write(c.faint(t('Muse の作業を止めています…')) + '\n'); await agent.cancelAll().catch(() => {}); }
     agent.close(); setTimeout(() => process.exit(0), 50);
-  }});
+  }, onReload: onReload ? () => {
+    // /reload: hand the terminal to a fresh process on the current code (it resumes this
+    // session), then leave. Closing first frees this window's node slot for it.
+    app.unmount();
+    let ok = true;
+    try { onReload(); } catch { ok = false; }
+    if (!ok) { const id = agent.session.turns ? agent.session.id.slice(0, 8) : ''; if (id) process.stdout.write(c.faint(t('再開するには: muser resume {id}', {id})) + '\n'); }
+    agent.close(); setTimeout(() => process.exit(0), 50);
+  } : undefined});
+  if (remoteCtrl) {
+    // Detach, never close: /exit and /reload reach the RemoteController's own
+    // callbacks; unmount first so the terminal is handed back cleanly.
+    const userExit = remoteCtrl.onExit, userReload = remoteCtrl.onReload;
+    remoteCtrl.onExit = async () => { try { app?.unmount(); } catch {} if (userExit) await userExit(); else setTimeout(() => process.exit(0), 50); };
+    remoteCtrl.onReload = userReload ? () => { try { app?.unmount(); } catch {} userReload(); } : undefined;
+  }
+  // What this window is doing, live, for `muser status` and other agents (src/window-status.js).
+  // A client window's conversation is the server's, which `muser status` lists already; the
+  // demo talks to no Muse.
+  if (!remoteCtrl && agent.client?.status !== 'demo') { try { new (require('../window-status.js').WindowStatus)({ctrl, agent}).start(); } catch {} }
   // An exception nothing caught ends muser: leave a report (src/crash.js) and the way back into the
   // chat instead of only a stack trace.
   const crashed = e => {
@@ -401,7 +590,7 @@ export function run({agent, museName, version, initial, connect}) {
       return original.call(this, s.startsWith('\x1b[?2026h') ? s + CLEAR : CLEAR + s, ...rest);
     };
   }
-  app = render(h(Root, {ctrl}), {exitOnCtrlC: false, incrementalRendering: true, maxFps: 30, kittyKeyboard: {mode: process.env.MUSER_KITTY === '1' ? 'auto' : 'disabled'}, patchConsole: true});
+  app = render(h(Root, {ctrl}), {exitOnCtrlC: false, incrementalRendering: true, maxFps: 30, kittyKeyboard: {mode: require('../settings.js').switchValue('kitty') ? 'auto' : 'disabled'}, patchConsole: true});
   // Drawn before Muse is reached: connect behind the screen; a message sent meanwhile waits for
   // it (runTurn awaits ensureConnected). Then learn Muse's name for next time.
   if (connect) connect().then(name => { if (name && name !== ctrl.museName) { ctrl.museName = name; ctrl.set({}); } }).catch(() => {});

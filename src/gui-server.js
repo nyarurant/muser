@@ -1,0 +1,1102 @@
+'use strict';
+// Headless GUI server (docs/gui-protocol.md v1 + the v2 and v3 additions): the third muser front-end. It hosts the
+// same Agent + Controller as the TUI — the Controller never needed the Ink view (view.mjs
+// only subscribes to it and forwards keys), so serve swaps the view for HTTP + SSE here.
+// Binds 127.0.0.1 only; every request needs the per-process Bearer token.
+const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const {execFile} = require('node:child_process');
+const {MODES} = require('./policy.js');
+const mention = require('./mentions.js');
+
+const MAX_ENTRIES = 200; // /api/state and entries-reset carry only the newest entries
+const MAX_BODY = 1024 * 1024;
+const SEND_MAX_BODY = 16 * 1024 * 1024; // v6: POST /send alone may carry base64 images
+const ATTACH_MAX_COUNT = 8, ATTACH_MAX_TOTAL = 11 * 1024 * 1024; // v6: decoded image bytes per send
+const ATTACH_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const STATE_DEBOUNCE_MS = 50; // bursts of Controller changes coalesce into one state event
+const DIFF_CAP = 200000; // v3: a per-file diff body is capped at 200k chars (truncated: true when capped)
+const GIT_TIMEOUT_MS = 15000, GIT_DIFF_TIMEOUT_MS = 30000; // generous but bounded
+const GIT_MAX_BUFFER = 32 * 1024 * 1024; // room for a big status/numstat/diff before the JS-side caps apply
+
+function defaultDiscoveryFile() { return path.join(os.homedir(), '.muser', 'gui.json'); }
+
+// Deep-copy a value into plain JSON. Functions, AbortSignals (approval calls carry one),
+// timers (a pending approval holds one) and circular references are dropped: none of them
+// can cross the wire, and the approval request object would not stringify at all otherwise.
+function plain(value) {
+  try {
+    const ancestors = [];
+    const out = JSON.stringify(value, function (key, v) {
+      if (typeof v === 'function') return undefined;
+      if (v && typeof v === 'object') {
+        if (v instanceof AbortSignal) return undefined;
+        if (typeof v._onTimeout === 'function') return undefined; // a Node timer
+        while (ancestors.length && ancestors[ancestors.length - 1] !== this) ancestors.pop();
+        if (ancestors.includes(v)) return undefined;
+        ancestors.push(v);
+      }
+      return v;
+    });
+    return out === undefined ? null : JSON.parse(out);
+  } catch { return null; }
+}
+
+// plain() a list item by item (audit #82): one unserialisable entry (a BigInt
+// field, a throwing getter) used to fail the whole plain() call, so a single
+// bad entry wiped the conversation's entire entry list to []. Bad items are
+// dropped; the rest survive.
+// The magic-byte signatures of the four accepted image types (audit #80).
+function imageMagicMatches(type, bytes) {
+  if (!Buffer.isBuffer(bytes)) return false;
+  if (type === 'image/png') return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  if (type === 'image/jpeg') return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (type === 'image/gif') { const head = bytes.subarray(0, 6).toString('ascii'); return head === 'GIF87a' || head === 'GIF89a'; }
+  if (type === 'image/webp') return bytes.length >= 12 && bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP';
+  return false;
+}
+
+function plainList(list) {
+  if (!Array.isArray(list)) return plain(list);
+  const out = [];
+  for (const item of list) {
+    if (item === null || item === undefined) { out.push(item ?? null); continue; }
+    const p = plain(item);
+    if (p !== null) { out.push(p); continue; }
+    // The item as a whole failed: salvage it field by field, so a single
+    // bad field costs that field, not the entry or the whole list.
+    if (typeof item === 'object') {
+      const salvaged = {};
+      for (const key of Object.keys(item)) {
+        try { const v = plain(item[key]); if (v !== null || item[key] === null) salvaged[key] = v; } catch {}
+      }
+      if (Object.keys(salvaged).length) { out.push(salvaged); continue; }
+    }
+    // Nothing salvageable: drop just this item.
+  }
+  return out;
+}
+
+// --- v3 git helpers (/api/changes) -------------------------------------------------------
+// Git is always run read-only, in the agent's cwd, through execFile with an argument
+// array (never a shell string), and file paths always go after a `--` separator.
+function gitRun(cwd, args, timeout = GIT_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    execFile('git', args, {cwd, timeout, maxBuffer: GIT_MAX_BUFFER, windowsHide: true, encoding: 'utf8'}, (err, stdout) => err ? reject(err) : resolve(stdout));
+  });
+}
+
+// Porcelain v1 -z: records are NUL-separated `XY <path>`; a rename/copy record carries
+// the DESTINATION in its own field and the source path as the NEXT NUL field.
+function parseStatusZ(text) {
+  const fields = String(text).split('\0'), out = [];
+  for (let i = 0; i < fields.length; i++) {
+    const rec = fields[i];
+    if (!rec) continue;
+    const xy = rec.slice(0, 2), filePath = rec.slice(3);
+    let origPath = null;
+    if (xy.includes('R') || xy.includes('C')) origPath = fields[++i] || null;
+    out.push({path: filePath, origPath, status: statusKind(xy)});
+  }
+  return out;
+}
+function statusKind(xy) {
+  if (xy === '??') return 'untracked';
+  if (xy.includes('R')) return 'renamed';
+  if (xy.includes('C') || xy.includes('A')) return 'added';
+  if (xy.includes('D')) return 'deleted';
+  return 'modified';
+}
+
+// diff --numstat -z: records are NUL-separated `<added>\t<deleted>\t<path>`; binary
+// files report `-` for both counts, and a rename reports an EMPTY path field followed
+// by the source and destination paths as the next two NUL fields.
+function parseNumstatZ(text) {
+  const fields = String(text).split('\0'), map = new Map();
+  for (let i = 0; i < fields.length; i++) {
+    const m = /^([^\t]+)\t([^\t]+)\t([\s\S]*)$/.exec(fields[i]);
+    if (!m) continue;
+    const counts = m[1] === '-' || m[2] === '-' ? null : {added: Number(m[1]) || 0, deleted: Number(m[2]) || 0};
+    if (m[3]) map.set(m[3], counts);
+    else { const dest = fields[i + 2]; if (dest) map.set(dest, counts); i += 2; }
+  }
+  return map;
+}
+
+class GuiServer {
+  // Injected like the /reload callback, so tests can drive it with fakes:
+  // {controller, agent, token, port} — token/port default to a fresh random token and an
+  // OS-assigned free port. discoveryFile / version are optional overrides (tests, embedding).
+  // v5 (remote/SERVER.md): {host} instead hosts every conversation of a SessionsHost;
+  // the unprefixed routes then point at the host's default conversation and the same
+  // routes also live under /api/s/:id/... per conversation. serverDiscoveryFile (or
+  // MUSER_SERVER_FILE) additionally writes ~/.muser/server.json; onStop backs
+  // POST /api/server/stop; accounts/recent providers are injectable for tests.
+  constructor({controller, agent, token, port, version, discoveryFile, host, serverDiscoveryFile, onStop, accountsProvider, recentProvider} = {}) {
+    if (!host && !controller) throw new Error('GuiServer needs a controller');
+    if (!host && !agent) throw new Error('GuiServer needs an agent');
+    this.host = host || null;
+    this.controller = controller || null;
+    this.agent = agent || null;
+    // Single-conversation mode wraps its pair as one entry, so every route below
+    // speaks of entries only. In host mode the entry is the host's default.
+    this.ownEntry = host ? null : {id: agent.session?.id || 'default', agent, controller, museName: controller.museName ?? null};
+    this.token = token || crypto.randomBytes(32).toString('hex');
+    this.requestedPort = port ?? 0;
+    this.port = null;
+    this.version = version ?? controller?.version ?? host?.defaultEntry()?.controller?.version ?? require('../package.json').version;
+    this.discoveryFile = discoveryFile || process.env.MUSER_GUI_FILE || defaultDiscoveryFile();
+    this.serverDiscoveryFile = serverDiscoveryFile || process.env.MUSER_SERVER_FILE || null;
+    this.onStop = onStop || null;
+    this.accountsProvider = accountsProvider || null;
+    this.recentProvider = recentProvider || null;
+    this.link = null; // src/link/link.js Link, attached by serve() once it is up (muser link)
+    this.clients = new Set(); // the default entry's SSE clients (kept for compat)
+    this.serverClients = new Set(); // /api/server/events clients
+    this.attached = new Map(); // entry -> {clients, unsubscribe}
+    this.server = null;
+    this._starting = null; // #64: the in-flight start() promise, shared by concurrent callers
+    this.eventsHeartbeatMs = 25000; // SSE keep-alive cadence; an open stream also touches its host entry (#61)
+    this.unsubscribe = null;
+    this.startedAt = null;
+    this._hostListener = null;
+  }
+  get url() { return 'http://127.0.0.1:' + this.port; }
+  defaultEntry() { return this.host ? this.host.defaultEntry() : this.ownEntry; }
+  resolveEntry(id) { return this.host ? this.host.get(id) : (this.ownEntry && this.ownEntry.id === id ? this.ownEntry : null); }
+  allEntries() { return this.host ? [...this.host.entries.values()] : [this.ownEntry]; }
+  state(entry) { const c = (entry || this.defaultEntry())?.controller; return c ? (c.s || c.get()) : {}; }
+
+  // The /api/state snapshot (docs/gui-protocol.md). Entries are the Controller's own entry
+  // objects (plain JSON, newest 200); approval is the pending request itself, minus the
+  // parts that cannot cross JSON (resolve, its expiry timer, the call's abort signal).
+  snapshot(entry, withEntries = true) {
+    if (entry === undefined || typeof entry === 'boolean') { withEntries = entry === undefined ? true : entry; entry = this.defaultEntry(); }
+    if (!entry) return {version: this.version, session: {id: null, turns: 0}, entries: withEntries ? [] : undefined};
+    const s = this.state(entry), a = entry.agent, ap = s.approval;
+    const snap = {
+      version: this.version,
+      cwd: a.cwd ?? null,
+      session: {id: a.session?.id ?? null, turns: a.session?.turns ?? 0, title: a.session?.title ?? null},
+      mode: s.mode ?? a.mode ?? null,
+      busy: !!s.busy,
+      queue: [...(s.queue || [])],
+      approval: ap ? plain({call: ap.call, preview: ap.preview ?? null, options: ap.options, index: ap.index ?? 0, outside: !!ap.outside}) : null,
+      shells: (s.shells || []).map(sh => ({id: sh.id, command: sh.command, running: !!sh.running})),
+      focus: s.focus ? plain(s.focus) : null,
+      todos: plain(s.todos) || [],
+      agents: plain(s.agents) || [],
+      plan: s.plan ? plain(s.plan) : null,
+      account: s.account ? plain(s.account) : null,
+      // Who the user works with (the TUI's Muse name, e.g. "kaguya") and the word Muse picked
+      // for its spinner this turn (spinner.set; null until it picks one).
+      muse: {name: entry.controller.museName ?? entry.museName ?? null},
+      spinnerWord: s.spinnerWord ?? null,
+      // v5: the Controller's pick-one menu (src/ui/controller.mjs openMenu), in a
+      // form that can cross JSON: options carry their plain values, and the pick
+      // itself stays server-side — POST .../menu {value} resolves it (see menuPick).
+      // Without this, /account, /settings, the quota choice and friends were
+      // visible in the TUI but unreachable from any other front-end.
+      menu: s.menu ? {
+        title: s.menu.title ?? null,
+        hint: s.menu.hint ?? null,
+        index: s.menu.index ?? 0,
+        current: plain(s.menu.current ?? null),
+        options: (s.menu.options || []).map(o => ({
+          value: plain(o?.value ?? null),
+          label: typeof o?.label === 'string' ? o.label : String(o?.value ?? ''),
+          ...(typeof o?.desc === 'string' ? {desc: o.desc} : {}),
+          ...(o?.danger ? {danger: true} : {}),
+          ...(o?.mark ? {mark: true} : {}),
+        })),
+      } : null,
+      // v6: the live bottom-of-screen state the TUI draws from (view.mjs) — a
+      // client front-end (the CLI as a client) needs the running call, the
+      // !command row, the stream tail and the status line, not just busy.
+      // The stream carries only its tail: partial can grow without bound.
+      live: {
+        // `table`: the reply's table lines held back until the table ends (md.mjs feed), only
+        // while there are some; bounded like partial.
+        stream: s.stream ? {id: s.stream.id ?? null, started: s.stream.started ?? null, partial: String(s.stream.partial ?? '').slice(-8192),
+          ...(s.stream.table?.length ? {table: s.stream.table.slice(-100).map(l => String(l).slice(0, 2000))} : {})} : null,
+        running: plain(s.running),
+        bangRunning: plain(s.bangRunning),
+        status: s.status ?? '',
+        activity: s.activity ?? '',
+        museRunning: s.museRunning ?? '',
+        agentWords: plain(s.agentWords) ?? [],
+        turnStart: s.turnStart ?? 0,
+        flash: s.flash ?? '',
+        deviceOk: !!s.deviceOk,
+        loginNeeded: !!s.loginNeeded,
+      },
+      // v6: approvals waiting behind the one on screen (Controller.pending,
+      // ask() queues there while an approval or a reason prompt is open).
+      approvalQueue: entry.controller.pending?.length ?? 0,
+      reasonFor: !!s.reasonFor,
+      // v6: the pending numeric input (limitKey), picked down to the fields a
+      // client renders — text is the current edit buffer; back/done/limits and
+      // the other closures stay server-side (POST /limit answers it).
+      limitInput: s.limitInput ? plain({key: s.limitInput.key, label: s.limitInput.label, text: s.limitInput.text, min: s.limitInput.min, max: s.limitInput.max, hint: s.limitInput.hint}) : null,
+      clientStatus: a.client?.status ?? null,
+      device: {name: a.constructor?.DEVICE ?? null, slot: a.nodeSlot?.slot ?? null, connected: !!a.device?.connected},
+      update: s.update ? plain(s.update) : null,
+    };
+    if (withEntries) snap.entries = plainList((s.entries || []).slice(-MAX_ENTRIES));
+    return snap;
+  }
+
+  // Audit #64: the http server used to be assigned to this.server BEFORE
+  // listen() succeeded, so a listen error (port in use) left this.server set
+  // and every later start() silently "succeeded" without listening — a retry
+  // was impossible. A concurrent start() likewise returned at once with
+  // this.port still null. Now one in-flight attempt is shared by concurrent
+  // callers, and a failed attempt clears its state so start() can be retried.
+  start() {
+    if (this.server && this.port) return Promise.resolve(this);
+    if (this._starting) return this._starting;
+    const starting = (async () => {
+    const server = http.createServer((req, res) => {
+      this.handle(req, res).catch(() => {
+        try { if (!res.headersSent) res.writeHead(500, {'content-type': 'application/json'}); res.end(JSON.stringify({error: 'internal error'})); } catch {}
+      });
+    });
+    this.server = server;
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(this.requestedPort, '127.0.0.1', resolve);
+      });
+    } catch (e) {
+      if (this.server === server) this.server = null;
+      try { server.close(() => {}); } catch {}
+      throw e;
+    }
+    this.port = server.address().port;
+    this.startedAt = Date.now();
+    for (const entry of this.allEntries()) this.attachEntry(entry);
+    if (this.host) {
+      this._hostListener = event => {
+        if (event?.type === 'session-opened') { const e = this.host.get(event.sessionId); if (e) this.attachEntry(e); }
+        if (event?.type === 'session-closed') this.detachEntry(event.sessionId);
+        this.broadcastServerEvent(event);
+      };
+      this.host.on('event', this._hostListener);
+    }
+    this.writeDiscovery();
+    return this;
+    })();
+    this._starting = starting;
+    const clearStarting = () => { if (this._starting === starting) this._starting = null; };
+    starting.then(clearStarting, clearStarting);
+    return starting;
+  }
+
+  // Per-entry SSE bookkeeping: each hosted conversation forwards its own
+  // Controller changes to its own /api/s/:id/events (or /api/events) clients.
+  attachEntry(entry) {
+    if (!entry || this.attached.has(entry)) return;
+    const att = {clients: new Set(), unsubscribe: null};
+    if (entry === this.defaultEntry()) this.clients = att.clients;
+    att.unsubscribe = typeof entry.controller?.subscribe === 'function' ? entry.controller.subscribe(() => this.onControllerChange(entry, att)) : null;
+    this.attached.set(entry, att);
+  }
+  detachEntry(id) {
+    for (const [entry, att] of [...this.attached]) {
+      if (entry.id !== id) continue;
+      if (att.unsubscribe) { try { att.unsubscribe(); } catch {} }
+      for (const client of [...att.clients]) this.dropClient(client, att);
+      this.attached.delete(entry);
+    }
+  }
+
+  async close() {
+    if (this.host && this._hostListener) { try { this.host.removeListener('event', this._hostListener); } catch {} this._hostListener = null; }
+    for (const [, att] of [...this.attached]) {
+      if (att.unsubscribe) { try { att.unsubscribe(); } catch {} att.unsubscribe = null; }
+      for (const client of [...att.clients]) this.dropClient(client, att);
+    }
+    this.attached.clear();
+    for (const client of [...this.serverClients]) this.dropServerClient(client);
+    this.removeDiscovery();
+    if (this.server) {
+      const server = this.server; this.server = null;
+      await new Promise(resolve => { server.close(() => resolve()); server.closeAllConnections?.(); });
+    }
+  }
+
+  // Audit #65 (gui-server side): whether a discovery file already belongs to
+  // a DIFFERENT process that is still alive. probeServer (discovery.js) now
+  // retries before calling a server dead, but a rival that still reaches
+  // start() must not overwrite the live server's file here — that overwrite
+  // orphaned the real server (discovery, and with it `server stop`, pointed
+  // at the rival). Same ownership test removeDiscoveryFile() already uses.
+  discoveryOwnedByLiveOther(file) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!data || typeof data.pid !== 'number' || data.pid === process.pid) return false;
+      try { process.kill(data.pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+    } catch { return false; }
+  }
+  writeDiscoveryFile(file, data) {
+    if (this.discoveryOwnedByLiveOther(file)) return;
+    try {
+      fs.mkdirSync(path.dirname(file), {recursive: true});
+      const tmp = file + '.tmp-' + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(data));
+      fs.renameSync(tmp, file);
+    } catch {}
+  }
+  // ~/.muser/gui.json, written atomically (temp + rename) so a reader never sees half a file.
+  // v5 adds ~/.muser/server.json ({pid, port, token, version, startedAt}) for the
+  // resident server: `muser server status/stop` and the second-serve attach read it.
+  writeDiscovery() {
+    const def = this.defaultEntry();
+    this.writeDiscoveryFile(this.discoveryFile, {pid: process.pid, port: this.port, token: this.token, cwd: def?.agent?.cwd ?? null, sessionId: def?.agent?.session?.id ?? null, startedAt: this.startedAt});
+    if (this.serverDiscoveryFile) this.writeDiscoveryFile(this.serverDiscoveryFile, {pid: process.pid, port: this.port, token: this.token, version: this.version, startedAt: this.startedAt});
+  }
+  removeDiscoveryFile(file) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (data.token === this.token && data.pid === process.pid) fs.unlinkSync(file);
+    } catch {}
+  }
+  removeDiscovery() {
+    this.removeDiscoveryFile(this.discoveryFile);
+    if (this.serverDiscoveryFile) this.removeDiscoveryFile(this.serverDiscoveryFile);
+  }
+
+  authorized(req) {
+    const header = req.headers.authorization || '';
+    const expected = Buffer.from('Bearer ' + this.token), given = Buffer.from(header);
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+  }
+
+  async handle(req, res) {
+    if (!this.authorized(req)) return this.json(res, 401, {error: 'unauthorized'});
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const p = url.pathname;
+    // v5 server-wide routes (remote/SERVER.md): about the server itself, not one
+    // conversation. They answer in single-conversation mode too (one session),
+    // except the session-opening ones, which need a SessionsHost.
+    if (req.method === 'GET' && p === '/api/server') return this.json(res, 200, this.serverInfo());
+    if (req.method === 'GET' && p === '/api/server/events') return this.serverEvents(req, res);
+    if (req.method === 'POST' && p === '/api/server/stop') {
+      await this.readBody(req, res).catch(() => {});
+      if (!this.onStop) return this.json(res, 501, {error: 'stop is not available'});
+      this.json(res, 200, {ok: true});
+      setTimeout(() => { Promise.resolve(this.onStop()).catch(() => {}); }, 10).unref?.();
+      return;
+    }
+    // muser link (remote/DESIGN.md): pairing and paired-device management for
+    // the phone link running inside this server. Local token only, like the rest.
+    if (req.method === 'GET' && p === '/api/server/link') {
+      if (!this.link) return this.json(res, 501, {error: 'link is not running'});
+      return this.json(res, 200, {link: this.linkState()});
+    }
+    if (req.method === 'POST' && p === '/api/server/link/pair') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (!this.link) return this.json(res, 501, {error: 'link is not running'});
+      const mode = body.mode === 'wifi' ? 'wifi' : 'qr';
+      try {
+        const {code, expiresAt} = this.link.startPairing({mode});
+        const {buildPairPayload} = require('./link/link');
+        const payload = mode === 'qr' ? buildPairPayload({pcId: this.link.pcId, staticPub: this.link.keys.noise.publicKey, relay: this.link.relayUrl, code, name: require('node:os').hostname(), lan: this.link.lanAddresses()}) : null;
+        return this.json(res, 200, {mode, code, expiresAt, payload});
+      } catch (e) { return this.json(res, 400, {error: e.message}); }
+    }
+    if (req.method === 'POST' && p === '/api/server/link/revoke') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (!this.link) return this.json(res, 501, {error: 'link is not running'});
+      const target = body.id || body.name;
+      if (!target) return this.json(res, 400, {error: 'id or name is required'});
+      const removed = this.link.remoteStore.remove(String(target));
+      return this.json(res, removed ? 200 : 404, removed ? {ok: true} : {error: 'no such device'});
+    }
+    if (req.method === 'GET' && p === '/api/sessions') return this.sessionList(url, res);
+    if (req.method === 'POST' && p === '/api/sessions') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (!this.host) return this.json(res, 501, {error: 'session hosting is not enabled'});
+      try { const entry = await this.host.openNew({cwd: body.cwd, account: body.account, mode: body.mode}); return this.json(res, 201, {id: entry.id}); }
+      catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
+    }
+    const openMatch = /^\/api\/sessions\/([^/]+)\/open$/.exec(p);
+    if (req.method === 'POST' && openMatch) {
+      await this.readBody(req, res).catch(() => {});
+      if (!this.host) return this.json(res, 501, {error: 'session hosting is not enabled'});
+      try { const entry = await this.host.openExisting(decodeURIComponent(openMatch[1])); return this.json(res, 200, {id: entry.id}); }
+      catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
+    }
+    const closeMatch = /^\/api\/sessions\/([^/]+)\/close$/.exec(p);
+    if (req.method === 'POST' && closeMatch) {
+      await this.readBody(req, res).catch(() => {});
+      if (!this.host) return this.json(res, 501, {error: 'session hosting is not enabled'});
+      try { this.host.close(decodeURIComponent(closeMatch[1])); return this.json(res, 200, {ok: true}); }
+      catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
+    }
+    // Per-conversation routes: /api/s/:id/... names a conversation; the unprefixed
+    // routes (v1-v4) keep pointing at the default conversation, unchanged.
+    const sMatch = /^\/api\/s\/([^/]+)(\/.*)$/.exec(p);
+    if (sMatch) {
+      const entry = this.resolveEntry(decodeURIComponent(sMatch[1]));
+      if (!entry) return this.json(res, 404, {error: 'unknown session'});
+      return this.dispatch(entry, req, res, url, '/api' + sMatch[2]);
+    }
+    const entry = this.defaultEntry();
+    if (!entry) return this.json(res, 404, {error: 'no conversation open'});
+    return this.dispatch(entry, req, res, url, p);
+  }
+
+  // Everything one conversation answers (the v1-v4 routes, plus v5's menu pick),
+  // against one hosted entry.
+  async dispatch(entry, req, res, url, p) {
+    // Audit #61: "used" used to mean ANY request reaching here, at its start
+    // only. Observation is not use: a forgotten GET poller (state/entries/…)
+    // refreshed the idle timer forever, while a conversation watched only
+    // through its long-lived SSE stream was never touched again after the
+    // stream opened and was idle-closed at 30 min. Actions (every POST)
+    // touch; the SSE stream touches for as long as it stays open (events()).
+    if (req.method !== 'GET') this.host?.touch(entry.id);
+    const controller = entry.controller, agent = entry.agent;
+    if (req.method === 'GET' && p === '/api/state') return this.json(res, 200, this.snapshot(entry, true));
+    if (req.method === 'GET' && p === '/api/events') return this.events(entry, req, res);
+    if (req.method === 'GET' && p === '/api/complete') return this.complete(entry, url, res);
+    if (req.method === 'GET' && p === '/api/changes') return this.changes(entry, url, res);
+    if (req.method === 'GET' && p === '/api/muse-avatar') return this.museAvatar(entry, res, url.searchParams.get('video'));
+    if (req.method === 'GET' && p === '/api/outputs') return this.outputs(entry, url, res);
+    if (req.method === 'GET' && p === '/api/entries') return this.entriesPage(entry, url, res);
+    if (req.method === 'POST' && p === '/api/send') {
+      // v6: this route alone gets the bigger body cap — base64 images ride in it.
+      const body = await this.readBody(req, res, SEND_MAX_BODY); if (body === null) return;
+      if (body.text !== undefined && typeof body.text !== 'string') return this.json(res, 400, {error: 'text must be a string'});
+      const text = typeof body.text === 'string' ? body.text : '';
+      let attachments = null;
+      if (body.attachments !== undefined) {
+        attachments = this.validateAttachments(body.attachments);
+        if (!attachments) return this.json(res, 400, {error: 'attachments must be at most 8 images (image/png, image/jpeg, image/gif or image/webp, base64, 11 MB total)'});
+      }
+      const hasAttachments = !!(attachments && attachments.length);
+      // Audit #77: an image-only send is valid — the Controller itself falls
+      // back to its "look at this image" wording for a text-less turn.
+      if (!text.trim() && !hasAttachments) return this.json(res, 400, {error: 'text is required'});
+      const st0 = this.state(entry);
+      // Audit #79: a busy submit whose queue is already full (Controller
+      // MAX_QUEUE = 5) is dropped by submit() with only a flash — the API
+      // must not answer 202 for a message it knows will never be queued.
+      if (st0?.busy && Array.isArray(st0.queue) && st0.queue.length >= 5) return this.json(res, 409, {error: 'queue is full'});
+      // Audit #78: attachments are consumed only by the plain-message path
+      // of submit() (not busy, no prompt pending, not a slash/! command, not
+      // mid account-add). Writing them into the shared state for any other
+      // path left them attached to the NEXT unrelated send, and an empty
+      // list wiped images the TUI had prepared — so an empty list is a
+      // no-op here, and a non-empty one on a non-consuming path is refused
+      // instead of being silently parked in the shared state.
+      const consuming = !st0?.busy && !st0?.promptFor && !controller.addingAccount && !text.startsWith('/') && !text.trimStart().startsWith('!');
+      if (hasAttachments && !consuming) return this.json(res, 400, {error: 'attachments can only be sent with a new message (not while busy, answering a prompt, or as a command)'});
+      // The attachments land in the Controller's send state immediately before
+      // submit, exactly where the TUI's attach() puts them: submit() reads
+      // s.attachments and clears them as the turn starts.
+      let prevAttachments;
+      if (hasAttachments) {
+        prevAttachments = st0?.attachments;
+        if (typeof controller.set === 'function') controller.set({attachments}); else if (st0) st0.attachments = attachments;
+      }
+      // Not awaited to completion: submit() resolves only when the whole
+      // turn ends, and the TUI fires it the same way from its key handler.
+      // Audit #79 (second half): a submit that fails at once — a synchronous
+      // throw or an immediately rejected promise — must not still answer
+      // 202, so the promise is watched for one tick before answering; a
+      // rejection after that belongs to the turn and is only swallowed.
+      let submitError = null, submitPromise = null;
+      try { submitPromise = Promise.resolve(controller.submit(text)); } catch (e) { submitError = e; }
+      if (submitPromise) {
+        submitPromise.catch(e => { if (!submitError) submitError = e; });
+        if (!submitError) await new Promise(r => setImmediate(r));
+      }
+      if (submitError) {
+        if (hasAttachments) { if (typeof controller.set === 'function') controller.set({attachments: prevAttachments || []}); else if (st0) st0.attachments = prevAttachments || []; }
+        return this.json(res, 500, {error: 'send failed: ' + (submitError.message || String(submitError))});
+      }
+      return this.json(res, 202, {ok: true});
+    }
+    if (req.method === 'POST' && p === '/api/approval') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      return this.approval(entry, body.decision, res);
+    }
+    if (req.method === 'POST' && p === '/api/mode') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      // Only the mode names themselves (src/policy.js MODES, the names the TUI shows);
+      // modeFrom's typed aliases (auto, yolo, ...) are not accepted here.
+      if (typeof body.mode !== 'string' || !MODES.includes(body.mode)) return this.json(res, 400, {error: 'mode must be one of: ' + MODES.join(', ')});
+      if (typeof controller.setMode !== 'function') return this.json(res, 500, {error: 'setMode is not available'});
+      controller.setMode(body.mode);
+      return this.json(res, 200, {ok: true, mode: body.mode});
+    }
+    if (req.method === 'POST' && p === '/api/menu') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (body?.cancel === true) return this.menuCancel(entry, res);
+      return this.menuPick(entry, body, res);
+    }
+    if (req.method === 'POST' && p === '/api/limit') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      return this.limitAnswer(entry, body, res);
+    }
+    if (req.method === 'POST' && p === '/api/interrupt') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      // v6: target picks what stops — 'turn' (no body / the v1 behaviour) is
+      // agent.interrupt(), 'bang' aborts only the running !command through
+      // the Controller's bangStop, 'all' does both.
+      const target = body?.target ?? 'turn';
+      if (target !== 'turn' && target !== 'bang' && target !== 'all') return this.json(res, 400, {error: 'target must be turn, bang or all'});
+      if (target === 'turn' || target === 'all') {
+        if (typeof agent.interrupt !== 'function') return this.json(res, 500, {error: 'interrupt is not available'});
+        Promise.resolve(agent.interrupt()).catch(() => {});
+      }
+      if (target === 'bang' || target === 'all') { try { controller.bangStop?.abort(); } catch {} }
+      return this.json(res, 200, {ok: true, target});
+    }
+    if (req.method === 'POST' && p === '/api/shell-kill') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (typeof body.id !== 'string' || !body.id) return this.json(res, 400, {error: 'id is required'});
+      try { const r = agent.shells.kill(body.id); return this.json(res, 200, {ok: true, ...r}); }
+      catch (e) { return this.json(res, 404, {error: e.message}); }
+    }
+    return this.json(res, 404, {error: 'not found'});
+  }
+
+  // GET /api/server (v5): the resident server itself — version, pid, start time,
+  // the open conversations, the default conversation's Muse, and the accounts.
+  serverInfo() {
+    const def = this.defaultEntry();
+    let sessions;
+    if (this.host) sessions = this.host.list();
+    else if (def) { const s = this.state(def); sessions = [{id: def.id, cwd: def.agent.cwd ?? null, turns: def.agent.session?.turns ?? 0, mode: s.mode ?? def.agent.mode ?? null, busy: !!s.busy, approval: !!s.approval, account: def.agent.accountId ?? null, accountLabel: def.agent.accountLabel ?? null, museName: def.controller.museName ?? null, isDefault: true}]; }
+    else sessions = [];
+    let accounts = [];
+    try {
+      if (this.accountsProvider) accounts = this.accountsProvider() || [];
+      else { const a = require('./accounts'); const active = a.activeId(); accounts = a.list().map(x => ({id: x.id, label: x.label, active: x.id === active})); }
+    } catch {}
+    return {protocol: 6, version: this.version, pid: process.pid, startedAt: this.startedAt, port: this.port, sessions, muse: {name: def?.controller?.museName ?? def?.museName ?? null}, accounts, link: this.linkState()};
+  }
+
+  // The link as the local API may show it: state() carries the pairing code for
+  // the pairing flow, but the standing /api/server view must not — a code is a
+  // credential. Device entries likewise lose their static keys here.
+  linkState() {
+    if (!this.link) return null;
+    try {
+      const s = this.link.state();
+      return {...s, pairing: s.pairing ? {mode: s.pairing.mode, expiresAt: s.pairing.expiresAt, attempts: s.pairing.attempts} : null, devices: (s.devices || []).map(d => ({id: d.id, name: d.name, createdAt: d.createdAt, lastSeen: d.lastSeen}))};
+    } catch { return null; }
+  }
+
+  // GET /api/sessions?cwd=&limit= (v5): the stored conversations (src/sessions.js
+  // recent), each marked with whether it is open here, and busy when it is.
+  sessionList(url, res) {
+    const cwd = url.searchParams.get('cwd') || undefined;
+    const limitRaw = Number(url.searchParams.get('limit'));
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
+    let recent;
+    try { recent = this.recentProvider ? this.recentProvider(cwd) : require('./sessions').recent(cwd); }
+    catch (e) { return this.json(res, 500, {error: e.message}); }
+    const sessions = (recent || []).slice(0, limit).map(s => {
+      const entry = this.resolveEntry(s.id);
+      return {id: s.id, cwd: s.cwd ?? null, title: s.title || '', turns: s.turns ?? 0, created: s.created ?? null, updated: s.updated ?? null, account: s.account ?? null, open: !!entry, busy: entry ? !!this.state(entry).busy : false};
+    });
+    return this.json(res, 200, {sessions});
+  }
+
+  // POST .../menu {value} or {index} (v5): pick from the menu in the snapshot.
+  // Exactly the TUI's menuKey pick (controller.mjs): the menu closes first, then
+  // its pick() runs with the chosen option's own value — closures never cross.
+  menuPick(entry, body, res) {
+    const controller = entry.controller, s = this.state(entry), menu = s?.menu;
+    if (!menu) return this.json(res, 409, {error: 'no menu open'});
+    const options = menu.options || [];
+    let index = -1;
+    if (Number.isInteger(body?.index)) index = body.index;
+    else if (body && 'value' in body) {
+      const wanted = JSON.stringify(plain(body.value));
+      const matches = [];
+      options.forEach((o, i) => { if (JSON.stringify(plain(o?.value ?? null)) === wanted) matches.push(i); });
+      // Audit #73: plain() collapses values JSON cannot tell apart
+      // (undefined / a function / a circular object / a BigInt all become
+      // null), so several distinct options can share one wire value.
+      // Picking the first would pick a different option than the client
+      // meant — an ambiguous value is refused, never guessed.
+      if (matches.length > 1) return this.json(res, 400, {error: 'menu value is ambiguous; pick by index'});
+      index = matches.length ? matches[0] : -1;
+    }
+    if (index < 0 || index >= options.length) return this.json(res, 400, {error: 'no such menu option'});
+    if (typeof controller.set === 'function') controller.set({menu: null}); else s.menu = null;
+    // Audit #74: the menu used to be consumed before pick() ran, so a
+    // synchronous throw from pick() left a 500 with the menu already gone
+    // (and its cancel() never called). A throwing pick restores the menu,
+    // so the client can still pick again or cancel it.
+    let picked;
+    try { picked = menu.pick(options[index].value); }
+    catch (e) {
+      if (typeof controller.set === 'function') controller.set({menu}); else s.menu = menu;
+      return this.json(res, 500, {error: e.message});
+    }
+    Promise.resolve(picked).catch(() => {});
+    return this.json(res, 200, {ok: true, index});
+  }
+
+  // POST .../menu {cancel: true} (v6): close the open menu the way the TUI's
+  // Esc does (menuKey's escape branch) — Controller.cancelMenu() is that
+  // branch; the fallback mirrors it for a controller without the method.
+  menuCancel(entry, res) {
+    const controller = entry.controller, s = this.state(entry), menu = s?.menu;
+    if (!menu) return this.json(res, 409, {error: 'no menu open'});
+    if (typeof controller.cancelMenu === 'function') controller.cancelMenu();
+    else {
+      if (typeof controller.set === 'function') controller.set({menu: null}); else s.menu = null;
+      menu.cancel?.();
+    }
+    return this.json(res, 200, {ok: true});
+  }
+
+  // POST /limit {value} or {cancel: true} (v6): answer the pending limitInput
+  // through Controller.answerLimit — the same code path as limitKey's
+  // return/escape, so validation and the back/done fallbacks cannot drift.
+  limitAnswer(entry, body, res) {
+    const controller = entry.controller, s = this.state(entry);
+    if (!s?.limitInput) return this.json(res, 409, {error: 'no limit input pending'});
+    if (typeof controller.answerLimit !== 'function') return this.json(res, 500, {error: 'limit input is not available'});
+    // Audit #75: a client answering a dialog it saw earlier must name the
+    // input it means — without the key check, a stale dialog's answer (or
+    // cancel) landed on whatever NEW limit input had opened since.
+    if (body?.key !== undefined && body.key !== s.limitInput.key) return this.json(res, 409, {error: 'limit input has changed'});
+    if (body?.cancel === true) { controller.answerLimit(null); return this.json(res, 200, {ok: true}); }
+    if (typeof body?.value !== 'number' || !Number.isFinite(body.value)) return this.json(res, 400, {error: 'value must be a number'});
+    // Audit #76: non-integers and integers JSON cannot represent exactly
+    // are their own error, not "out of range" — 1.5 used to be reported as
+    // a range failure, and an unsafe integer arrives already rounded by
+    // JSON.parse, so it is refused here instead of silently applying a
+    // different value through a lenient answerLimit.
+    if (!Number.isSafeInteger(body.value)) return this.json(res, 400, {error: 'value must be a safe integer'});
+    if (controller.answerLimit(body.value) === false) return this.json(res, 400, {error: 'value is out of range'});
+    return this.json(res, 200, {ok: true, value: body.value});
+  }
+
+  // GET /entries?before=<entryId>&limit=<n> (v6): one page of the Controller's
+  // FULL entry list, older than the snapshot's newest-200 window. Entries are
+  // strictly before the entry whose id is `before` (the newest page when it
+  // is absent), in the list's own newest-last order; hasMore says older ones
+  // remain. An unknown `before` id is a 404 — paging from a position the
+  // server no longer holds would silently return the wrong page.
+  entriesPage(entry, url, res) {
+    const all = this.state(entry).entries || [];
+    const limitRaw = Number(url.searchParams.get('limit'));
+    // Audit #81: floor() turned limit=0.5 into 0, which paged as
+    // {entries: [], hasMore: true} forever — a positive limit is at least 1.
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.max(Math.floor(limitRaw), 1), 500) : 200;
+    const before = url.searchParams.get('before');
+    let end = all.length;
+    if (before !== null) {
+      const idx = all.findIndex(e => String(e?.id) === before);
+      if (idx < 0) return this.json(res, 404, {error: 'unknown entry'});
+      end = idx;
+    }
+    const start = Math.max(0, end - limit);
+    return this.json(res, 200, {entries: plainList(all.slice(start, end)), hasMore: start > 0});
+  }
+
+  // v6 /send attachments, in the Controller's own attachment shape
+  // (src/clipboard.js attachment(): {name, type, size, data} with base64
+  // data). Returns the validated list, or null for anything off-spec.
+  validateAttachments(list) {
+    if (!Array.isArray(list) || list.length > ATTACH_MAX_COUNT) return null;
+    let total = 0;
+    const out = [];
+    for (const item of list) {
+      if (!item || typeof item !== 'object' || !ATTACH_TYPES.has(item.type)) return null;
+      if (typeof item.data !== 'string' || !item.data || item.data.length % 4 === 1 || !/^[A-Za-z0-9+/]+={0,2}$/.test(item.data)) return null;
+      const bytes = Buffer.from(item.data, 'base64');
+      const size = bytes.length;
+      total += size;
+      if (total > ATTACH_MAX_TOTAL) return null;
+      // Audit #80: the declared MIME used to be the only check, so any
+      // bytes at all could be stored and forwarded as image/png. The
+      // magic bytes must agree with the declared type.
+      if (!imageMagicMatches(item.type, bytes)) return null;
+      out.push({name: typeof item.name === 'string' && item.name ? item.name : 'image', type: item.type, size, data: item.data});
+    }
+    return out;
+  }
+
+  // GET /api/server/events (v5): the server-wide SSE stream the phone's
+  // notifications are built from — session open/close, busy start/end, and
+  // approval pending/cleared, as {kind: 'event', event: {...}} after an initial
+  // {kind: 'server', server} snapshot.
+  serverEvents(req, res) {
+    res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no'});
+    const client = {res, heartbeat: null};
+    try { res.write('data: ' + JSON.stringify({kind: 'server', server: this.serverInfo()}) + '\n\n'); } catch {}
+    client.heartbeat = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 25000);
+    client.heartbeat.unref?.();
+    this.serverClients.add(client);
+    req.on('close', () => this.dropServerClient(client));
+  }
+  dropServerClient(client) {
+    if (!this.serverClients.delete(client)) return;
+    if (client.heartbeat) clearInterval(client.heartbeat);
+    try { client.res.end(); } catch {}
+  }
+  broadcastServerEvent(event) {
+    if (!event) return;
+    for (const client of [...this.serverClients]) {
+      try { client.res.write('data: ' + JSON.stringify({kind: 'event', event}) + '\n\n'); } catch { this.dropServerClient(client); }
+    }
+  }
+
+  // Resolve the pending approval with exactly the values the TUI resolves Controller.ask()
+  // with (src/ui/controller.mjs): answer() -> {allow: true, always: <key|null>} (choosing
+  // the auto-edit option also switches the mode first), submitReason() ->
+  // {allow: false, reason: <text>}, esc in the approval box -> {allow: false}.
+  approval(entry, decision, res) {
+    const d = decision;
+    if (!d || typeof d !== 'object' || typeof d.allow !== 'boolean') return this.json(res, 400, {error: 'decision.allow (boolean) is required'});
+    if (d.reason !== undefined && typeof d.reason !== 'string') return this.json(res, 400, {error: 'decision.reason must be a string'});
+    const s = this.state(entry), a = s.approval;
+    // A client that does not know the option keys (the C# shell) sends always: true for
+    // its "always" button: translate it to the pending approval's own always option —
+    // its key, or the auto-edit option (marked on the decision for the branch below) —
+    // which is exactly what choosing that option in the TUI resolves with.
+    if (d.always === true) {
+      const opts = a?.options || [];
+      const keyed = opts.find(o => o && typeof o.always === 'string');
+      if (keyed) d.always = keyed.always;
+      else if (opts.some(o => o && o.autoEdit)) { d.always = null; d.autoEdit = true; }
+      else d.always = null;
+    }
+    if (d.always !== undefined && d.always !== null && typeof d.always !== 'string') return this.json(res, 400, {error: 'decision.always must be a string or null'});
+    if (!a) {
+      // The TUI already took the decline and is waiting for its reason text: that wait is
+      // Controller.submitReason, and a GUI decision with a reason completes it.
+      if (s.reasonFor && typeof entry.controller.submitReason === 'function') {
+        // Audit #72: ANY decision used to complete the reason wait with an
+        // empty reason — including {allow: true}, which never declined
+        // anything. Only a decline decision may answer a reason prompt.
+        if (d.allow !== false) return this.json(res, 400, {error: 'only a decline decision can answer a reason prompt'});
+        entry.controller.submitReason(typeof d.reason === 'string' ? d.reason : '');
+        return this.json(res, 200, {ok: true});
+      }
+      return this.json(res, 409, {error: 'no approval pending'});
+    }
+    // The always key is the PENDING approval's to offer, not the client's to invent:
+    // any string used to be accepted, so an API caller could hand itself a key that
+    // was never asked about ('edit', or another command's exec key) and have it
+    // remembered (audit #70). The auto-edit option is the approval's to offer too.
+    const offeredAlways = new Set((a.options || []).filter(o => o && typeof o.always === 'string').map(o => o.always));
+    if (typeof d.always === 'string' && !offeredAlways.has(d.always)) return this.json(res, 400, {error: 'decision.always is not an option for this approval'});
+    if (d.autoEdit && !(a.options || []).some(o => o && o.autoEdit)) return this.json(res, 400, {error: 'decision.autoEdit is not an option for this approval'});
+    const resolved = d.allow ? {allow: true, always: d.always || null} : d.reason !== undefined ? {allow: false, reason: d.reason} : {allow: false};
+    if (d.allow && d.autoEdit && entry.agent.mode === 'default' && typeof entry.controller.setMode === 'function') entry.controller.setMode('auto-edit');
+    // The same state clearing answer()/approvalKey() do, then the next queued approval opens.
+    if (typeof entry.controller.set === 'function') entry.controller.set({approval: null, ...(resolved.allow && a.call?.agent === 'main' ? {running: {call: a.call, tail: []}} : {})});
+    else s.approval = null;
+    a.resolve(resolved);
+    entry.controller.nextApproval?.();
+    return this.json(res, 200, {ok: true});
+  }
+
+  // GET /api/complete (docs/gui-protocol.md v2): the same candidates the TUI offers.
+  // kind=slash reuses Controller.slashList (the ↑↓ candidate source; descriptions are
+  // looked up in that same COMMANDS table, loaded lazily — never a copy of the list).
+  // kind=file reuses mentions.complete, the @ completion machinery: it answers from its
+  // cache synchronously and only kicks off a background refresh, so a cold or stale
+  // cache yields [] (or the stale list) instead of blocking the request.
+  async complete(entry, url, res) {
+    const kind = url.searchParams.get('kind');
+    const q = url.searchParams.get('q') ?? '';
+    if (kind === 'slash') {
+      if (typeof entry.controller.slashList !== 'function') return this.json(res, 500, {error: 'slash completion is not available'});
+      const names = entry.controller.slashList(q) || [];
+      const descs = await this.commandDescriptions();
+      return this.json(res, 200, {items: names.map(text => { const item = {text}; const desc = descs.get(text); if (typeof desc === 'string') item.desc = desc; return item; })});
+    }
+    if (kind === 'file') {
+      const list = mention.complete(q, entry.agent.cwd, mention.COMPLETE_LIMIT) || [];
+      return this.json(res, 200, {items: list.map(text => ({text}))});
+    }
+    return this.json(res, 400, {error: 'kind must be slash or file'});
+  }
+
+  // name -> description from controller.mjs's COMMANDS (the single definition), cached.
+  // Best-effort: if the module cannot load, candidates simply carry no desc.
+  commandDescriptions() {
+    if (!this._commandDescs) this._commandDescs = import('./ui/controller.mjs').then(m => new Map(m.COMMANDS || [])).catch(() => new Map());
+    return this._commandDescs;
+  }
+
+  // GET /api/changes (docs/gui-protocol.md v3): the changed-files list for the agent's
+  // cwd, or one file's diff with ?file=<path>. Line counts come from a single
+  // `diff --numstat -z HEAD` (staged + unstaged together); untracked and binary files
+  // carry null counts, and the totals sum only the non-null values.
+  async changedFiles(cwd) {
+    if (!cwd || typeof cwd !== 'string') return null;
+    let inside;
+    try { inside = (await gitRun(cwd, ['rev-parse', '--is-inside-work-tree'])).trim(); } catch { return null; }
+    if (inside !== 'true') return null;
+    let branch = null;
+    try { branch = (await gitRun(cwd, ['symbolic-ref', '--short', '-q', 'HEAD'])).trim() || null; } catch { branch = null; }
+    let parsed;
+    try { parsed = parseStatusZ(await gitRun(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])); } catch { return null; }
+    const counts = await this.numstatMap(cwd);
+    const files = parsed.map(f => {
+      if (f.status === 'untracked') return {...f, added: null, deleted: null};
+      const c = counts.get(f.path);
+      if (c === null) return {...f, added: null, deleted: null}; // binary
+      if (c) return {...f, added: c.added, deleted: c.deleted};
+      return {...f, added: 0, deleted: 0};
+    });
+    return {branch, files};
+  }
+
+  // Whether HEAD names a commit at all. The staged+unstaged fallbacks in
+  // numstatMap()/changes() exist ONLY for an unborn HEAD (audit #86): they
+  // used to fire on ANY git error, so a failing `diff HEAD` in a normal
+  // repo was silently replaced by the sum of two partial diffs, double-
+  // counting files that are both staged and modified.
+  async headExists(cwd) {
+    try { await gitRun(cwd, ['rev-parse', '--verify', '-q', 'HEAD']); return true; } catch { return false; }
+  }
+
+  async numstatMap(cwd) {
+    try { return parseNumstatZ(await gitRun(cwd, ['diff', '--numstat', '-z', 'HEAD'])); } catch {}
+    if (await this.headExists(cwd)) return new Map();
+    // No HEAD yet (unborn branch): staged and unstaged diffs separately, summed.
+    const merged = new Map();
+    for (const args of [['diff', '--cached', '--numstat', '-z'], ['diff', '--numstat', '-z']]) {
+      let part;
+      try { part = parseNumstatZ(await gitRun(cwd, args)); } catch { continue; }
+      for (const [p, c] of part) {
+        if (!merged.has(p)) { merged.set(p, c); continue; }
+        const prev = merged.get(p);
+        merged.set(p, prev === null || c === null ? null : {added: prev.added + c.added, deleted: prev.deleted + c.deleted});
+      }
+    }
+    return merged;
+  }
+
+  // GET /api/muse-avatar[?video=idle|working|...]: the image (or one of the looping videos)
+  // the user set for their Muse on muse.ai (identity.avatar), read through the chat gateway's
+  // workspace files (/fs/raw/...) as Muse Desktop Community does. Each is fetched once per
+  // serve and kept; 404 when the Muse has no such image or video.
+  async museAvatar(entry, res, video = null) {
+    try {
+      if (video !== null && !/^[a-z_]{1,40}$/.test(video)) return this.json(res, 400, {error: 'bad video name'});
+      // The identity/avatar cache is per conversation in v5: two conversations can
+      // be on different accounts, with different Muses.
+      const cache = entry._avatarCache ||= {identity: null, avatars: new Map()};
+      cache.identity ||= Promise.resolve(entry.agent.client?.request ? entry.agent.client.request('GET', '/identity') : null)
+        .catch(e => { cache.identity = null; throw e; });
+      const key = video || 'image';
+      if (!cache.avatars.has(key)) cache.avatars.set(key, (async () => {
+        const av = (await cache.identity)?.avatar;
+        const p = video === null
+          ? (av?.image_exists !== false && typeof av?.image_path === 'string' ? av.image_path : '')
+          : (av?.video_exists !== false && typeof av?.video_variants?.[video] === 'string' ? av.video_variants[video] : '');
+        const parts = p.replace(/^\/+/, '').split('/');
+        if (!p || p.length > 512 || parts.some(x => !x || x === '.' || x === '..')) return null;
+        const r = await entry.agent.client.request('GET', '/fs/raw/' + parts.map(encodeURIComponent).join('/'), {}, {raw: true});
+        const type = String(r?.contentType || '').split(';')[0].trim().toLowerCase();
+        const ok = video === null ? /^image\/(png|jpeg|webp|gif)$/.test(type) : /^video\/(mp4|webm)$/.test(type);
+        if (!ok || !r.data || r.data.length > (video === null ? 8 : 32) * 1024 * 1024) return null;
+        return {type, data: Buffer.from(r.data)};
+      })().catch(e => { cache.avatars.delete(key); throw e; }));
+      const a = await cache.avatars.get(key);
+      if (!a) return this.json(res, 404, {error: video ? 'no such avatar video' : 'no avatar'});
+      res.writeHead(200, {'content-type': a.type, 'content-length': a.data.length, 'cache-control': 'private, max-age=3600'});
+      res.end(a.data);
+    } catch (e) { return this.json(res, 502, {error: 'avatar unavailable: ' + e.message}); }
+  }
+
+  async changes(entry, url, res) {
+    const cwd = entry.agent.cwd ?? null;
+    const fileParam = url.searchParams.get('file');
+    if (fileParam === null) {
+      const info = await this.changedFiles(cwd).catch(() => null);
+      if (!info) return this.json(res, 200, {repo: false});
+      const files = info.files.map(f => ({path: f.path, status: f.status, added: f.added, deleted: f.deleted}));
+      let added = 0, deleted = 0;
+      for (const f of files) { if (f.added !== null) added += f.added; if (f.deleted !== null) deleted += f.deleted; }
+      return this.json(res, 200, {repo: true, branch: info.branch, files, added, deleted});
+    }
+    // A diff is served ONLY for a path in the current changed-files list (never an
+    // arbitrary path): an unlisted path — or a non-repo cwd — is a 404.
+    const wanted = fileParam.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '').replace(/^\/+/, '');
+    const info = await this.changedFiles(cwd).catch(() => null);
+    const fileEntry = info ? info.files.find(f => f.path === wanted) : null;
+    if (!fileEntry) return this.json(res, 404, {error: 'file not in changed files'});
+    if (fileEntry.status === 'untracked') return this.json(res, 200, {repo: true, path: fileEntry.path, diff: null});
+    const paths = fileEntry.origPath && fileEntry.origPath !== fileEntry.path ? [fileEntry.origPath, fileEntry.path] : [fileEntry.path];
+    let diff;
+    try { diff = await gitRun(cwd, ['diff', 'HEAD', '--', ...paths], GIT_DIFF_TIMEOUT_MS); }
+    catch {
+      // Audit #86: the unborn fallback only when HEAD really is unborn —
+      // any other diff failure is reported, not masked by two partial
+      // diffs concatenated (which double-lists a staged-and-modified file).
+      if (await this.headExists(cwd)) return this.json(res, 500, {error: 'could not read diff'});
+      // No HEAD yet: the staged diff plus the unstaged diff for the same paths.
+      const parts = [];
+      for (const args of [['diff', '--cached', '--', ...paths], ['diff', '--', ...paths]]) {
+        try { const part = await gitRun(cwd, args, GIT_DIFF_TIMEOUT_MS); if (part) parts.push(part); } catch {}
+      }
+      diff = parts.join('');
+    }
+    const truncated = diff.length > DIFF_CAP;
+    return this.json(res, 200, {repo: true, path: fileEntry.path, diff: truncated ? diff.slice(0, DIFF_CAP) : diff, ...(truncated ? {truncated: true} : {})});
+  }
+
+  // GET /api/outputs (docs/gui-protocol.md v3): without a query, the Controller's
+  // keepOutput store (this.outputs: {id, at, command, summary, text}, newest last in
+  // the store) newest first, each as {id, title, text} where title is the line
+  // showOutput() heads the entry with (command + summary). With ?shell=<id>, one
+  // background shell's buffered output via the same accessor the shell.output tool
+  // uses (src/shells.js Shells.output, from offset 0 under a GUI-only read cursor so
+  // the main cursor is not consumed), with command/running from Shells.get.
+  async outputs(entry, url, res) {
+    const shellId = url.searchParams.get('shell');
+    if (shellId === null) {
+      const raw = Array.isArray(entry.controller.outputs) ? entry.controller.outputs : [];
+      const outputs = raw.map((o, i) => {
+        const id = o && o.id !== undefined && o.id !== null && o.id !== '' ? String(o.id) : (o && o.at ? 'output-' + o.at + '-' + i : 'output-' + i);
+        const title = o && typeof o.title === 'string' && o.title ? o.title : [o?.command, o?.summary].filter(v => typeof v === 'string' && v).join('  ');
+        const full = o && typeof o.text === 'string' ? o.text : String(o?.text ?? '');
+        // Audit #84: the list form returned every stored output in full
+        // (up to 30, unbounded each) while the shell form caps at 1 MB.
+        // The list form now caps each text the same way, flagged.
+        const truncated = full.length > 1024 * 1024;
+        return {id, title, text: truncated ? full.slice(0, 1024 * 1024) : full, ...(truncated ? {truncated: true} : {})};
+      }).reverse();
+      return this.json(res, 200, {outputs});
+    }
+    if (!shellId) return this.json(res, 404, {error: 'unknown shell'});
+    const shells = entry.agent.shells;
+    if (!shells || (typeof shells.output !== 'function' && typeof shells.get !== 'function')) return this.json(res, 404, {error: 'unknown shell'});
+    let record = null;
+    if (typeof shells.get === 'function') { try { record = shells.get(shellId); } catch { return this.json(res, 404, {error: 'unknown shell'}); } }
+    if (typeof shells.output === 'function') {
+      let r;
+      try { r = await shells.output(shellId, {since: 0, caller: 'gui', maxChars: 1024 * 1024}); } catch { return this.json(res, 404, {error: 'unknown shell'}); }
+      // Audit #85: Shells.output flags a capped log with truncated:true;
+      // dropping it made a partial log look complete.
+      return this.json(res, 200, {shell: {id: r?.id ?? record?.id ?? shellId, command: record?.command ?? r?.command ?? '', running: typeof r?.running === 'boolean' ? r.running : !!record?.running, text: typeof r?.output === 'string' ? r.output : (typeof r?.text === 'string' ? r.text : ''), ...(r?.truncated ? {truncated: true} : {})}});
+    }
+    return this.json(res, 200, {shell: {id: record.id ?? shellId, command: record.command ?? '', running: !!record.running, text: typeof record.out === 'string' ? record.out : ''}});
+  }
+
+  events(entry, req, res) {
+    if (!this.attached.has(entry)) this.attachEntry(entry);
+    const att = this.attached.get(entry);
+    res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no'});
+    const client = {res, entry, lastEntries: this.state(entry).entries || [], lastStateJson: '', stateTimer: null, heartbeat: null};
+    const state = this.snapshot(entry, false);
+    client.lastStateJson = JSON.stringify(state);
+    this.sendEvent(client, {kind: 'state', state});
+    // Audit #56: lastEntries starts at the CURRENT list, so entries added
+    // while this client was disconnected were never sent to it — the initial
+    // state frame carries no entries, and onControllerChange only diffs from
+    // the current list. Every (re)connect therefore re-syncs the entry list
+    // with an entries-reset, the same frame a wholesale replacement sends.
+    this.sendEvent(client, {kind: 'entries-reset', entries: plainList(client.lastEntries.slice(-MAX_ENTRIES))});
+    // Audit #61: an open stream is a viewer — it counts as use for as long as
+    // it stays open (touch at connect and on every heartbeat), and stops
+    // counting the moment it drops.
+    this.host?.touch(entry.id);
+    client.heartbeat = setInterval(() => { this.host?.touch(entry.id); try { res.write(': ping\n\n'); } catch {} }, this.eventsHeartbeatMs);
+    client.heartbeat.unref?.();
+    att.clients.add(client);
+    req.on('close', () => this.dropClient(client));
+  }
+
+  dropClient(client, att) {
+    att = att || this.attached.get(client.entry);
+    if (att && !att.clients.delete(client)) return;
+    if (!att && !this.clients.delete(client)) return;
+    if (client.stateTimer) clearTimeout(client.stateTimer);
+    if (client.heartbeat) clearInterval(client.heartbeat);
+    try { client.res.end(); } catch {}
+  }
+
+  sendEvent(client, obj) {
+    try { client.res.write('data: ' + JSON.stringify(obj) + '\n\n'); } catch { this.dropClient(client); }
+  }
+
+  // Controller.subscribe fires on every set(): entry appends (and wholesale list
+  // replacements — /new, /resume, /clear) go out at once; other state changes are
+  // debounced ~50 ms and sent without entries.
+  onControllerChange(entry, att) {
+    att = att || this.attached.get(entry);
+    if (!att) return;
+    for (const client of [...att.clients]) {
+      const entries = this.state(entry).entries || [];
+      if (client.lastEntries !== entries) {
+        const prev = client.lastEntries || [];
+        const appended = entries.length >= prev.length && prev.every((e, i) => entries[i] && entries[i].id === e.id);
+        if (appended) for (const ent of entries.slice(prev.length)) this.sendEvent(client, {kind: 'entry', entry: plain(ent)});
+        else this.sendEvent(client, {kind: 'entries-reset', entries: plainList(entries.slice(-MAX_ENTRIES))});
+        client.lastEntries = entries;
+      }
+      if (!client.stateTimer) {
+        client.stateTimer = setTimeout(() => {
+          client.stateTimer = null;
+          const state = this.snapshot(entry, false), json = JSON.stringify(state);
+          if (json !== client.lastStateJson) { client.lastStateJson = json; this.sendEvent(client, {kind: 'state', state}); }
+        }, STATE_DEBOUNCE_MS);
+        client.stateTimer.unref?.();
+      }
+    }
+  }
+
+  json(res, status, obj) {
+    if (res.writableEnded) return;
+    // Audit #83: stringify BEFORE writeHead — a value JSON cannot carry
+    // (a BigInt, a throwing getter) used to throw after the 200 head was
+    // already sent, and the error JSON was then appended to that head as
+    // a second, corrupt body. A stringify failure is a clean 500 instead.
+    let body;
+    try { body = JSON.stringify(obj); } catch { status = 500; body = JSON.stringify({error: 'internal error'}); }
+    res.writeHead(status, {'content-type': 'application/json'});
+    res.end(body);
+  }
+
+  // Reads and parses a JSON body; on any problem it answers (400/413) and returns null.
+  // maxBody overrides the global cap for the one route that needs it (v6 /send).
+  readBody(req, res, maxBody = MAX_BODY) {
+    return new Promise(resolve => {
+      const chunks = []; let size = 0, settled = false, overflow = false;
+      const fail = (status, error) => { if (!settled) { settled = true; this.json(res, status, {error}); resolve(null); } };
+      req.on('data', chunk => {
+        // Past the cap the 413 is already answered; the rest is drained and
+        // dropped instead of destroying the request — destroying it reset
+        // the connection and the client never saw the 413 (v6: a 17 MB send).
+        if (overflow) return;
+        size += chunk.length;
+        if (size > maxBody) { overflow = true; chunks.length = 0; fail(413, 'body too large'); return; }
+        chunks.push(chunk);
+      });
+      req.on('end', () => {
+        if (settled) return; settled = true;
+        const text = Buffer.concat(chunks).toString('utf8').trim();
+        if (!text) return resolve({});
+        // Audit #69: a body of literally `null` parsed to null, which is
+        // this function's own error sentinel — every caller then returned
+        // without answering and the request hung. A parsed null is an
+        // empty object body (every route then reports its missing fields
+        // as a normal 400); only a real read/parse failure resolves null.
+        try { const parsed = JSON.parse(text); resolve(parsed === null ? {} : parsed); } catch { this.json(res, 400, {error: 'invalid JSON'}); resolve(null); }
+      });
+      req.on('error', () => fail(400, 'could not read body'));
+    });
+  }
+}
+
+module.exports = {GuiServer};

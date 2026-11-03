@@ -1,4 +1,4 @@
-// Syntax-check every .js / .mjs file under bin/ and src/ with `node --check`.
+// Syntax-check every .js / .mjs file under bin/, src/ and scripts/ with `node --check`.
 // Exits 1 (and prints each failure) when any file does not parse.
 import { spawnSync } from 'node:child_process';
 import { readdirSync, statSync } from 'node:fs';
@@ -20,7 +20,7 @@ function walk(dir, out = []) {
   return out;
 }
 
-const files = ['bin', 'src'].flatMap(d => walk(path.join(root, d))).sort();
+const files = ['bin', 'src', 'scripts'].flatMap(d => walk(path.join(root, d))).sort();
 const failures = [];
 for (const file of files) {
   const r = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });

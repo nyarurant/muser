@@ -14,16 +14,19 @@ let EN = null, current = null;
 function configFile() { return path.join(os.homedir(), '.muser', 'config.json'); }
 function readConfig() { try { return require('./config').readJson(configFile()) || {}; } catch { return {}; } }
 function osLang() { return /^ja\b/i.test(Intl.DateTimeFormat().resolvedOptions().locale || '') ? 'ja' : 'en'; }
+// A regional tag names its language: en-US / ja-JP / en_GB mean en / ja / en. Only the exact
+// 'en' / 'ja' used to be accepted, so MUSER_LANG=en-US was silently ignored (audit #225).
+function norm(l) { const p = String(l || '').toLowerCase().split(/[-_]/)[0]; return LANGS.includes(p) ? p : null; }
 // The language the user picked (config.json), or null before the first run asked.
-function chosen() { const l = readConfig().lang; return LANGS.includes(l) ? l : null; }
+function chosen() { return norm(readConfig().lang); }
 function lang() {
   if (current) return current;
-  const env = String(process.env.MUSER_LANG || '').toLowerCase();
-  return (current = LANGS.includes(env) ? env : chosen() || osLang());
+  return (current = norm(process.env.MUSER_LANG) || chosen() || osLang());
 }
 function setLang(l, {save = true} = {}) {
-  if (!LANGS.includes(l)) return;
-  current = l;
+  const n = norm(l);
+  if (!n) return;
+  current = n; l = n;
   if (!save) return;
   try { require('./config').update(cfg => { cfg.lang = l; }); } catch {}
 }
@@ -35,4 +38,4 @@ function t(text, vars) {
   return s;
 }
 
-module.exports = {t, lang, setLang, chosen, osLang, LANGS};
+module.exports = {t, lang, setLang, chosen, osLang, LANGS, norm};

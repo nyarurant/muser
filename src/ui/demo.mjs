@@ -65,10 +65,12 @@ class DemoAgent extends EventEmitter {
   close() { this.shells.killAll(); }
 }
 
-export async function demo({version}) {
+export async function demo({version, cwd, mode}) {
   // Like a real first run: ask for the language if none was picked yet (and keep the choice).
   if (i18n.chosen() === null) await require('../tui/onboard.js').askLanguage();
-  const agent = new DemoAgent(process.cwd());
+  // --cd / --mode used to be silently dropped on the way here.
+  const agent = new DemoAgent(cwd || process.cwd());
+  if (mode) agent.mode = mode;
   // The demo's approval previews come from the script instead of real files.
   const app = run({agent, museName: t('Muse (デモ)'), version});
   return app;
@@ -126,7 +128,7 @@ function demoRegister() {
   };
 }
 
-export async function demoLogin({version}) {
+export async function demoLogin({version, cwd, mode}) {
   const {onboard, askLanguage} = require('../tui/onboard.js');
   process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
   // The first-run demo always starts with the language question; it changes the saved choice
@@ -142,7 +144,8 @@ export async function demoLogin({version}) {
     register: demoRegister(),
   });
   await sleep(1200);
-  const agent = new LoginDemoAgent(process.cwd());
+  const agent = new LoginDemoAgent(cwd || process.cwd());
+  if (mode) agent.mode = mode;
   const app = run({agent, museName: t('Muse (デモ)'), version, connect: async () => {
     await agent.ensureConnected();
     // Then, a while later, the login lapses: the offer to log in again appears.

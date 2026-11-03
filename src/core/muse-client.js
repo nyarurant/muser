@@ -54,6 +54,7 @@ class MuseClient extends EventEmitter {
     // Like the web client, ask the VM for text in the user's language (settings, connectors, permissions).
     this.locale=typeof locale==='string'&&/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(locale)?locale:'';
     this.pending=new Map(); this.ws=null; this.transport=null; this.connecting=null; this.status='disconnected'; this.badFrames=0;
+    this.socketVmId=null; this.deferredCredentials=null;
   }
   state(status,message) { this.status=status; this.emit('status',{status,message}); }
   // One credential refresh attempt with a named outcome, so the login
@@ -74,7 +75,15 @@ class MuseClient extends EventEmitter {
     let result;
     try { result=await this.fetchJson('/api/hatch/token',{vmAddress:session.endpoint_url,vmName:session.vm_name,force_refresh:true}); } catch { return 'token'; }
     if(!result?.token) return 'token';
-    this.credentials={gateway:'https://hatch.metaaivm.com',vmId:session.vm_id,vmName:session.vm_name,endpoint:session.endpoint_url,appId:this.credentials?.appId||'hatch-web',token:result.token,notaryToken:result.notary_token,source:'login'};
+    const next={gateway:'https://hatch.metaaivm.com',vmId:session.vm_id,vmName:session.vm_name,endpoint:session.endpoint_url,appId:this.credentials?.appId||'hatch-web',token:result.token,notaryToken:result.notary_token,source:'login'};
+    // Audit #126: a refresh that lands while a socket is live (or opening) for a
+    // DIFFERENT VM must not swap the stored credentials under it — the saved
+    // credentials and the live socket's VM would diverge, and the next save
+    // would persist a VM the socket never connected to. A token refresh for
+    // the same VM applies at once; a different VM is deferred until the
+    // socket is disconnected, then applied (and emitted) there.
+    if(this.socketVmId&&next.vmId&&next.vmId!==this.socketVmId&&(this.ws||this.connecting||this.status==='connected')) { this.deferredCredentials=next; return 'ready'; }
+    this.credentials=next;
     this.emit('credentials',this.credentials);
     return 'ready';
   }
@@ -89,12 +98,22 @@ class MuseClient extends EventEmitter {
   }
   async open() {
     this.disconnect(false); this.state('connecting',t('Muse に接続しています…'));
-    const stage=await this.refreshCredentials();
+    // muser: a credential refresh can take up to ~24 s (two website calls with their own
+    // timeouts) while the cached credentials are usually still good. Race it against ~3 s and
+    // connect with the cached ones when it is slow. With requireLogin the gate is kept: when
+    // the cached credentials are not login-derived, the refresh must finish and prove the
+    // login before anything connects.
+    const refresh=this.refreshCredentials(); refresh.catch(()=>{});
+    let timer=null;
+    let stage=await Promise.race([refresh,new Promise(r=>{timer=setTimeout(()=>r('__slow'),3000);timer.unref?.();})]);
+    if(timer)clearTimeout(timer);
+    if(stage==='__slow'&&this.requireLogin&&this.credentials?.source!=='login') stage=await refresh;
     if(this.requireLogin&&(stage==='waiting'||this.credentials?.source!=='login')) {
       this.state('auth_required',t('Muse にログインしてください。'));throw new Error(t('Muse にログインしてください。'));
     }
     const c=this.credentials;
     if(!c?.token) { this.state('auth_required',t('ログインまたは通信記録の読み込みが必要です。')); throw new Error(t('Muse にログインしてください。')); }
+    this.socketVmId=c.vmId||null;
     const target=allowedGateway(c.gateway); target.protocol='wss:';target.pathname='/v1/noise';target.search='';
     for(const [k,v] of Object.entries({vm_id:c.vmId,auth_token:c.token,notary_token:c.notaryToken,app_id:c.appId,request_id:crypto.randomUUID()})) if(v) target.searchParams.set(k,v);
     const ws=new WebSocket(target,{origin:'https://muse.ai',handshakeTimeout:15000,maxPayload:1024*1024}); this.ws=ws;
@@ -131,20 +150,46 @@ class MuseClient extends EventEmitter {
   request(verb,path,params={},options={}) {
     if(this.status!=='connected'||!this.transport) return Promise.reject(new Error(t('Muse に接続してください。')));
     if(this.pending.size>=64) return Promise.reject(new Error(t('処理中の操作が多すぎます。')));
-    let body=Buffer.alloc(0);
-    if(verb==='GET') {const q=new URLSearchParams();for(const[k,v]of Object.entries(params))if(Array.isArray(v))for(const x of v)q.append(k,String(x));else if(v!==undefined&&v!==null)q.set(k,String(v));if(q.size)path+='?'+q;}
-    else body=Buffer.isBuffer(options.body)?options.body:Buffer.from(JSON.stringify(params));
-    const r=this.transport.request(verb,path,body,[['x-app-id',this.credentials.appId],['Content-Type',options.contentType||'application/json'],['Accept-Encoding','identity'],...(this.locale?[['Accept-Language',this.locale]]:[])],options.service||0);
+    let body=Buffer.alloc(0); let r;
+    // Audit #124: callers attach .catch to the returned promise, so a failure
+    // while building the request (a huge payload the transport refuses, a
+    // dead cipher, unserializable params) must reject, never throw sync.
+    try {
+      if(verb==='GET') {const q=new URLSearchParams();for(const[k,v]of Object.entries(params))if(Array.isArray(v))for(const x of v)q.append(k,String(x));else if(v!==undefined&&v!==null)q.set(k,String(v));if(q.size)path+='?'+q;}
+      else body=Buffer.isBuffer(options.body)?options.body:Buffer.from(JSON.stringify(params));
+      r=this.transport.request(verb,path,body,[['x-app-id',this.credentials.appId],['Content-Type',options.contentType||'application/json'],['Accept-Encoding','identity'],...(this.locale?[['Accept-Language',this.locale]]:[])],options.service||0);
+    } catch(e) { return Promise.reject(e instanceof Error?e:new Error(String(e))); }
     return new Promise((resolve,reject)=>{
-      const pending={resolve,reject,path,subscriptionScope:options.subscriptionScope,status:0,chunks:[],size:0,text:'',decoder:new TextDecoder(),onEvent:options.onEvent,stream:!!options.stream,raw:!!options.raw,contentType:'',settled:false};
+      const pending={resolve,reject,path,subscriptionScope:options.subscriptionScope,sessionId:typeof params?.session_id==='string'?params.session_id:'',status:0,chunks:[],size:0,text:'',decoder:new TextDecoder(),onEvent:options.onEvent,stream:!!options.stream,raw:!!options.raw,contentType:'',settled:false,streamIdleMs:options.streamIdleMs||120000};
       pending.timer=setTimeout(()=>{this.cancelRequest(r.id);reject(new Error(t('Muse の応答がタイムアウトしました。送信済みの可能性があるため、自動再送はしません。')));},options.timeout||30000);
       this.pending.set(r.id.toString(),pending);
       try { for(const frame of r.frames)this.ws.send(frame); } catch {this.cancelRequest(r.id);reject(new Error(t('送信中に通信が切れました。')));}
     });
   }
+  // Send a transport reset for one stream, quietly: a dead cipher or a closing
+  // socket must never turn a cleanup path into a throw (audit #123/#125).
+  _resetQuiet(id) {
+    try { if(this.transport&&this.ws?.readyState===WebSocket.OPEN)for(const f of this.transport.reset(BigInt(id)))this.ws.send(f); } catch {}
+  }
+  // Audit #120: record() clears a stream's overall timer when its first record
+  // arrives, so a stream that stalls after that waited forever and leaked its
+  // pending slot. Non-subscription streams re-arm an idle timer on every
+  // frame instead; /chat/subscribe is exempt (it may legitimately sit quiet
+  // between chat events — its liveness is the socket ping watchdog's job).
+  _armStreamIdle(key,p) {
+    if(!p.stream||p.path==='/chat/subscribe')return;
+    clearTimeout(p.idleTimer);
+    p.idleTimer=setTimeout(()=>{
+      if(this.pending.get(key)!==p)return;
+      clearTimeout(p.timer);this.pending.delete(key);
+      this._resetQuiet(key);
+      this.emit('stream-error',{path:p.path,scope:p.subscriptionScope,message:t('Muse の応答がタイムアウトしました。送信済みの可能性があるため、自動再送はしません。')});
+    },p.streamIdleMs||120000);
+    p.idleTimer.unref?.();
+  }
   cancelRequest(id,completeSubscription=false) {
     const p=this.pending.get(String(id));if(p){
-      clearTimeout(p.timer);this.pending.delete(String(id));
+      clearTimeout(p.timer);clearTimeout(p.idleTimer);this.pending.delete(String(id));
       // A view change can cancel a subscription before its initial ack. Its IPC
       // caller must still receive a reply; otherwise Electron reports "reply was
       // never sent". Request timeouts retain their own rejection path.
@@ -152,21 +197,29 @@ class MuseClient extends EventEmitter {
         p.settled=true;p.resolve({subscribed:false,cancelled:true});
       }
     }
-    if(this.transport&&this.ws?.readyState===WebSocket.OPEN)for(const f of this.transport.reset(BigInt(id)))this.ws.send(f);
+    // Audit #123: this used to throw (dead cipher, closing socket) AFTER the
+    // pending was deleted and its timer cleared, so the caller's own settle
+    // path never ran and the promise hung forever. It must not throw.
+    this._resetQuiet(id);
   }
   // One bad NDJSON record (unparseable JSON, or a payload unwrap() rejects) must not
   // kill a long-lived subscription: skip and count it instead. This only wraps the
   // per-record parse/unwrap; transport decode (Noise decrypt) failures happen in the
   // ws message handler before onFrame() and stay fatal, as do frame-level errors below.
   noteBadFrame(error) {
+    // Consecutive, not cumulative: one bad record in a long healthy stream must never add up
+    // to a reconnect, but a run of them means the stream is corrupt, so after 10 in a row the
+    // connection is dropped and the caller reconnects (as with a closed socket).
     this.badFrames=(this.badFrames||0)+1;
-    if(this.badFrames===1||this.badFrames%25===0) console.error('muse-client: skipped a malformed stream record ('+this.badFrames+' total): '+(error?.message||error));
+    if(this.badFrames===1||this.badFrames%25===0) console.error('muse-client: skipped a malformed stream record ('+this.badFrames+' in a row): '+(error?.message||error));
     try{this.emit('warning',{type:'bad-frame',count:this.badFrames,error:error?.message||String(error)});}catch{}
+    if(this.badFrames>=10){this.disconnect(false);this.state('disconnected',t('接続が切れました。再接続しています…'));}
   }
+  noteGoodFrame() { this.badFrames=0; }
   recordLine(p,line) {
     let value;
     try{value=JSON.parse(line);}catch(e){this.noteBadFrame(e);return;}
-    try{this.record(p,value);}catch(e){this.noteBadFrame(e);}
+    try{this.record(p,value);this.noteGoodFrame();}catch(e){this.noteBadFrame(e);}
   }
   record(p,value) {
     if(value?.type==='event'||(typeof value?.event==='string'&&value.payload)) {
@@ -178,6 +231,7 @@ class MuseClient extends EventEmitter {
   }
   onFrame(f) {
     if(!f)return;const key=f.id.toString(),p=this.pending.get(key);if(!p)return;
+    this._armStreamIdle(key,p); // any frame is activity for the idle watchdog (#120)
     try {
       if(f.type==='reset')throw new Error(t('Muse がこの操作の通信を終了しました。'));
       if(f.type==='response') {
@@ -204,11 +258,18 @@ class MuseClient extends EventEmitter {
           if(p.raw){p.settled=true;p.resolve({contentType:p.contentType,data});}
           else{const text=data.toString('utf8');const value=text?unwrap(JSON.parse(text)):{};p.settled=true;p.resolve(value);}
         }
-        clearTimeout(p.timer);this.pending.delete(key);
+        clearTimeout(p.timer);clearTimeout(p.idleTimer);this.pending.delete(key);
         // muser: say which stream ended, so a closed /chat/subscribe can be opened again.
         if(p.stream)this.emit('stream-end',{path:p.path,scope:p.subscriptionScope});
       }
-    }catch(e){clearTimeout(p.timer);this.pending.delete(key);p.reject(e);if(p.settled)this.emit('stream-error',{path:p.path,scope:p.subscriptionScope,message:e.message});}
+    }catch(e){clearTimeout(p.timer);clearTimeout(p.idleTimer);this.pending.delete(key);p.reject(e);
+      // Audit #125: tell the gateway this stream is over, or it keeps sending
+      // frames for a pending that no longer exists.
+      this._resetQuiet(key);
+      // Audit #121: a stream that fails BEFORE its first record (settled=false)
+      // must still raise stream-error, or the resubscribe logic never fires
+      // and live updates stop silently.
+      if(p.stream||p.settled)this.emit('stream-error',{path:p.path,scope:p.subscriptionScope,message:e.message});}
   }
   // muser: the gateway socket had no keepalive, so a half-open socket (sleep, network change)
   // looked connected forever. Missing pongs now count as a drop.
@@ -221,15 +282,26 @@ class MuseClient extends EventEmitter {
     },20000);this.pingTimer.unref?.();
   }
   disconnect(announce=true) {
-    clearInterval(this.pingTimer);const ws=this.ws;this.ws=null;if(ws){ws.on('error',()=>{});if(ws.readyState===WebSocket.CONNECTING)ws.terminate();else ws.close();}
+    clearInterval(this.pingTimer);const ws=this.ws;this.ws=null;if(ws){ws.on('error',()=>{});if(ws.readyState===WebSocket.CONNECTING)ws.terminate();else{ws.close();
+      // muser: a close handshake that stalls (a half-open socket may never answer it) must not
+      // leave the socket alive: terminate it if it is still not closed after ~2 s.
+      const timer=setTimeout(()=>{try{if(ws.readyState!==WebSocket.CLOSED)ws.terminate();}catch{}},2000);timer.unref?.();
+      try{ws.once?.('close',()=>clearTimeout(timer));}catch{}
+    }}
     this.transport?.destroy();this.transport=null;
-    for(const p of this.pending.values()){clearTimeout(p.timer);p.reject(new Error(t('Muse の接続が終了しました。')));}this.pending.clear();
+    for(const p of this.pending.values()){clearTimeout(p.timer);clearTimeout(p.idleTimer);p.reject(new Error(t('Muse の接続が終了しました。')));}this.pending.clear();
+    this.socketVmId=null;
+    // A credential refresh deferred by #126 (different VM than the live socket)
+    // applies now that no socket is using the old credentials.
+    if(this.deferredCredentials){this.credentials=this.deferredCredentials;this.deferredCredentials=null;this.emit('credentials',this.credentials);}
     this.status='disconnected';if(announce)this.state('disconnected',t('未接続'));
   }
   sessions() {return this.request('GET','/api/session/list',{limit:100});}
   history(sessionId='',before) {return this.request('GET','/chat/history',{limit:50,session_id:sessionId,...before!==undefined?{before_seq:before}:{}});}
   subscribe(sessionId='') {
-    for(const [id,p]of this.pending)if(p.path==='/chat/subscribe'&&!p.subscriptionScope)this.cancelRequest(id,true);
+    // Audit #122: only a previous unscoped subscription for the SAME session is
+    // replaced; subscribing for session B must not kill session A's live one.
+    for(const [id,p]of this.pending)if(p.path==='/chat/subscribe'&&!p.subscriptionScope&&(p.sessionId||'')===(sessionId||''))this.cancelRequest(id,true);
     return this.request('POST','/chat/subscribe',{...(sessionId?{session_id:sessionId}:{}),capabilities:['chat_cancel','delta_stream']},{stream:true});
   }
   subscribeAgent(sessionId,scope) {

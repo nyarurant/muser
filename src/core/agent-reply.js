@@ -10,6 +10,23 @@ const FAILED=new Set(['failed','error','errored','cancelled','canceled','stopped
 function waitForReply({client,sessionId,baseline=new Set(),signal,timeoutMs=600000,pollMs=5000,settleMs=500,reconnectGraceMs=300000}) {
   let ended=false,checking=false,again=false,accepted=false,expectedReply=null,lost=null;
   let doneIds=new Set(),last='',stableAt=0,retry=null,resolveReply,rejectReply;
+  // Parsed history messages, cached by id across check() calls: polling re-reads
+  // the same history every time, and messageFromEvent (incl. attachment splitting)
+  // need not run again for an event whose text has not changed.
+  const parsedCache=new Map();
+  const parseCached=event=>{
+    const p=event.payload||{};
+    const id=event.message_id||p.message_id||p.id;
+    const raw=event.display_text??p.display_text??p.content??p.text;
+    if(typeof id==='string'&&id){
+      const hit=parsedCache.get(id);
+      if(hit&&hit.raw===raw)return hit.message;
+      const message=messageFromEvent(event);
+      parsedCache.set(id,{raw,message});
+      return message;
+    }
+    return messageFromEvent(event);
+  };
   let pollFailures=0,pollTimer=null;
   const promise=new Promise((resolve,reject)=>{resolveReply=resolve;rejectReply=reject;});
   // Sending can fail before the caller starts awaiting this promise.
@@ -35,7 +52,7 @@ function waitForReply({client,sessionId,baseline=new Set(),signal,timeoutMs=6000
       if(!status||BUSY.has(status))return;
       const byId=new Map();
       for(const event of history.chat_events||[]){
-        const message=messageFromEvent(event);
+        const message=parseCached(event);
         if(message?.role!=='assistant'||!message.content||baseline.has(message.id)||(expectedReply&&message.replyTo&&message.replyTo!==expectedReply))continue;
         byId.set(message.id,{...message,ready:event.display_text_ready!==false&&event.payload?.display_text_ready!==false});
       }
@@ -81,9 +98,10 @@ function waitForReply({client,sessionId,baseline=new Set(),signal,timeoutMs=6000
   const onAbort=()=>cancel();
   const timeout=setTimeout(()=>finish(new Error(t('Muse の応答がタイムアウトしました。'))),timeoutMs);
   // Self-scheduling poll with backoff: the interval starts at the caller's pollMs
-  // and doubles per consecutive failed check, capped at 5s (never below pollMs for
-  // callers that asked for a slower cadence); a successful check resets it.
-  const maxPollMs=Math.max(5000,pollMs);
+  // and doubles per consecutive failed check, capped at 30s (or pollMs*8 when that
+  // is larger, so callers that asked for a slower cadence still back off);
+  // a successful check resets it.
+  const maxPollMs=Math.max(30000,pollMs*8);
   const schedulePoll=()=>{
     if(ended)return;
     const delay=pollFailures?Math.min(pollMs*(2**pollFailures),maxPollMs):pollMs;

@@ -1,10 +1,25 @@
 'use strict';
 const test = require('node:test');
+const {after} = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {spawnSync} = require('node:child_process');
 const m = require('../src/mentions');
+
+// B8: every test in this file mkdtemps its own fixture dir and none of them
+// were cleaned. Track them all (every call site goes through this fs object)
+// and remove them when the file finishes.
+const createdDirs = [];
+const origMkdtempSync = fs.mkdtempSync.bind(fs);
+fs.mkdtempSync = (...args) => { const dir = origMkdtempSync(...args); createdDirs.push(dir); return dir; };
+after(() => { for (const dir of createdDirs) { try { fs.rmSync(dir, {recursive: true, force: true}); } catch {} } });
+
+// B7: the timeout test below pins rg-specific behaviour (source stays 'rg'
+// after a 1 ms timeout). Without an rg binary on PATH, listFilesAsync falls
+// back to the walk and that test can only fail — skip it in that case instead.
+const rgAvailable = (() => { try { const r = spawnSync('rg', ['--version'], {encoding: 'utf8', timeout: 10000}); return !r.error && r.status === 0; } catch { return false; } })();
 
 test('@ mentions: files and folders go along, emails do not, missing are reported', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-at-'));
@@ -73,4 +88,85 @@ test('switching folders while a list is being built keeps the new folder\'s list
   assert.ok(m.loading(b) || m.complete('only', b).length === 1, "a's listing finishing must not clear or replace b's");
   await m.ready(b);
   assert.deepEqual(m.complete('only', b), ['only-b.txt']);
+});
+
+// Audit #239: '[', ']', '{' and '}' are legal in Windows file names; refs using them
+// used to be declared missing without a stat.
+test('@ mentions: file names with [ ] { } are real files, not obviously missing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-at-brackets-'));
+  fs.writeFileSync(path.join(dir, 'notes [draft].md'), 'bracketed');
+  fs.writeFileSync(path.join(dir, 'data{1}.txt'), 'braced');
+  const ex = m.expand('@"notes [draft].md" @data{1}.txt', dir, new Set());
+  assert.deepEqual(ex.missing, []);
+  assert.match(ex.block, /bracketed/);
+  assert.match(ex.block, /braced/);
+});
+
+// Audit #240: a stray backtick must not swallow a mention. An unclosed fence ate the
+// rest of the message; a lone backtick paired with a later real span's opener.
+test('@ mentions: stray backticks stay literal; real code spans still hide mentions', () => {
+  const B = String.fromCharCode(96);
+  assert.deepEqual(m.mentions('x ' + B + B + B + '\ncode @b.txt'), ['b.txt'], 'unclosed fence does not eat the mention');
+  assert.deepEqual(m.mentions('a ' + B + ' stray @c.txt and ' + B + 'code' + B + ' end'), ['c.txt'], 'a stray backtick does not pair with the next span');
+  assert.deepEqual(m.mentions('run ' + B + '@babel/core' + B + ' first'), [], 'a real span still hides its mention');
+  assert.deepEqual(m.mentions(B + B + B + '\n@in-fence.txt\n' + B + B + B + '\n@after.txt'), ['after.txt'], 'a closed fence still hides its contents');
+});
+
+// Audit #238: MAX_TOTAL budgets the whole block — folder listings and notices count
+// toward it, not just plain file bodies.
+test('@ expand: folder listings count toward MAX_TOTAL', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-at-total-'));
+  const many = path.join(dir, 'many'); fs.mkdirSync(many);
+  for (let i = 0; i < 300; i++) fs.writeFileSync(path.join(many, 'f' + i + '-' + 'x'.repeat(70) + '.txt'), '');
+  for (const n of ['a', 'b', 'c', 'd']) fs.writeFileSync(path.join(dir, n + '.txt'), 'y'.repeat(39900));
+  const ex = m.expand('@many @a.txt @b.txt @c.txt @d.txt', dir, new Set());
+  assert.deepEqual(ex.files.map(f => f.kind), ['dir', 'file', 'file', 'file', 'file']);
+  assert.ok(ex.block.length <= 155000, 'the whole block stays within the 150k budget (was ~178k when listings were free): ' + ex.block.length);
+});
+
+// Audit #241: after an rg timeout resolves with the partial list, the killed child's
+// close handler must not run the full fallback walk (discarded anyway) or overwrite
+// the diagnostic.
+test('listFilesAsync: a timeout keeps its partial result and its diagnostic', {skip: !rgAvailable && 'no rg binary on PATH: the timeout path is rg-specific (without rg the listing falls back to the walk)'}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-at-timeout-'));
+  for (let i = 0; i < 1200; i++) fs.writeFileSync(path.join(dir, 'f' + i + '.txt'), '');
+  const files = await m.listFilesAsync(dir, 1);
+  assert.ok(Array.isArray(files));
+  assert.equal(m.listDiag().source, 'rg');
+  assert.match(m.listDiag().error, /stopped after/);
+  // The old code slept one fixed 600 ms ("the killed rg closes in the
+  // meantime") and checked once at the end. The child handle lives inside
+  // src/mentions, so its close cannot be awaited directly from here; what CAN
+  // be done is poll the diagnostic continuously across a wider window
+  // (1500 ms, checked every 25 ms): a late close handler that overwrote the
+  // diagnostic at ANY point in that window is now caught, not just one that
+  // happened to land before a single end-of-sleep check. (PARTIAL: the window
+  // is still time-based because no close signal is exported.)
+  const until = Date.now() + 1500;
+  while (Date.now() < until) {
+    assert.equal(m.listDiag().source, 'rg', 'the close handler did not run the fallback walk over the result');
+    assert.match(m.listDiag().error, /stopped after/);
+    await new Promise(r => setTimeout(r, 25));
+  }
+  assert.equal(m.listDiag().source, 'rg', 'the close handler did not run the fallback walk over the result');
+  assert.match(m.listDiag().error, /stopped after/);
+});
+
+// Audit #237: an @mention must never inline a secret, however it was named —
+// the read tools refuse these paths, and the mention path used to bypass them.
+test('@ mentions: secrets are withheld by name, never inlined (audit #237)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-at-secret-'));
+  fs.writeFileSync(path.join(dir, 'id_rsa'), 'PRIVATE KEY BODY');
+  fs.writeFileSync(path.join(dir, '.env'), 'TOKEN=abc');
+  fs.writeFileSync(path.join(dir, 'notes.txt'), 'hello');
+  fs.mkdirSync(path.join(dir, '.ssh'));
+  fs.writeFileSync(path.join(dir, '.ssh', 'id_ed25519'), 'ANOTHER KEY');
+  const ex = m.expand('@id_rsa @.env @notes.txt @.ssh @../' + path.basename(dir) + '/id_rsa', dir, new Set());
+  assert.ok(!ex.block.includes('PRIVATE KEY BODY'), 'the key body never reaches the message');
+  assert.ok(!ex.block.includes('TOKEN=abc'), 'the env body never reaches the message');
+  assert.ok(!ex.block.includes('ANOTHER KEY'));
+  assert.ok(!/id_ed25519/.test(ex.block), 'a sensitive folder is not even listed');
+  assert.match(ex.block, /File notes\.txt/);
+  assert.deepEqual(ex.files.filter(f => f.kind === 'sensitive').map(f => f.ref), ['id_rsa', '.env', '.ssh', '../' + path.basename(dir) + '/id_rsa']);
+  assert.deepEqual(ex.missing, []);
 });

@@ -53,7 +53,7 @@ test('a session index with broken entries still lists the good ones', t => {
   const {execFileSync} = require('node:child_process');
   fs.mkdirSync(path.join(dir, 'muser'));
   fs.writeFileSync(path.join(dir, 'muser', 'sessions.json'), JSON.stringify([null, {id: 'x'}, {id: 'abc-1', cwd: 'C:/p', turns: 1, updated: 1}]));
-  const out = execFileSync(process.execPath, ['-e', "const s=require('./src/sessions');console.log(s.recent().length, s.recent('C:/p').length)"], {cwd: path.join(__dirname, '..'), env: {...process.env, LOCALAPPDATA: dir}, encoding: 'utf8'});
+  const out = execFileSync(process.execPath, ['-e', "const s=require('./src/sessions');console.log(s.recent().length, s.recent('C:/p').length)"], {cwd: path.join(__dirname, '..'), env: {...process.env, LOCALAPPDATA: dir}, encoding: 'utf8', timeout: 30000});
   assert.equal(out.trim(), '2 1');
 });
 

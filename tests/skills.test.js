@@ -111,3 +111,60 @@ test('a config.json that does not parse is kept aside, not wiped, when a setting
   assert.equal(cfg.maxAgents, 0, 'other settings survive a save');
   assert.deepEqual(cfg.skills.disabled, ['x', 'y']);
 });
+
+test('muser never offers its own skill for other agents (muser-exec) to Muse', t => {
+  const {home, proj, put} = sandbox(t);
+  const skills = require('../src/skills');
+  put(path.join(home, '.claude', 'skills'), 'muser-exec', fs.readFileSync(path.join(__dirname, '..', 'skills', 'muser-exec', 'SKILL.md'), 'utf8'));
+  put(path.join(home, '.claude', 'skills'), 'other', '---\nname: other\ndescription: something\n---\nbody');
+  const names = skills.load(proj).map(s => s.name);
+  assert.ok(names.includes('other'));
+  assert.ok(!names.includes('muser-exec'));
+});
+
+// Audit #229: two skills whose names normalise to the same key ('Foo Bar' -> 'foo-bar')
+// used to merge silently, the loser vanishing without a trace.
+test('a name-normalisation collision keeps the first skill and records the dropped one', t => {
+  const {proj, put} = sandbox(t);
+  const skills = require('../src/skills');
+  const dir = path.join(proj, '.muser', 'skills');
+  put(dir, 'Foo Bar', '---\nname: Foo Bar\ndescription: spaced\n---\n');
+  put(dir, 'foo-bar', '---\nname: foo-bar\ndescription: dashed\n---\n');
+  const all = skills.load(proj);
+  assert.deepEqual(all.map(s => s.name), ['foo-bar'], 'exactly one survives under the shared key');
+  const diag = skills.diagnostics().filter(d => d.reason === 'name-collision');
+  assert.equal(diag.length, 1, 'the collision is diagnosed, not silent');
+  assert.equal(diag[0].name, 'foo-bar');
+  assert.deepEqual([diag[0].dir, diag[0].keptDir].sort(), [path.join(dir, 'Foo Bar'), path.join(dir, 'foo-bar')].sort());
+});
+
+// Audit #230: an oversized SKILL.md was skipped with no trace, so skill.read answered
+// "No skill named" for a skill that exists.
+test('an oversized SKILL.md is diagnosed, and skill.read says why it was skipped', t => {
+  const {proj, put} = sandbox(t);
+  const skills = require('../src/skills');
+  put(path.join(proj, '.muser', 'skills'), 'huge', '---\nname: huge\ndescription: big\n---\n' + 'x'.repeat(256 * 1024));
+  assert.deepEqual(skills.load(proj).map(s => s.name), [], 'too large to load');
+  const diag = skills.diagnostics().find(d => d.reason === 'too-large');
+  assert.ok(diag && diag.size > 256 * 1024, 'the skip is recorded with its size');
+  assert.throws(() => skills.read(proj, {name: 'huge'}), /was skipped.*over the 262144-byte limit/);
+});
+
+// Audit #231: the containment check rejected any relative path STARTING with '..',
+// including a legitimate '..foo' folder inside the skill.
+test('skill.read serves a file in a folder named ..foo, and still refuses a real escape', t => {
+  const {proj, put} = sandbox(t);
+  const skills = require('../src/skills');
+  put(path.join(proj, '.muser', 'skills'), 'guide', '---\nname: guide\ndescription: d\n---\nBody\n', {'..foo/note.md': 'inside, honestly'});
+  assert.equal(skills.read(proj, {name: 'guide', path: '..foo/note.md'}).content, 'inside, honestly');
+  assert.throws(() => skills.read(proj, {name: 'guide', path: '../outside.md'}), /inside the skill folder/);
+  assert.throws(() => skills.read(proj, {name: 'guide', path: '..foo/../../outside.md'}), /inside the skill folder/);
+});
+
+test('the shipped muser-exec skill has the frontmatter Claude Code and Codex read', () => {
+  const {frontmatter} = require('../src/skills');
+  const {meta, body} = frontmatter(fs.readFileSync(path.join(__dirname, '..', 'skills', 'muser-exec', 'SKILL.md'), 'utf8'));
+  assert.equal(meta.name, 'muser-exec');
+  assert.ok(meta.description.length > 50 && meta.description.length < 1024, 'description length ' + meta.description.length);
+  assert.match(body, /--status-file/);
+});

@@ -16,7 +16,13 @@ test('newer compares x.y.z and never offers a pre-release', () => {
   assert.equal(update.newer('0.3.1', '0.3.1'), false);
   assert.equal(update.newer('0.3.0', '0.3.1'), false);
   assert.equal(update.newer('0.4.0-beta.1', '0.3.1'), false);
-  assert.equal(update.newer('0.3.1', '0.3.1-dev'), false);
+  // Audit #227: the release IS newer than its own pre-release (semver orders a
+  // pre-release before the release); stripping b's suffix used to hide it, so a
+  // 0.4.0-beta user was never offered 0.4.0. '-dev' is a pre-release suffix too.
+  assert.equal(update.newer('0.4.0', '0.4.0-beta'), true);
+  assert.equal(update.newer('0.4.0', '0.4.0-beta.1'), true);
+  assert.equal(update.newer('0.3.1', '0.3.1-dev'), true);
+  assert.equal(update.newer('0.4.0', '0.4.0'), false);
   assert.equal(update.newer('', '0.3.1'), false);
 });
 
@@ -29,6 +35,11 @@ test('the check is off by env, by config, and for a git checkout unless forced',
   fs.mkdirSync(path.join(pkg, '.git'));
   assert.equal(update.enabled({env: {}, configFile: none, root: pkg}), false, 'npm must not overwrite a dev checkout');
   assert.equal(update.enabled({env: {MUSER_UPDATE_CHECK: '1'}, configFile: none, root: pkg}), true);
+  // Audit #228: the env opt-in also wins over a saved "updateCheck": false (it used
+  // to be checked only against the dev-checkout gate, so the escape hatch did nothing
+  // for the users who had turned the check off in /settings).
+  assert.equal(update.enabled({env: {MUSER_UPDATE_CHECK: '1'}, configFile: cfg, root: pkg}), true, 'env opt-in beats the saved off');
+  assert.equal(update.enabled({env: {MUSER_UPDATE_CHECK: '1', MUSER_NO_UPDATE_CHECK: '1'}, configFile: none, root: pkg}), false, 'the explicit off still wins over the opt-in');
 });
 
 class FakeAgent extends EventEmitter {
@@ -63,7 +74,13 @@ test('at start the footer says it is checking, then shows a newer version or not
 });
 
 test('a stuck npm is stopped, so /update can be tried again', async () => {
-  const r = await update.install({timeoutMs: 1000, command: 'ping -n 30 127.0.0.1 >nul'});
+  // Cross-platform hang fixture (the old 'ping -n 30' is Windows-only): Node itself
+  // sleeping for 30 s, stopped by install()'s 1 s timeout long before that. The bare
+  // 'node' is deliberate: install() runs the command through cmd.exe /c, and a quoted
+  // process.execPath does not survive that spawn (Node escapes the quotes and cmd
+  // rejects them; unquoted, the path breaks on the space in 'Program Files').
+  const sleeper = 'node -e setTimeout(function(){},30000)';
+  const r = await update.install({timeoutMs: 1000, command: sleeper});
   assert.equal(r.ok, false);
   assert.match(r.output, /did not finish in 1 s/);
 });

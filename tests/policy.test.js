@@ -119,9 +119,9 @@ test('alwaysKey narrows exec by a plain subcommand word', () => {
   assert.equal(alwaysKey('mcp', {}, 'some_tool'), 'mcp:some_tool');
   assert.equal(alwaysKey('exec', {command: 'npm ls'}), 'exec:npm ls');
   assert.equal(alwaysKey('exec', {command: 'npm ls --depth=0'}), 'exec:npm ls');
-  assert.equal(alwaysKey('exec', {command: 'npm exec evil'}), 'exec:npm exec');
+  assert.equal(alwaysKey('exec', {command: 'npm exec evil'}), 'exec:npm exec evil');
   assert.notEqual(alwaysKey('exec', {command: 'npm ls'}), alwaysKey('exec', {command: 'npm exec evil'}));
-  assert.equal(alwaysKey('exec', {command: 'npm run build'}), 'exec:npm run');
+  assert.equal(alwaysKey('exec', {command: 'npm run build'}), 'exec:npm run build');
   assert.equal(alwaysKey('exec', {command: 'npm install react'}), 'exec:npm install');
   assert.equal(alwaysKey('exec', {command: 'git status'}), 'exec:git status');
   assert.equal(alwaysKey('exec', {command: 'git push origin main'}), 'exec:git push');
@@ -134,6 +134,52 @@ test('alwaysKey narrows exec by a plain subcommand word', () => {
   assert.equal(alwaysKey('exec', {command: '  NPM   LS  '}), 'exec:npm ls');
   assert.equal(alwaysKey('exec', {command: ''}), null);
   assert.equal(alwaysKey('read', {command: 'npm ls'}), null);
+});
+
+// Audit #210: the second word of a dispatcher command names only the family;
+// the third word is the script / package / image that actually runs.
+test('alwaysKey: dispatcher verbs name the word that actually runs (audit #210)', () => {
+  assert.equal(alwaysKey('exec', {command: 'npm run build'}), 'exec:npm run build');
+  assert.equal(alwaysKey('exec', {command: 'npm run'}), null, 'no script named: nothing safe to remember');
+  assert.equal(alwaysKey('exec', {command: 'npm run --silent build'}), null, 'a flag in the script slot is not a script');
+  assert.equal(alwaysKey('exec', {command: 'npm exec evil'}), 'exec:npm exec evil');
+  assert.equal(alwaysKey('exec', {command: 'docker run alpine'}), 'exec:docker run alpine');
+  assert.equal(alwaysKey('exec', {command: 'yarn dlx cowsay'}), 'exec:yarn dlx cowsay');
+  assert.equal(alwaysKey('exec', {command: 'npm test'}), 'exec:npm test', 'a plain subcommand keeps its two-word key');
+  assert.notEqual(alwaysKey('exec', {command: 'npm run build'}), alwaysKey('exec', {command: 'npm run deploy'}));
+  const always = new Set([alwaysKey('exec', {command: 'npm run build'})]);
+  const d = (command) => decide({mode: 'default', kind: 'exec', params: {command}, always});
+  assert.equal(d('npm run build'), 'allow');
+  assert.equal(d('npm run deploy'), 'ask');
+  assert.equal(d('npm exec evil'), 'ask');
+});
+
+// Audit #211: --contents prints an arbitrary file as the blamed text.
+test('git blame --contents is not read-only (audit #211)', () => {
+  assert.equal(readOnlyCommand('git blame --contents C:/Users/x/anything.txt HEAD'), false);
+  assert.equal(readOnlyCommand('git blame --contents=anything.txt HEAD'), false);
+  assert.equal(readOnlyCommand('git blame src/policy.js'), true);
+});
+
+// Audit #208/#209: the secret screen behind read-only searches — bare file
+// names, glob pathspecs, and search roots outside the working folder.
+test('decide: read-only searches that can reach secrets ask (audit #208/#209)', () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const plan = (command, extra = {}) => decide({mode: 'plan', kind: 'exec', params: {command}, gitConfig: () => '', ...extra});
+  // Bare names: the shell is already inside the secret's folder.
+  assert.equal(plan('rg -e . id_rsa'), 'deny');
+  assert.equal(plan('rg -e . credentials.json'), 'deny');
+  assert.equal(plan('rg -e . notes.txt'), 'allow', 'an ordinary bare name stays read-only');
+  // A glob pathspec is expanded by git, not by the lexical screen.
+  assert.equal(plan('git log -p -- *.env'), 'deny');
+  assert.equal(plan('git log -p -- *.js'), 'allow');
+  // A search rooted outside the working folder reads whatever lives there.
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-policy-work-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-policy-out-'));
+  fs.mkdirSync(path.join(work, 'sub'));
+  assert.equal(plan('rg needle ' + outside, {cwd: work}), 'deny');
+  assert.equal(plan('rg needle .', {cwd: work}), 'allow', 'the working folder itself stays trusted');
+  assert.equal(plan('rg needle sub', {cwd: work}), 'allow', 'a folder inside the workspace stays trusted');
 });
 
 test('decide: plan mode allows only provably read-only exec', () => {
@@ -210,9 +256,9 @@ test('a git read runs unasked only when the repo config cannot make it run a pro
 test('a planted core.fsmonitor in a real repo makes git status ask', t => {
   const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), {execFileSync} = require('node:child_process');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fsmon-')); t.after(() => fs.rmSync(dir, {recursive: true, force: true}));
-  execFileSync('git', ['init', '-q', dir]);
+  execFileSync('git', ['init', '-q', dir], {timeout: 30000});
   assert.equal(decide({mode: 'default', kind: 'exec', params: {command: 'git status'}, cwd: dir}), 'allow');
-  execFileSync('git', ['-C', dir, 'config', 'core.fsmonitor', 'echo pwned > pwned.txt']);
+  execFileSync('git', ['-C', dir, 'config', 'core.fsmonitor', 'echo pwned > pwned.txt'], {timeout: 30000});
   assert.equal(decide({mode: 'default', kind: 'exec', params: {command: 'git status'}, cwd: dir}), 'ask');
   assert.equal(decide({mode: 'plan', kind: 'exec', params: {command: 'git status'}, cwd: dir}), 'deny');
   assert.equal(fs.existsSync(path.join(dir, 'pwned.txt')), false, 'checking ran nothing');

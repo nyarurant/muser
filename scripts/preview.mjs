@@ -8,9 +8,10 @@ process.stdout.columns = 96; process.stdout.rows = 40;
 const {Controller} = await import('../src/ui/controller.mjs');
 const view = await import('../src/ui/view.mjs');
 const {lineDiff} = require('../src/tools.js');
+const {version} = require('../package.json');
 class A extends EventEmitter { constructor(){super();this.mode='default';this.cwd='C:/Users/me/proj';this.session={id:'x',turns:0};this.ctx={readFiles:new Set()};this.client={status:'connected'};this.allowAlways=new Set();this.device={connected:true};} }
 A.DEVICE='devbox CLI (muser)';
-const a=new A(); const ctrl=new Controller({agent:a,museName:'Muse',version:'0.1.0',onExit(){}});
+const a=new A(); const ctrl=new Controller({agent:a,museName:'Muse',version,onExit(){}});
 ctrl.push({type:'user',text:'テストが落ちてるので直して'});
 a.emit('text',{id:'m1',text:'了解、`src/app.js` を見ます。\n## 方針\n- **入力**を検証\n```js\nconst x = 1;\n```\n途中の行'});
 a.emit('tool-end',{command:'code.edit',summary:'src/app.js',ok:true,view:{diff:lineDiff('a\nb\nc\nd\n','a\nB\nc\nd\n')}});

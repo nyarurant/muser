@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const {spawnSync} = require('node:child_process');
+const crypto = require('node:crypto');
 const {t} = require('./i18n');
 
 const DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser');
@@ -56,14 +57,42 @@ function preload(names) {
 function save(name, value) {
   const target = file(name), json = JSON.stringify(value), c = fresh(name, stampOf(target));
   if (c && c.json === json) return;
-  fs.mkdirSync(DIR, {recursive: true});
+  // Names may carry a folder (accounts/<id>/web.enc): create the target's own folder, not just DIR.
+  fs.mkdirSync(path.dirname(target), {recursive: true});
   // A temp name per process: two muser windows saving the same file collided on one '.tmp' and
   // the second rename failed (ENOENT) inside the gateway's credentials event.
   const temp = target + '.tmp-' + process.pid + '-' + Date.now();
   fs.writeFileSync(temp, dpapi('Protect', Buffer.from(json, 'utf8')));
-  fs.renameSync(temp, target);
+  // Windows refuses the rename (EPERM / EBUSY / EACCES) while another window or a scanner has the
+  // target open for a moment; the failed save then left its temp file behind for good (four of
+  // them sat next to web.enc / session.enc on 2026-11-03). Retry briefly, and never leave the temp.
+  try { renameRetry(temp, target); }
+  catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
+  sweepTemps(target);
   const st = stampOf(target); if (st) cache.set(name, {...st, json});
 }
+function renameRetry(from, to) {
+  for (let i = 0; ; i++) {
+    try { return fs.renameSync(from, to); }
+    catch (e) {
+      if (i >= 5 || !['EPERM', 'EBUSY', 'EACCES'].includes(e?.code)) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (i + 1));
+    }
+  }
+}
+// Temp files of saves that died before their rename (killed window, older muser): removed once
+// the process that wrote them is gone. A live writer's temp is left alone.
+function sweepTemps(target) {
+  const dir = path.dirname(target), prefix = path.basename(target) + '.tmp-';
+  let names = []; try { names = fs.readdirSync(dir); } catch { return; }
+  for (const n of names) {
+    if (!n.startsWith(prefix)) continue;
+    const pid = Number(n.slice(prefix.length).split('-')[0]);
+    if (pid === process.pid || (Number.isInteger(pid) && pid > 0 && alive(pid))) continue;
+    try { fs.unlinkSync(path.join(dir, n)); } catch {}
+  }
+}
+function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 
 // Missing file -> null ("not logged in yet"). A file that exists but cannot be
 // decrypted or parsed is a different, actionable problem: throw a clear error
@@ -72,12 +101,25 @@ function load(name) {
   const target = file(name);
   const hit = fresh(name, stampOf(target));
   if (hit) return JSON.parse(hit.json);
+  const before = stampOf(target);
   let data;
   try { data = fs.readFileSync(target); }
   catch (e) { if (e && (e.code === 'ENOENT' || e.code === 'ENOTDIR')) return null; throw e; }
   try {
-    const st = stampOf(target), json = dpapi('Unprotect', data).toString('utf8'), value = JSON.parse(json);
-    if (st) cache.set(name, {...st, json});
+    const json = dpapi('Unprotect', data).toString('utf8'), value = JSON.parse(json);
+    // Cache only when the file still holds exactly the bytes that were
+    // decrypted: the stamp used to be taken between reading the file and the
+    // (slow, ~0.4 s) DPAPI call, so another muser writing the file in between
+    // left the cache mapping the NEW file's stamp to the OLD value, and every
+    // later load served the stale secret. Stat before and after, and compare
+    // the ciphertext hash, before trusting the pairing.
+    const after = stampOf(target);
+    if (before && after && before.mtimeMs === after.mtimeMs && before.size === after.size) {
+      const digest = crypto.createHash('sha256').update(data).digest('hex');
+      let same = false;
+      try { same = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex') === digest; } catch {}
+      if (same) cache.set(name, {...after, json});
+    }
     return value;
   } catch (e) {
     throw new Error(t('暗号化ファイル {file} を読み込めませんでした。ファイルが壊れているか、別の Windows ユーザーで作成された可能性があります。`muser login` でログインし直してください。（詳細: {detail}）', {file: target, detail: e.message}));
@@ -86,4 +128,4 @@ function load(name) {
 
 function remove(name) { cache.delete(name); try { fs.unlinkSync(file(name)); } catch {} }
 
-module.exports = {DIR, file, save, load, remove, preload};
+module.exports = {DIR, file, save, load, remove, preload, renameRetry};

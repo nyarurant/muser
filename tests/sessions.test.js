@@ -1,5 +1,6 @@
 'use strict';
 const test = require('node:test');
+const {after} = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -13,10 +14,23 @@ const sessions = require('../src/sessions');
 const FILE = sessions.FILE;
 const DIR = path.dirname(FILE);
 
+after(() => fs.rmSync(tmp, {recursive: true, force: true})); // B8: the mkdtemp store is removed once the file is done
+
 function seed(id) { const s = sessions.create('C:\\work'); s.id = id; sessions.touch(s, 'hello'); return s; }
-function leftovers() { return fs.readdirSync(DIR).filter(f => f.includes('.tmp-')); }
+function leftovers() { return fs.existsSync(DIR) ? fs.readdirSync(DIR).filter(f => f.includes('.tmp-')) : []; }
+function corruptBackups() { return fs.existsSync(DIR) ? fs.readdirSync(DIR).filter(f => f.startsWith('sessions.json.corrupt-')) : []; }
+// B1: every test starts from an EMPTY store. The tests used to share one mutable
+// index, so e.g. the corrupt-backup count below only held because the salvage
+// test ran before it and hand-deleted the backups it had created; run in any
+// other order (or alone after a salvage) the count was wrong.
+function resetStore() {
+  fs.rmSync(FILE, {force: true}); fs.rmSync(FILE + '.lock', {force: true});
+  for (const f of corruptBackups()) fs.rmSync(path.join(DIR, f), {force: true});
+  for (const f of leftovers()) fs.rmSync(path.join(DIR, f), {force: true});
+}
 
 test('atomic save: file stays valid JSON and no temp files are left behind', () => {
+  resetStore();
   seed('11111111-aaaa');
   const list = JSON.parse(fs.readFileSync(FILE, 'utf8'));
   assert.ok(Array.isArray(list) && list.some(s => s.id === '11111111-aaaa'));
@@ -24,6 +38,7 @@ test('atomic save: file stays valid JSON and no temp files are left behind', () 
 });
 
 test('find: exact match wins, unique prefix resolves, ambiguous prefix returns null + flag', () => {
+  resetStore();
   seed('aaaa-1111'); seed('aaaa-2222'); seed('ab'); seed('abcd'); seed('cccc-3333');
   assert.equal(sessions.find('cccc').id, 'cccc-3333');
   assert.equal(sessions.find.ambiguous, false);
@@ -35,12 +50,67 @@ test('find: exact match wins, unique prefix resolves, ambiguous prefix returns n
   assert.equal(sessions.find.ambiguous, false);
 });
 
+test('#55: a truncated index is salvaged, not emptied — complete entries survive and the next touch keeps them', () => {
+  resetStore();
+  const good = [
+    {id: 'salv-1', cwd: 'C:\\work', title: 'one', turns: 2, created: 1, updated: 2},
+    {id: 'salv-2', cwd: 'C:\\work', title: 'two', turns: 1, created: 1, updated: 3},
+  ];
+  fs.writeFileSync(FILE, JSON.stringify(good) + ',{"id":"salv-3","cwd":"C:\\w');
+  assert.deepEqual(sessions.recent().map(s => s.id), ['salv-2', 'salv-1'], 'the two complete entries are recovered');
+  seed('salv-9');
+  const ids = JSON.parse(fs.readFileSync(FILE, 'utf8')).map(s => s.id).sort();
+  assert.deepEqual(ids, ['salv-1', 'salv-2', 'salv-9'], 'the salvaged entries were persisted, not overwritten by a 1-entry index');
+  // No hand-cleanup of this test's corrupt backups: the corrupt test below
+  // resets the store itself and counts relative to what it found (B1).
+});
+
+test('#53/#54: save/touch merge with the stored entry (other-window metadata and turns survive); a failed touch rolls the counter back', () => {
+  resetStore();
+  const s = seed('merge-1');
+  // Another window enriches the stored entry behind this object's back.
+  const list = JSON.parse(fs.readFileSync(FILE, 'utf8'));
+  const stored = list.find(x => x.id === 'merge-1');
+  stored.goal = 'other window goal'; stored.turns = 10;
+  fs.writeFileSync(FILE, JSON.stringify(list));
+  sessions.save(s);
+  let now = JSON.parse(fs.readFileSync(FILE, 'utf8')).find(x => x.id === 'merge-1');
+  assert.equal(now.goal, 'other window goal', 'stored-only metadata was not overwritten away');
+  assert.equal(now.turns, 10, 'turns never moves backwards');
+  sessions.touch(s, 'next');
+  now = JSON.parse(fs.readFileSync(FILE, 'utf8')).find(x => x.id === 'merge-1');
+  assert.equal(now.turns, 11, 'the new turn counts on top of the stored count');
+  assert.equal(now.goal, 'other window goal');
+  // A write that cannot land (the index path is a folder, so all() throws)
+  // must not leave the in-memory counter ahead of disk.
+  const victim = {...sessions.create('C:\\work'), turns: 5};
+  fs.rmSync(FILE); fs.mkdirSync(FILE);
+  try { assert.throws(() => sessions.touch(victim, 'boom')); assert.equal(victim.turns, 5, 'turns rolled back after the failed write'); }
+  finally { fs.rmSync(FILE, {recursive: true, force: true}); }
+});
+
+test('#50: a live lock is never bypassed — touch waits, then throws, instead of writing unlocked', {timeout: 30000}, () => {
+  resetStore();
+  const lock = FILE + '.lock';
+  fs.writeFileSync(lock, 'someone-else:' + process.pid); // a lock whose holder process is alive: never stale, never bypassed
+  const s = sessions.create('C:\\work');
+  const t0 = Date.now();
+  try {
+    assert.throws(() => sessions.touch(s, 'must not land'), /locked by another muser window/);
+    assert.ok(Date.now() - t0 >= 5000, 'it waited past the stale threshold instead of spinning for 2 s and running unlocked');
+    assert.equal(sessions.find(s.id), undefined, 'nothing was written without the lock');
+  } finally { fs.rmSync(lock, {force: true}); }
+});
+
 test('corrupt JSON is backed up aside, not wiped, and the store recovers', () => {
+  resetStore();
+  const before = corruptBackups().length;
   fs.writeFileSync(FILE, 'not json{{{');
   assert.deepEqual(sessions.recent(), []);
-  const backups = fs.readdirSync(DIR).filter(f => f.startsWith('sessions.json.corrupt-'));
-  assert.equal(backups.length, 1);
-  assert.equal(fs.readFileSync(path.join(DIR, backups[0]), 'utf8'), 'not json{{{', 'original bytes survive in the backup');
+  const backups = corruptBackups();
+  assert.equal(backups.length, before + 1, 'exactly one new backup, whatever earlier tests left behind');
+  const mine = backups.find(f => fs.readFileSync(path.join(DIR, f), 'utf8') === 'not json{{{');
+  assert.ok(mine, 'original bytes survive in the new backup');
   seed('dddd-4444');
   assert.equal(sessions.find('dddd').id, 'dddd-4444');
   assert.deepEqual(leftovers(), []);

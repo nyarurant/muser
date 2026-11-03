@@ -14,7 +14,10 @@ function unprotect(buf) {
   const script = 'Add-Type -AssemblyName System.Security;$b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim());' +
     '[Console]::Out.Write([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)))';
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {input: buf.toString('base64'), encoding: 'utf8', windowsHide: true, timeout: 15000});
-  if (r.status !== 0) throw new Error(t('デスクトップ版の暗号鍵を開けませんでした。'));
+  // A spawn failure (powershell missing/blocked, timeout) sets r.error and leaves stdout
+  // null; checking only r.status fell through to r.stdout.trim() and surfaced a bare
+  // TypeError instead of the friendly message below.
+  if (r.error || r.status !== 0 || typeof r.stdout !== 'string') throw new Error(t('デスクトップ版の暗号鍵を開けませんでした。'));
   // The base64 input and r.stdout are JS strings and cannot be zeroed; the returned
   // Buffer is the decrypted key and the caller zeroes it (fill(0)) after use.
   return Buffer.from(r.stdout.trim(), 'base64');
@@ -51,4 +54,4 @@ function desktopSdkToken() {
   return {sdkToken: saved.sdkToken, sdkTokenId: saved.sdkTokenId};
 }
 
-module.exports = {desktopSdkToken, APP_DIR};
+module.exports = {desktopSdkToken, APP_DIR, unprotect};

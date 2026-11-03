@@ -11,3 +11,6 @@ process.env.MUSER_PERMISSIONS_FILE = path.join(os.tmpdir(), 'muser-test-permissi
 // ran a real turn wrote its session into the user's sessions.json.
 import fs from 'node:fs';
 process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-test-data-'));
+// And the home folder: ~/.muser/AGENTS.md (the user's instructions for every project) and
+// ~/.muser/config.json of the real user were read into tests.
+process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-test-home-'));
