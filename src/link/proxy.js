@@ -4,6 +4,7 @@
 // code paths (remote/DESIGN.md, "Inside the channel"). One-shot requests for
 // {t:'req'} and long-lived SSE subscriptions for {t:'sub'}.
 const http = require('node:http');
+const {TextDecoder} = require('node:util');
 
 const REQUEST_TIMEOUT_MS = 30000;
 // Serve can hand back media up to ~32 MB; anything past the cap is a runaway
@@ -21,18 +22,34 @@ function createProxy({port, token, host = '127.0.0.1', requestTimeoutMs = REQUES
   if (!port) throw new Error('link proxy: serve port is required');
   const headers = extra => ({authorization: 'Bearer ' + token, ...extra});
 
-  // {method, path, body} -> {status, body, contentType}. A JSON response body comes
-  // back parsed; anything else (or an empty body) is text / null.
-  function request({method = 'GET', path: p, body} = {}) {
+  // {method, path, body, signal} -> {status, body, contentType[, bodyEncoding]}. A JSON
+  // response body comes back parsed; other text is a string (empty body: null). A BINARY
+  // response (media etc.) must not be forced through UTF-8: invalid bytes would be
+  // replaced by U+FFFD and the original bytes lost for good (deep audit c20 #9), so it
+  // comes back base64 with bodyEncoding: 'base64', which survives the channel's JSON
+  // framing intact and decodes back to the exact bytes.
+  function abortError() {
+    const e = new Error('link proxy: request aborted');
+    e.name = 'AbortError';
+    e.code = 'ABORT_ERR';
+    return e;
+  }
+  function request({method = 'GET', path: p, body, signal} = {}) {
     return new Promise((resolve, reject) => {
+      // Honour the caller's AbortSignal (deep audit H9): channel-server
+      // aborts a request once every channel waiting on it has gone away, and
+      // that must cancel the serve request itself, not just the bookkeeping.
+      if (signal?.aborted) { reject(abortError()); return; }
       const data = body === undefined || body === null ? null : (typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body));
+      const onAbort = () => { try { req.destroy(abortError()); } catch {} };
+      const detachSignal = () => { try { signal?.removeEventListener?.('abort', onAbort); } catch {} };
       const req = http.request({host, port, path: p, method, headers: headers(data ? {'content-type': 'application/json'} : {})}, res => {
         const chunks = [];
         let size = 0;
         res.on('data', c => {
           size += c.length;
           if (size > maxResponseBytes) {
-            clearTimeout(deadline);
+            clearTimeout(deadline); detachSignal();
             // Destroy without an error argument: passing one re-emits it as a
             // stray 'error' on the response stream; the reject below is the
             // single, clean failure for this request.
@@ -43,21 +60,29 @@ function createProxy({port, token, host = '127.0.0.1', requestTimeoutMs = REQUES
           chunks.push(c);
         });
         res.on('end', () => {
-          clearTimeout(deadline);
-          const text = Buffer.concat(chunks).toString('utf8');
+          clearTimeout(deadline); detachSignal();
+          const raw = Buffer.concat(chunks);
+          const contentType = res.headers['content-type'] || null;
+          if (!raw.length) { resolve({status: res.statusCode, body: null, contentType}); return; }
+          const ct = String(contentType || '').split(';')[0].trim().toLowerCase();
+          let binary = !!ct && !ct.startsWith('text/') && ct !== 'image/svg+xml' && !ct.includes('json') && !ct.includes('xml') && ct !== 'application/javascript' && ct !== 'application/x-www-form-urlencoded';
+          if (!binary) { try { new TextDecoder('utf-8', {fatal: true}).decode(raw); } catch { binary = true; } }
+          if (binary) { resolve({status: res.statusCode, body: raw.toString('base64'), contentType, bodyEncoding: 'base64'}); return; }
+          const text = raw.toString('utf8');
           let parsed = null;
           if (text) { try { parsed = JSON.parse(text); } catch { parsed = text; } }
-          resolve({status: res.statusCode, body: parsed, contentType: res.headers['content-type'] || null});
+          resolve({status: res.statusCode, body: parsed, contentType});
         });
-        res.on('error', err => { clearTimeout(deadline); reject(err); });
+        res.on('error', err => { clearTimeout(deadline); detachSignal(); reject(err); });
       });
+      if (signal && typeof signal.addEventListener === 'function') signal.addEventListener('abort', onAbort, {once: true});
       // A deadline, not socket inactivity: a response that keeps dripping a
       // chunk every few seconds must still die at the limit (audit #110).
       // req.setTimeout alone only measures the gap between chunks.
       const deadline = setTimeout(() => req.destroy(new Error('link proxy: serve did not answer in time')), requestTimeoutMs);
       deadline.unref?.();
       req.setTimeout(requestTimeoutMs, () => req.destroy(new Error('link proxy: serve did not answer in time')));
-      req.on('error', err => { clearTimeout(deadline); reject(err); });
+      req.on('error', err => { clearTimeout(deadline); detachSignal(); reject(err); });
       if (data) req.write(data);
       req.end();
     });

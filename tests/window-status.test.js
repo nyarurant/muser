@@ -122,8 +122,13 @@ test('muser status reads the real folders: a window file and a running exec file
   fs.writeFileSync(ef, JSON.stringify({version: 1, state: 'running', pid: process.pid, startedAt: now, updatedAt: now, cwd: 'C:\\e', tools: 1}));
   try {
     const all = await status.gatherAll({readServer: () => null, readGui: () => null});
-    assert.deepEqual(all.windows.map(w => w.pid), [process.pid]);
-    assert.deepEqual(all.execs.map(v => v.pid), [process.pid]);
+    // t6 #11 (deep audit): exact-equality here assumed this process is the
+    // ONLY live window/exec in the real folders — false when the suite runs
+    // inside a muser window (system.run), whose own fresh status files then
+    // join the list and fail a correct implementation. The test's claim is
+    // that OUR files show up; assert exactly that.
+    assert.ok(all.windows.some(w => w.pid === process.pid), 'the window file written into the real folder is listed');
+    assert.ok(all.execs.some(v => v.pid === process.pid), 'the running exec file written into the real folder is listed');
     assert.deepEqual(all.servers, []);
   } finally { fs.rmSync(wf, {force: true}); fs.rmSync(ef, {force: true}); }
 });

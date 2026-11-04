@@ -67,19 +67,66 @@ function encodeControlMessage(message) {
 class ControlMessageDecoder {
   constructor(maxMessageBytes = MAX_INBOUND_MESSAGE) {
     this.maxMessageBytes = maxMessageBytes;
-    this.buffer = Buffer.alloc(0);
+    // Fix (c7 #5): keep the not-yet-parsed bytes as a queue of chunks
+    // instead of one buffer re-concatenated on every feed(). Concatenating
+    // the whole accumulation per chunk made a fragmented (legal, up to
+    // 4 MB) control message cost quadratic copying and could stall the
+    // event loop; with a queue each byte is copied only when its message
+    // is taken out, so the total work stays linear in the message size.
+    this._chunks = [];
+    this._buffered = 0;
+  }
+
+  _peekLength() {
+    const head = Buffer.allocUnsafe(4);
+    let copied = 0;
+    for (const chunk of this._chunks) {
+      const take = Math.min(chunk.length, 4 - copied);
+      chunk.copy(head, copied, 0, take);
+      copied += take;
+      if (copied === 4) break;
+    }
+    return head.readUInt32LE(0);
+  }
+
+  _take(count) {
+    const firstChunk = this._chunks[0];
+    if (firstChunk.length >= count) {
+      if (firstChunk.length === count) this._chunks.shift();
+      else this._chunks[0] = firstChunk.subarray(count);
+      this._buffered -= count;
+      return firstChunk.subarray(0, count);
+    }
+    const parts = [];
+    let remaining = count;
+    while (remaining > 0) {
+      const chunk = this._chunks[0];
+      if (chunk.length <= remaining) {
+        parts.push(chunk);
+        this._chunks.shift();
+        remaining -= chunk.length;
+      } else {
+        parts.push(chunk.subarray(0, remaining));
+        this._chunks[0] = chunk.subarray(remaining);
+        remaining = 0;
+      }
+    }
+    this._buffered -= count;
+    return Buffer.concat(parts, count);
   }
 
   feed(chunk) {
     const data = asBinary(chunk);
-    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, data]) : data;
+    if (data.length) {
+      this._chunks.push(data);
+      this._buffered += data.length;
+    }
     const messages = [];
-    while (this.buffer.length >= 4) {
-      const length = this.buffer.readUInt32LE(0);
+    while (this._buffered >= 4) {
+      const length = this._peekLength();
       if (length > this.maxMessageBytes) throw safeError('inbound_too_large');
-      if (this.buffer.length < length + 4) break;
-      const raw = this.buffer.subarray(4, length + 4);
-      this.buffer = this.buffer.subarray(length + 4);
+      if (this._buffered < length + 4) break;
+      const raw = this._take(length + 4).subarray(4);
       if (length === 0) continue;
       // Audit #135: a corrupt payload used to be silently skipped, so a
       // damaged registration response vanished and connect() hung for its
@@ -95,7 +142,7 @@ class ControlMessageDecoder {
       if (!isRecord(message)) throw safeError('protocol_error');
       messages.push(message);
     }
-    if (this.buffer.length > this.maxMessageBytes + 4) {
+    if (this._buffered > this.maxMessageBytes + 4) {
       throw safeError('inbound_too_large');
     }
     return messages;
@@ -173,16 +220,23 @@ class NativeDevice extends EventEmitter {
     if (invokes && !invokes.sent) invokes.sent = this._sentInvokeResults;
     this._seenInvokeIds = invokes?.seen || new Set();
     if (invokes && !invokes.seen) invokes.seen = this._seenInvokeIds;
+    // Shared alongside the invoke maps: the one in-flight result send per
+    // invoke id, so senders on different instances coordinate (see
+    // _sendResultShared).
+    this._sendingResults = invokes?.sending || new Map();
+    if (invokes && !invokes.sending) invokes.sending = this._sendingResults;
     this._lastInboundAt = 0;
     this._invokeBusy = false;
     this._streamFallback = 1n;
     this._sendQueue = Promise.resolve();
     this._connectPromise = null;
+    this._connectTarget = null;
     this._connectWait = null;
     this._connectTimer = null;
     this._registerWait = null;
     this._pingTimer = null;
     this._watchdogGraceMs = 30000; // extra time past an invoke's own timeout before the watchdog answers for it
+    this._zombieTimeoutMs = 120000; // extra time past the watchdog before a never-settling invoke's slot is freed anyway (c7 #1)
   }
 
   get connected() {
@@ -224,16 +278,28 @@ class NativeDevice extends EventEmitter {
     if (typeof nodeId !== 'string' || !nodeId) {
       return Promise.reject(safeError('node_id_required'));
     }
-    if (this._connectPromise) return this._connectPromise;
     // Audit #127: the same nodeId with NEW credentials (a different VM or a
     // rotated token) is not the connection we already have — falling through
     // reconnects with the new ones instead of silently keeping the old VM.
     if (this.connected && this._nodeId === nodeId && this._vmId === vm.vm_id && this._vmToken === vm.vm_auth_token) return Promise.resolve();
+    if (this._connectPromise) {
+      const target = this._connectTarget;
+      if (target && target.nodeId === nodeId && target.vmId === vm.vm_id && target.token === vm.vm_auth_token) {
+        return this._connectPromise;
+      }
+      // Fix (c7 #2): a connect() during an in-flight attempt used to return
+      // the old attempt's promise without looking at its arguments, so new
+      // credentials/nodeId were silently ignored and the caller believed
+      // it had connected to the new VM. Supersede the old attempt instead:
+      // it is rejected as closed and the new target is connected below.
+      this.disconnect();
+    }
     if (this._ws || this._transport) this.disconnect();
 
     this._nodeId = nodeId;
     this._vmId = vm.vm_id;
     this._vmToken = vm.vm_auth_token;
+    this._connectTarget = {nodeId, vmId: vm.vm_id, token: vm.vm_auth_token};
     this._phase = 'opening';
     this._emitStatus(false, statusMessage('connecting'));
 
@@ -536,14 +602,19 @@ class NativeDevice extends EventEmitter {
     if (!invokeId || invokeId.length > 256) return;
     if (this._completedInvokes.has(invokeId)) {
       const result = this._completedInvokes.get(invokeId);
-      this._sendResult(invokeId, result).catch(() => {});
+      // Fix (c7 #4): go through the shared send coordination instead of
+      // _sendResult directly. If the original completion's send is still
+      // in flight this duplicate waits for it and does not deliver the
+      // same result a second time; if no send is in flight (e.g. a re-ask
+      // on a reconnected device) the cached result is sent as before.
+      this._sendResultShared(invokeId, result).catch(() => {});
       return;
     }
     // Audit #131: the result payload was evicted from the 128-entry cache,
     // but the id is still tombstoned — answer that it already completed
     // instead of running a non-idempotent command a second time.
     if (this._seenInvokeIds.has(invokeId)) {
-      this._sendResult(invokeId, {ok: false, error: 'already_completed'}).catch(() => {});
+      this._sendResultShared(invokeId, {ok: false, error: 'already_completed'}).catch(() => {});
       return;
     }
     const prior = this._inflightInvokes.get(invokeId);
@@ -578,12 +649,32 @@ class NativeDevice extends EventEmitter {
     // a duplicate re-sent after the command actually finished is answered from
     // the real result instead of getting 'invoke_timeout' from the record forever.
     let watchdog = null;
+    let zombieTimer = null;
     let timedOut = false;
     const task = Promise.race([
       executed,
       new Promise((resolve) => {
         watchdog = setTimeout(
-          () => { timedOut = true; resolve({ok: false, error: 'invoke_timeout'}); },
+          () => {
+            timedOut = true;
+            resolve({ok: false, error: 'invoke_timeout'});
+            // Fix (c7 #1): the watchdog answers the caller, but #132 keeps
+            // the concurrency slot while the command still runs as a
+            // zombie. An execute() that NEVER settles kept that slot
+            // forever, so six hangs permanently filled
+            // MAX_CONCURRENT_INVOKES and every later invoke was answered
+            // 'busy' until restart. Bound the zombie: if the command
+            // still has not settled after the extra zombie timeout, free
+            // the slot anyway. A late settlement still replaces the
+            // remembered timeout result (the executed handlers below),
+            // and a duplicate re-send is answered from the completed
+            // cache, so freeing the slot cannot re-run the command.
+            zombieTimer = setTimeout(() => {
+              zombieTimer = null;
+              if (this._inflightInvokes.get(invokeId) === task) this._inflightInvokes.delete(invokeId);
+            }, this._zombieTimeoutMs);
+            zombieTimer.unref?.();
+          },
           (timeoutMs || 120000) + this._watchdogGraceMs,
         );
         watchdog.unref?.();
@@ -593,6 +684,10 @@ class NativeDevice extends EventEmitter {
       if (watchdog !== null) {
         clearTimeout(watchdog);
         watchdog = null;
+      }
+      if (zombieTimer !== null) {
+        clearTimeout(zombieTimer);
+        zombieTimer = null;
       }
     };
     let executedSettled = false;
@@ -689,14 +784,52 @@ class NativeDevice extends EventEmitter {
   // instances sharing the invoke maps). Exactly one of them delivers the
   // result; the claim is released when the send fails so another waiter on a
   // live connection can still deliver it.
+  // Fix (first audit #15): a waiter that arrived while the original send
+  // was still in flight used to return at once; when that send then failed
+  // and released the claim, nobody retried and the result was lost. Waiters
+  // now await the in-flight attempt and, if it failed, claim the send
+  // themselves (see _sendResultShared).
   async _sendResultOnce(id, result) {
-    if (this._sentInvokeResults.has(id)) return;
-    this._sentInvokeResults.add(id);
-    while (this._sentInvokeResults.size > MAX_SEEN_INVOKES) {
-      this._sentInvokeResults.delete(this._sentInvokeResults.values().next().value);
+    if (this._sentInvokeResults.has(id)) return true;
+    return this._sendResultShared(id, result);
+  }
+
+  // Coordinates the one in-flight result send per invoke id across every
+  // device instance sharing the invoke maps: concurrent callers await the
+  // current attempt instead of sending in parallel, and a caller whose
+  // awaited attempt failed loops and becomes the sender itself. A
+  // successful delivery is remembered in _sentInvokeResults so later
+  // _sendResultOnce callers for the same dispatch skip. The
+  // completed-cache path uses this directly (not the _sentInvokeResults
+  // check), so a duplicate arriving while the original send is queued
+  // cannot double-deliver (c7 #4), while a re-ask after delivery still
+  // re-sends on its own connection because nothing is in flight then.
+  async _sendResultShared(id, result) {
+    while (true) {
+      const inflight = this._sendingResults.get(id);
+      if (inflight) {
+        if (await inflight) return true;
+        continue;
+      }
+      let settleAttempt;
+      const attempt = new Promise((resolve) => { settleAttempt = resolve; });
+      this._sendingResults.set(id, attempt);
+      let ok = false;
+      try {
+        ok = await this._sendResult(id, result);
+      } catch {
+        ok = false;
+      }
+      if (this._sendingResults.get(id) === attempt) this._sendingResults.delete(id);
+      if (ok) {
+        this._sentInvokeResults.add(id);
+        while (this._sentInvokeResults.size > MAX_SEEN_INVOKES) {
+          this._sentInvokeResults.delete(this._sentInvokeResults.values().next().value);
+        }
+      }
+      settleAttempt(ok);
+      return ok;
     }
-    const ok = await this._sendResult(id, result);
-    if (!ok) this._sentInvokeResults.delete(id);
   }
 
   send(text, sessionId = '', extra = {}) {
@@ -838,6 +971,13 @@ class NativeDevice extends EventEmitter {
     const ws = this._ws;
     const wasActive = Boolean(ws || this._transport || this._phase !== 'idle' || this._connected);
     this._ws = null;
+    // Fix (c7 #3): clear the connect promise synchronously here instead of
+    // leaving it to connect()'s .finally() microtask: a connect() issued
+    // in the same tick right after disconnect()/_failConnection used to
+    // get the old, already-rejected promise back and never opened a new
+    // socket.
+    this._connectPromise = null;
+    this._connectTarget = null;
     this._phase = 'idle';
     this._connected = false;
     this._clearConnectTimer();

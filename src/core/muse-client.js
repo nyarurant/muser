@@ -55,6 +55,12 @@ class MuseClient extends EventEmitter {
     this.locale=typeof locale==='string'&&/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(locale)?locale:'';
     this.pending=new Map(); this.ws=null; this.transport=null; this.connecting=null; this.status='disconnected'; this.badFrames=0;
     this.socketVmId=null; this.deferredCredentials=null;
+    // Deep #95: open() captures openSeq after its own opening disconnect(); any
+    // later disconnect() bumps it, so an open() that was superseded or cancelled
+    // while it waited can tell and stop instead of creating a zombie socket.
+    // _openFail settles an in-flight handshake promise from disconnect().
+    // _lastInboundAt is a monotonic (performance.now) liveness stamp for startPing.
+    this.openSeq=0; this._openFail=null; this._lastInboundAt=0;
   }
   state(status,message) { this.status=status; this.emit('status',{status,message}); }
   // One credential refresh attempt with a named outcome, so the login
@@ -69,11 +75,14 @@ class MuseClient extends EventEmitter {
     // A network failure says nothing about the login; only an HTTP refusal means "not signed in".
     // muser: a server error (5xx) or rate limit (429) says nothing about the login either; taken as
     // 'waiting' it marked the login lapsed and stopped reconnecting on a passing muse.ai hiccup.
-    try { session=await this.fetchJson('/api/session?vm_state=true'); } catch(e) { return e?.network||e?.status>=500||e?.status===429?'error':'waiting'; }
+    // Deep #94: same classification as web.js probe() — fetchJson marks a non-JSON
+    // body parse:true and a mid-read timeout timeout:true, and neither says the
+    // login lapsed; this copy used to fall through to 'waiting'/'token' for them.
+    try { session=await this.fetchJson('/api/session?vm_state=true'); } catch(e) { return e?.network||e?.timeout||e?.parse||e?.status>=500||e?.status===429?'error':'waiting'; }
     if(!session?.endpoint_url||!session?.vm_id) return 'session';
     try { allowedGateway(session.endpoint_url); } catch { return 'session'; }
     let result;
-    try { result=await this.fetchJson('/api/hatch/token',{vmAddress:session.endpoint_url,vmName:session.vm_name,force_refresh:true}); } catch { return 'token'; }
+    try { result=await this.fetchJson('/api/hatch/token',{vmAddress:session.endpoint_url,vmName:session.vm_name,force_refresh:true}); } catch(e) { return e?.network||e?.timeout||e?.parse||e?.status>=500||e?.status===429?'error':'token'; }
     if(!result?.token) return 'token';
     const next={gateway:'https://hatch.metaaivm.com',vmId:session.vm_id,vmName:session.vm_name,endpoint:session.endpoint_url,appId:this.credentials?.appId||'hatch-web',token:result.token,notaryToken:result.notary_token,source:'login'};
     // Audit #126: a refresh that lands while a socket is live (or opening) for a
@@ -98,6 +107,8 @@ class MuseClient extends EventEmitter {
   }
   async open() {
     this.disconnect(false); this.state('connecting',t('Muse に接続しています…'));
+    const seq=this.openSeq;
+    const aborted=()=>seq!==this.openSeq;
     // muser: a credential refresh can take up to ~24 s (two website calls with their own
     // timeouts) while the cached credentials are usually still good. Race it against ~3 s and
     // connect with the cached ones when it is slow. With requireLogin the gate is kept: when
@@ -107,20 +118,36 @@ class MuseClient extends EventEmitter {
     let timer=null;
     let stage=await Promise.race([refresh,new Promise(r=>{timer=setTimeout(()=>r('__slow'),3000);timer.unref?.();})]);
     if(timer)clearTimeout(timer);
+    // Deep #95: a disconnect() during the wait above (account switch, shutdown)
+    // must stop this open here; going on would create a socket nobody owns.
+    if(aborted()) throw new Error(t('Muse の接続が終了しました。'));
     if(stage==='__slow'&&this.requireLogin&&this.credentials?.source!=='login') stage=await refresh;
+    if(aborted()) throw new Error(t('Muse の接続が終了しました。'));
     if(this.requireLogin&&(stage==='waiting'||this.credentials?.source!=='login')) {
       this.state('auth_required',t('Muse にログインしてください。'));throw new Error(t('Muse にログインしてください。'));
     }
     const c=this.credentials;
     if(!c?.token) { this.state('auth_required',t('ログインまたは通信記録の読み込みが必要です。')); throw new Error(t('Muse にログインしてください。')); }
     this.socketVmId=c.vmId||null;
-    const target=allowedGateway(c.gateway); target.protocol='wss:';target.pathname='/v1/noise';target.search='';
-    for(const [k,v] of Object.entries({vm_id:c.vmId,auth_token:c.token,notary_token:c.notaryToken,app_id:c.appId,request_id:crypto.randomUUID()})) if(v) target.searchParams.set(k,v);
-    const ws=new WebSocket(target,{origin:'https://muse.ai',handshakeTimeout:15000,maxPayload:1024*1024}); this.ws=ws;
-    const noise=new NoiseXX(); let established=false;
+    let ws,noise;
+    try {
+      const target=allowedGateway(c.gateway); target.protocol='wss:';target.pathname='/v1/noise';target.search='';
+      for(const [k,v] of Object.entries({vm_id:c.vmId,auth_token:c.token,notary_token:c.notaryToken,app_id:c.appId,request_id:crypto.randomUUID()})) if(v) target.searchParams.set(k,v);
+      ws=new WebSocket(target,{origin:'https://muse.ai',handshakeTimeout:15000,maxPayload:1024*1024}); this.ws=ws;
+      noise=new NoiseXX();
+    } catch(e) {
+      // Deep #98: these throws sit outside the handshake promise, so without this
+      // the status stayed 'connecting' forever and no reconnect was scheduled.
+      if(this.ws===ws&&ws) { this.ws=null; try{ws.terminate();}catch{} }
+      this.state('error',e.message); throw e;
+    }
+    let established=false;
     return new Promise((resolve,reject)=>{
       const timeout=setTimeout(()=>fail(new Error(t('Muse への接続がタイムアウトしました。'))),20000);
-      const fail=(e,status='error')=>{clearTimeout(timeout);if(this.ws===ws){this.disconnect(false);this.state(status,e.message);}reject(e);};
+      const fail=(e,status='error')=>{clearTimeout(timeout);this._openFail=null;if(this.ws===ws){this.disconnect(false);this.state(status,e.message);}reject(e);};
+      // Deep #95: disconnect() calls this to settle a handshake still in flight,
+      // instead of leaving connect() hanging until the 20 s timeout above.
+      this._openFail=e=>{clearTimeout(timeout);reject(e);};
       ws.on('open',()=>{try{ws.send(noise.message1());}catch{fail(new Error(t('暗号化接続を開始できませんでした。')));}});
       ws.on('unexpected-response',(_,res)=>{const auth=res.statusCode===401||res.statusCode===403;fail(new Error(auth?t('Muse の認証が切れています。ログインし直してください。'):t('Muse に接続できませんでした (HTTP {status})。', {status: res.statusCode})),auth?'auth_required':'error');});
       ws.on('error',()=>{if(!established)fail(new Error(t('Muse の通信に失敗しました。接続情報を更新してください。')));});
@@ -136,13 +163,22 @@ class MuseClient extends EventEmitter {
             const fingerprint=crypto.createHash('sha256').update(noise.remoteStatic).digest('hex');
             this.checkPin?.(c.vmId,fingerprint);
             const keys=noise.message3();this.transport=new Transport(keys.tx,keys.rx);ws.send(keys.message);
-            established=true;clearTimeout(timeout);this.startPing(ws);this.state('connected',t('接続済み'));resolve();
+            // Fifth f2-2: a new connection starts a new bad-frame streak — the
+            // counter is consecutive-only, so the 10 that dropped the old socket
+            // must not carry over and drop the new one on its first bad record.
+            established=true;clearTimeout(timeout);this._openFail=null;this.badFrames=0;this.startPing(ws);this.state('connected',t('接続済み'));resolve();
           }else this.onFrame(this.transport.decode(data));
         }catch(e){if(!established)fail(e);else{this.disconnect(false);this.state('error',t('Muse の暗号化通信が中断されました。再接続してください。'));}}
       });
-      ws.on('close',()=>{
+      ws.on('close',code=>{
         if(this.ws!==ws)return;
-        if(!established)fail(new Error(t('Muse との接続が閉じられました。')));
+        // Fifth f2-1: a policy/auth close (1008, or the app-level 4401/4403) will
+        // not heal by reconnecting; report auth_required so the agent stops its
+        // backoff loop and asks for a login instead of retrying forever. Other
+        // codes stay transient drops, as before.
+        const auth=code===1008||code===4401||code===4403;
+        if(!established)fail(new Error(auth?t('Muse の認証が切れています。ログインし直してください。'):t('Muse との接続が閉じられました。')),auth?'auth_required':'error');
+        else if(auth){this.disconnect(false);this.state('auth_required',t('Muse の認証が切れています。ログインし直してください。'));}
         else {this.disconnect(false);this.state('disconnected',t('接続が切れました。再接続しています…'));}
       });
     });
@@ -161,9 +197,13 @@ class MuseClient extends EventEmitter {
     } catch(e) { return Promise.reject(e instanceof Error?e:new Error(String(e))); }
     return new Promise((resolve,reject)=>{
       const pending={resolve,reject,path,subscriptionScope:options.subscriptionScope,sessionId:typeof params?.session_id==='string'?params.session_id:'',status:0,chunks:[],size:0,text:'',decoder:new TextDecoder(),onEvent:options.onEvent,stream:!!options.stream,raw:!!options.raw,contentType:'',settled:false,streamIdleMs:options.streamIdleMs||120000};
-      pending.timer=setTimeout(()=>{this.cancelRequest(r.id);reject(new Error(t('Muse の応答がタイムアウトしました。送信済みの可能性があるため、自動再送はしません。')));},options.timeout||30000);
+      // Deep #99: like the frame-error path in onFrame (#121), a stream that fails
+      // before its first record — here by overall timeout or by the send itself
+      // failing — must still raise stream-error, or a scoped subscription whose
+      // caller only fire-and-forgets the promise is never resubscribed.
+      pending.timer=setTimeout(()=>{this.cancelRequest(r.id);if(pending.stream)this.emit('stream-error',{path:pending.path,scope:pending.subscriptionScope,message:t('Muse の応答がタイムアウトしました。送信済みの可能性があるため、自動再送はしません。')});reject(new Error(t('Muse の応答がタイムアウトしました。送信済みの可能性があるため、自動再送はしません。')));},options.timeout||30000);
       this.pending.set(r.id.toString(),pending);
-      try { for(const frame of r.frames)this.ws.send(frame); } catch {this.cancelRequest(r.id);reject(new Error(t('送信中に通信が切れました。')));}
+      try { for(const frame of r.frames)this.ws.send(frame); } catch {this.cancelRequest(r.id);if(pending.stream)this.emit('stream-error',{path:pending.path,scope:pending.subscriptionScope,message:t('送信中に通信が切れました。')});reject(new Error(t('送信中に通信が切れました。')));}
     });
   }
   // Send a transport reset for one stream, quietly: a dead cipher or a closing
@@ -221,16 +261,27 @@ class MuseClient extends EventEmitter {
     try{value=JSON.parse(line);}catch(e){this.noteBadFrame(e);return;}
     try{this.record(p,value);this.noteGoodFrame();}catch(e){this.noteBadFrame(e);}
   }
+  // Deep #96: an exception in a consumer's event handler is the consumer's bug,
+  // not a malformed wire record. It is reported like a bad frame (log + warning)
+  // but must not feed badFrames: ten throwing events in a row used to disconnect
+  // a perfectly healthy stream, and the reconnect then hit the same events.
+  noteHandlerError(error) {
+    console.error('muse-client: an event handler failed: '+(error?.message||error));
+    try{this.emit('warning',{type:'handler-error',error:error?.message||String(error)});}catch{}
+  }
   record(p,value) {
     if(value?.type==='event'||(typeof value?.event==='string'&&value.payload)) {
       if(!p.settled){p.settled=true;clearTimeout(p.timer);p.resolve({});}
-      p.onEvent?.(value); this.emit('event',value);return;
+      try{p.onEvent?.(value);}catch(e){this.noteHandlerError(e);}
+      try{this.emit('event',value);}catch(e){this.noteHandlerError(e);}
+      return;
     }
     const result=unwrap(value);
     if(!p.settled){p.settled=true;clearTimeout(p.timer);p.resolve(result);}
   }
   onFrame(f) {
     if(!f)return;const key=f.id.toString(),p=this.pending.get(key);if(!p)return;
+    this._lastInboundAt=performance.now(); // any frame is liveness evidence for the ping watchdog (fifth f2-3)
     this._armStreamIdle(key,p); // any frame is activity for the idle watchdog (#120)
     try {
       if(f.type==='reset')throw new Error(t('Muse がこの操作の通信を終了しました。'));
@@ -274,14 +325,27 @@ class MuseClient extends EventEmitter {
   // muser: the gateway socket had no keepalive, so a half-open socket (sleep, network change)
   // looked connected forever. Missing pongs now count as a drop.
   startPing(ws) {
-    clearInterval(this.pingTimer);let lastPong=Date.now();ws.on('pong',()=>{lastPong=Date.now();});
+    clearInterval(this.pingTimer);
+    // Fifth f2-3: native-device learned in #129 that any inbound frame is liveness
+    // evidence; this watchdog used to look at pongs only, so a gateway (or proxy)
+    // that stops answering pongs but keeps streaming was dropped every ~45 s.
+    // Fifth f3-6 (client side): the stamps are performance.now(), not Date.now(),
+    // so a wall-clock step can neither fake a long silence nor hide a real one.
+    let lastPong=performance.now(); this._lastInboundAt=lastPong;
+    ws.on('pong',()=>{lastPong=performance.now();});
+    ws.on('message',()=>{this._lastInboundAt=performance.now();});
     this.pingTimer=setInterval(()=>{
       if(this.ws!==ws){clearInterval(this.pingTimer);return;}
-      if(Date.now()-lastPong>45000){this.disconnect(false);this.state('disconnected',t('接続が切れました。再接続しています…'));return;}
+      if(performance.now()-Math.max(lastPong,this._lastInboundAt||0)>45000){this.disconnect(false);this.state('disconnected',t('接続が切れました。再接続しています…'));return;}
       try{ws.ping();}catch{}
     },20000);this.pingTimer.unref?.();
   }
   disconnect(announce=true) {
+    // Deep #95: invalidate any open() still waiting (its seq check stops it) and
+    // settle a handshake in flight at once; neither may create or keep a socket
+    // after this disconnect.
+    this.openSeq++; const openFail=this._openFail; this._openFail=null;
+    if(openFail) openFail(new Error(t('Muse の接続が終了しました。')));
     clearInterval(this.pingTimer);const ws=this.ws;this.ws=null;if(ws){ws.on('error',()=>{});if(ws.readyState===WebSocket.CONNECTING)ws.terminate();else{ws.close();
       // muser: a close handshake that stalls (a half-open socket may never answer it) must not
       // leave the socket alive: terminate it if it is still not closed after ~2 s.
@@ -316,7 +380,12 @@ class MuseClient extends EventEmitter {
   // With attachments the web client sends `items` (text + image/file parts); a reply adds `in_reply_to`.
   send(text,sessionId,nodeId,{replyTo,attachments}={}) {
     const content=attachments?.length?{items:[...text?[{type:'text',text}]:[],...attachments]}:{message:text};
-    return this.request('POST','/chat/stream',{...content,node_id:nodeId,...sessionId?{session_id:sessionId}:{},...replyTo?{in_reply_to:replyTo}:{},capabilities:['chat_cancel','delta_stream']},{stream:true,timeout:120000});
+    // Deep #97: a turn can legitimately sit silent through one long tool run
+    // (system.run alone allows 600 s), so /chat/stream gets a 15-minute idle
+    // bound instead of the generic 120 s — long enough for the longest single
+    // tool call, still a bound so a stream stalled after its first record is
+    // released (#120). Other stream callers keep the 120 s default.
+    return this.request('POST','/chat/stream',{...content,node_id:nodeId,...sessionId?{session_id:sessionId}:{},...replyTo?{in_reply_to:replyTo}:{},capabilities:['chat_cancel','delta_stream']},{stream:true,timeout:120000,streamIdleMs:900000});
   }
   cancel(sessionId) {return this.request('POST','/chat/cancel',{...(sessionId?{session_id:sessionId}:{})});}
 }

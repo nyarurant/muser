@@ -29,15 +29,10 @@ const {Link, LAN_MAX_PAYLOAD} = require('../src/link/link');
 const dgram = require('node:dgram');
 const {EventEmitter} = require('node:events');
 
-let noise = null;
-try { noise = require('../src/link/noise'); } catch (e) {
-  // Skip the noise tests ONLY when src/link/noise itself is absent. Any other
-  // failure — the module exists but a dependency is missing, or it throws on
-  // load — must fail loudly instead of silently skipping ~28 tests.
-  const missing = e && e.code === 'MODULE_NOT_FOUND' && /Cannot find module '\.\.\/src\/link\/noise'/.test(e.message);
-  if (!missing) throw e;
-}
-const noiseSkip = noise ? false : 'src/link/noise.js not present yet';
+// noise.js is a shipped production module (deep audit H17): require it
+// unconditionally. The old skip fallback let a missing/renamed noise module
+// turn ~28 channel/link tests into skips while the suite stayed green.
+const noise = require('../src/link/noise');
 
 // --- keys -------------------------------------------------------------------
 
@@ -173,7 +168,10 @@ class Phone {
     this.conn = new noise.NoiseConnection({pattern: this.pattern, initiator: true, staticKeyPair: this.keyPair, psk: this.psk});
     this.ws = new WebSocket(this.url);
     this.ws.on('message', d => this.rawQ.push(Buffer.from(d)));
-    this.ws.on('close', () => { this.rawQ.push(null); this.appQ.push(null); this.markClosed(); });
+    // Close only ends rawQ: the drain loop below pushes appQ's null AFTER the
+    // frames already queued, so a rejection sent just before the close is
+    // still delivered to recv() (t1 #3: pushing null here raced the decrypt).
+    this.ws.on('close', () => { this.rawQ.push(null); this.markClosed(); });
     this.ws.on('error', () => {});
     await new Promise((resolve, reject) => { this.ws.once('open', resolve); this.ws.once('error', reject); });
     this.ws.send(this.conn.writeMessage(Buffer.alloc(0)));
@@ -184,12 +182,14 @@ class Phone {
       if (!this.conn.handshakeFinished) this.ws.send(this.conn.writeMessage(Buffer.alloc(0)));
     }
     (async () => {
-      for (;;) {
-        const m = await this.rawQ.next().catch(() => null);
-        if (!m) return;
-        try { const whole = this.decoder.push(this.conn.readTransport(m)); if (whole) this.appQ.push(JSON.parse(whole.toString('utf8'))); }
-        catch { return; }
-      }
+      try {
+        for (;;) {
+          const m = await this.rawQ.next().catch(() => null);
+          if (!m) break;
+          try { const whole = this.decoder.push(this.conn.readTransport(m)); if (whole) this.appQ.push(JSON.parse(whole.toString('utf8'))); }
+          catch { break; }
+        }
+      } finally { this.appQ.push(null); } // after every queued frame, never before them
     })();
     return this;
   }
@@ -215,7 +215,7 @@ const stubProxy = {
 function pcKeys() { return {keys: {noise: noise.generateStaticKeyPair(), relay: noise.generateStaticKeyPair()}, pcId: 'pc-test-id'}; }
 function tmpStore() { return createRemoteStore(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'muser-link-e2e-')), 'remote.json')); }
 
-test('channel: QR pairing, then the tunnel protocol on the paired key', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: QR pairing, then the tunnel protocol on the paired key', {timeout: 30000}, async t => {
   const store = tmpStore();
   const pairing = {mode: 'qr', code: 'K7Q2AB12', expiresAt: Date.now() + 60000, attempts: 0};
   const ctx = () => ({keys: pcKeys(), remoteStore: store, proxy: stubProxy, pairing, relayUrl: 'wss://relay.test/', lanAddresses: ['192.168.1.6:8734']});
@@ -226,8 +226,8 @@ test('channel: QR pairing, then the tunnel protocol on the paired key', {skip: n
   // Wrong code: rejected, nothing paired.
   const bad = await new Phone(url, {}).start();
   bad.send({t: 'pair', code: 'WRONG123', name: 'Bad Phone'});
-  const rejection = await bad.recv().catch(() => null);
-  if (rejection) assert.equal(rejection.t, 'pair-failed');
+  const rejection = await bad.recv(); // unconditional (t1 #3): the Phone close race that used to eat this frame is fixed above, so a missing rejection now fails here
+  assert.equal(rejection.t, 'pair-failed');
   await bad.closed;
   assert.deepEqual(store.list(), []);
 
@@ -268,7 +268,7 @@ test('channel: QR pairing, then the tunnel protocol on the paired key', {skip: n
   await Promise.allSettled(results);
 });
 
-test('channel: an unpaired static key is closed at once when not pairing', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: an unpaired static key is closed at once when not pairing', {timeout: 30000}, async t => {
   const store = tmpStore();
   const {url} = await channelServer(t, {keys: pcKeys(), remoteStore: store, proxy: stubProxy, pairing: null});
   const stranger = await new Phone(url, {}).start(); // the XX handshake itself completes…
@@ -276,7 +276,7 @@ test('channel: an unpaired static key is closed at once when not pairing', {skip
   assert.deepEqual(store.list(), []);
 });
 
-test('channel: Wi-Fi pairing rides the PSK handshake; a wrong code burns an attempt', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: Wi-Fi pairing rides the PSK handshake; a wrong code burns an attempt', {timeout: 30000}, async t => {
   const store = tmpStore();
   const keys = pcKeys();
   const pairing = {mode: 'wifi', code: 'W1F1CODE', expiresAt: Date.now() + 60000, attempts: 0};
@@ -299,7 +299,7 @@ test('channel: Wi-Fi pairing rides the PSK handshake; a wrong code burns an atte
   assert.equal(store.list().length, 1); // the guesser did not get in
 });
 
-test('channel: one QR code pairs exactly one phone, even concurrently (audit #87)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: one QR code pairs exactly one phone, even concurrently (audit #87)', {timeout: 30000}, async t => {
   const store = tmpStore();
   const keys = pcKeys();
   const pairing = {mode: 'qr', code: 'K7Q2AB12', expiresAt: Date.now() + 60000, attempts: 0};
@@ -315,7 +315,7 @@ test('channel: one QR code pairs exactly one phone, even concurrently (audit #87
   a.close(); b.close();
 });
 
-test('channel: Wi-Fi guesses in parallel share one attempt budget (audit #88)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: Wi-Fi guesses in parallel share one attempt budget (audit #88)', {timeout: 30000}, async t => {
   const store = tmpStore();
   const keys = pcKeys();
   const pairing = {mode: 'wifi', code: 'W1F1CODE', expiresAt: Date.now() + 60000, attempts: 0};
@@ -333,7 +333,7 @@ test('channel: Wi-Fi guesses in parallel share one attempt budget (audit #88)', 
 
 // --- Link pairing control ---------------------------------------------------------
 
-test('link: pairing codes are 8 unambiguous chars, live 5 minutes, and stop on demand', {skip: noiseSkip, timeout: 30000}, async () => {
+test('link: pairing codes are 8 unambiguous chars, live 5 minutes, and stop on demand', {timeout: 30000}, async () => {
   const keys = {keys: {noise: noise.generateStaticKeyPair(), relay: noise.generateStaticKeyPair()}};
   keys.pcId = pcIdFor(keys.keys.relay.publicKey);
   const link = new Link({serve: {port: 9, token: 't'}, relayUrl: null, lanPort: 0, keys, store: tmpStore(), proxy: stubProxy});
@@ -355,18 +355,21 @@ test('link: pairing codes are 8 unambiguous chars, live 5 minutes, and stop on d
 
 // --- audit 2026-11-03, section G regressions ---------------------------------
 
-test('noise framing: reassembly is capped, not unbounded (audit #89)', {skip: noiseSkip}, () => {
+test('noise framing: reassembly is capped, not unbounded (audit #89)', () => {
   const dec = new noise.FrameDecoder();
   const frame = Buffer.concat([Buffer.from([0x00]), Buffer.alloc(1024 * 1024, 1)]); // 1 MiB, non-final
   for (let i = 0; i < 32; i++) assert.equal(dec.push(frame), null);
   assert.throws(() => dec.push(frame), /exceeds/);
   assert.deepEqual(dec.parts, []); // the buffered parts are dropped, not kept
-  assert.deepEqual(dec.push(Buffer.from([0x01, 65])), Buffer.from([65])); // still usable afterwards
+  // Phase 2 (deep c30 #2): once the cap trips the decoder stays failed — the tail
+  // of an oversized payload must never be delivered as a complete message, so
+  // the decoder is NOT reusable afterwards.
+  assert.throws(() => dec.push(Buffer.from([0x01, 65])), /already failed/);
   const re = new noise.ChunkReassembler();
   const piece = Buffer.alloc(1024 * 1024, 2);
   for (let i = 0; i < 32; i++) assert.equal(re.push(piece, false), null);
   assert.throws(() => re.push(piece, false), /exceeds/);
-  assert.deepEqual(re.push(Buffer.from('x'), true), Buffer.from('x'));
+  assert.throws(() => re.push(Buffer.from('x'), true), /already failed/);
 });
 
 test('remote-store: a corrupt file is refused, never silently emptied (audit #106)', () => {
@@ -436,6 +439,19 @@ test('channel: the message queue is bounded while the consumer is busy (audit #9
   assert.equal(q.overflowed, true);
 });
 
+test('channel: the message queue byte cap terminates below the count cap (t1 #4)', () => {
+  // MAX_QUEUED_BYTES (16 MiB) had no test: 17 × 1 MiB stays under the
+  // 256-message count cap, so only the byte accounting can terminate this.
+  const fake = new EventEmitter();
+  let terminated = false;
+  fake.terminate = () => { terminated = true; };
+  fake.close = () => {};
+  const q = messageQueue(fake);
+  for (let i = 0; i < 17; i++) fake.emit('message', Buffer.alloc(1024 * 1024, 1));
+  assert.equal(terminated, true);
+  assert.equal(q.overflowed, true);
+});
+
 // A phone that stalls mid-handshake: sends message 1, reads message 2, then
 // only ever retransmits message 1.
 async function handshakeStaller(url) {
@@ -452,7 +468,7 @@ async function handshakeStaller(url) {
   return {ws, msg1, closed};
 }
 
-test('channel: the handshake deadline is overall — duplicates cannot rewind it (audit #94)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: the handshake deadline is overall — duplicates cannot rewind it (audit #94)', {timeout: 30000}, async t => {
   const keys = pcKeys();
   const {url, results} = await channelServer(t, () => ({keys, remoteStore: tmpStore(), proxy: stubProxy, pairing: null, handshakeTimeoutMs: 250}));
   const staller = await handshakeStaller(url);
@@ -464,7 +480,7 @@ test('channel: the handshake deadline is overall — duplicates cannot rewind it
   assert.equal(res.reason, 'handshake-timeout');
 });
 
-test('channel: handshake duplicate retransmits are capped (audit #94)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: handshake duplicate retransmits are capped (audit #94)', {timeout: 30000}, async t => {
   const keys = pcKeys();
   const {url, results} = await channelServer(t, () => ({keys, remoteStore: tmpStore(), proxy: stubProxy, pairing: null, handshakeTimeoutMs: 10000}));
   const staller = await handshakeStaller(url);
@@ -515,7 +531,7 @@ function pairedRawSetup(t, extraCtx = {}) {
   return channelServer(t, {keys, remoteStore: store, proxy: stubProxy, pairing: null, ...extraCtx}).then(h => ({...h, keyPair}));
 }
 
-test('channel: a late duplicate handshake message does not kill the channel (audit #95)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a late duplicate handshake message does not kill the channel (audit #95)', {timeout: 30000}, async t => {
   const {url, keyPair} = await pairedRawSetup(t);
   const phone = await rawPhone(url, keyPair);
   phone.ws.send(phone.msg1); // in-flight duplicates arriving after the handshake finished
@@ -526,7 +542,7 @@ test('channel: a late duplicate handshake message does not kill the channel (aud
   await phone.closed;
 });
 
-test('channel: transport corruption ends the channel as a failure, not a clean end (audit #102)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: transport corruption ends the channel as a failure, not a clean end (audit #102)', {timeout: 30000}, async t => {
   const {url, results, keyPair} = await pairedRawSetup(t);
   const phone = await rawPhone(url, keyPair);
   phone.ws.send(Buffer.alloc(48, 9)); // not a Noise transport message at all
@@ -536,7 +552,7 @@ test('channel: transport corruption ends the channel as a failure, not a clean e
   assert.equal(res.reason, 'aead-failed');
 });
 
-test('channel: a malformed frame ends the channel as a failure (audit #102)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a malformed frame ends the channel as a failure (audit #102)', {timeout: 30000}, async t => {
   const {url, results, keyPair} = await pairedRawSetup(t);
   const phone = await rawPhone(url, keyPair);
   phone.ws.send(phone.conn.writeTransport(Buffer.from([0x7f, 1, 2]))); // valid AEAD, unknown frame flags
@@ -546,18 +562,19 @@ test('channel: a malformed frame ends the channel as a failure (audit #102)', {s
   assert.equal(res.reason, 'bad-frame');
 });
 
-test('channel: a silent established channel is dropped, activity keeps it alive (audit #98)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a silent established channel is dropped, activity keeps it alive (audit #98)', {timeout: 30000}, async t => {
   const store = tmpStore();
   const keys = pcKeys();
   const keyPair = noise.generateStaticKeyPair();
   store.add({name: 'Idle Phone', staticPub: keyPair.publicKey});
-  const {url, results} = await channelServer(t, {keys, remoteStore: store, proxy: stubProxy, pairing: null, channelIdleTimeoutMs: 200});
+  const {url, results} = await channelServer(t, {keys, remoteStore: store, proxy: stubProxy, pairing: null, channelIdleTimeoutMs: 1000});
   const phone = await new Phone(url, {keyPair}).start();
-  // Pinging every 60 ms keeps the channel past several idle deadlines.
-  for (let i = 0; i < 6; i++) {
+  // Pinging every 100 ms keeps the channel alive past the 1 s idle deadline
+  // (t1 #5: the old 200 ms deadline / 60 ms ping raced scheduler jitter).
+  for (let i = 0; i < 12; i++) {
     phone.send({t: 'ping'});
     assert.deepEqual(await phone.recv(), {t: 'pong'});
-    await new Promise(r => setTimeout(r, 60));
+    await new Promise(r => setTimeout(r, 100));
   }
   await phone.closed; // then silence gets it dropped
   const res = await results[0];
@@ -565,7 +582,7 @@ test('channel: a silent established channel is dropped, activity keeps it alive 
   assert.equal(res.reason, 'idle-timeout');
 });
 
-test('channel: one slow request does not park ping/pong behind it (audit #104)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: one slow request does not park ping/pong behind it (audit #104)', {timeout: 30000}, async t => {
   const slowProxy = {
     request: async ({path: p}) => { if (p === '/slow') await new Promise(r => setTimeout(r, 400)); return {status: 200, body: {path: p}}; },
     openSubscription: stubProxy.openSubscription,
@@ -599,7 +616,7 @@ async function pairedPhoneSetup(t, proxy, extraCtx = {}) {
   return {...h, keyPair};
 }
 
-test('channel: proxy failures are classified for the phone, never relayed raw (audit #119)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: proxy failures are classified for the phone, never relayed raw (audit #119)', {timeout: 30000}, async t => {
   const proxy = {
     request: async ({path: p}) => {
       if (p === '/refused') { const e = new Error('connect ECONNREFUSED 127.0.0.1:9999'); e.code = 'ECONNREFUSED'; throw e; }
@@ -627,7 +644,7 @@ test('channel: proxy failures are classified for the phone, never relayed raw (a
   await phone.closed;
 });
 
-test('channel: a request whose channel dies mid-flight is replayed to the resend, never executed twice (audit #108)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a request whose channel dies mid-flight is replayed to the resend, never executed twice (audit #108)', {timeout: 30000}, async t => {
   let calls = 0, release = null, seenSignal = null;
   const proxy = {
     request: ({signal}) => { calls++; seenSignal = signal; if (calls === 1) return new Promise(res => { release = res; }); return Promise.resolve({status: 200, body: {calls}}); },
@@ -651,7 +668,7 @@ test('channel: a request whose channel dies mid-flight is replayed to the resend
   await again.closed;
 });
 
-test('channel: a request a signal-honouring proxy cancelled is executed fresh on resend (audit #108)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a request a signal-honouring proxy cancelled is executed fresh on resend (audit #108)', {timeout: 30000}, async t => {
   let calls = 0;
   const proxy = {
     request: ({signal}) => {
@@ -676,7 +693,7 @@ test('channel: a request a signal-honouring proxy cancelled is executed fresh on
   await again.closed;
 });
 
-test('channel: an identical request sent again after delivery is a new execution (audit #108)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: an identical request sent again after delivery is a new execution (audit #108)', {timeout: 30000}, async t => {
   let calls = 0;
   const proxy = {request: async () => ({status: 200, body: {calls: ++calls}}), openSubscription: stubProxy.openSubscription};
   const {url, keyPair} = await pairedPhoneSetup(t, proxy);
@@ -690,7 +707,7 @@ test('channel: an identical request sent again after delivery is a new execution
   await phone.closed;
 });
 
-test('channel: tunnel ids are validated and deduplicated (audit #109)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: tunnel ids are validated and deduplicated (audit #109)', {timeout: 30000}, async t => {
   const reqPaths = [], subPaths = [];
   let releaseSlow = null;
   const proxy = {
@@ -726,7 +743,7 @@ test('channel: tunnel ids are validated and deduplicated (audit #109)', {skip: n
   await phone.closed;
 });
 
-test('channel: a failed subscription is reported to the phone, which can resubscribe the id (audit #113)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a failed subscription is reported to the phone, which can resubscribe the id (audit #113)', {timeout: 30000}, async t => {
   let opens = 0, subError = null;
   const proxy = {
     request: stubProxy.request,
@@ -747,7 +764,7 @@ test('channel: a failed subscription is reported to the phone, which can resubsc
   await phone.closed;
 });
 
-test('channel: a resend that joined in flight keeps the original alive when the first channel dies (audit #108)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a resend that joined in flight keeps the original alive when the first channel dies (audit #108)', {timeout: 30000}, async t => {
   let calls = 0, release = null, seenSignal = null;
   const proxy = {
     request: ({signal}) => { calls++; seenSignal = signal; return new Promise(res => { release = res; }); },
@@ -772,7 +789,7 @@ test('channel: a resend that joined in flight keeps the original alive when the 
   await second.closed;
 });
 
-test('channel: a subscription that fails synchronously during open is reported and torn down (audit #113)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: a subscription that fails synchronously during open is reported and torn down (audit #113)', {timeout: 30000}, async t => {
   let opens = 0, closes = 0;
   const proxy = {
     request: stubProxy.request,
@@ -790,7 +807,7 @@ test('channel: a subscription that fails synchronously during open is reported a
   await phone.closed;
 });
 
-test('channel: sendApp backpressure drops events and ends the channel on an undeliverable reply (audit #118)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('channel: sendApp backpressure drops events and ends the channel on an undeliverable reply (audit #118)', {timeout: 30000}, async t => {
   // A negative limit makes every bufferedAmount (even 0) exceed it, which
   // exercises the backpressure branch deterministically.
   const {url, keyPair} = await pairedPhoneSetup(t, stubProxy, {sendBufferLimitBytes: -1});
@@ -806,7 +823,7 @@ test('channel: sendApp backpressure drops events and ends the channel on an unde
   assert.deepEqual(phone.appQ.items.filter(v => v !== null), [], 'the reply was not queued either');
 });
 
-test('link: the LAN listener caps frame size and live channels (audit #90)', {skip: noiseSkip, timeout: 30000}, async () => {
+test('link: the LAN listener caps frame size and live channels (audit #90)', {timeout: 30000}, async () => {
   const keys = {keys: {noise: noise.generateStaticKeyPair(), relay: noise.generateStaticKeyPair()}};
   keys.pcId = pcIdFor(keys.keys.relay.publicKey);
   const link = new Link({serve: {port: 9, token: 't'}, relayUrl: null, lanPort: 0, keys, store: tmpStore(), proxy: stubProxy, discoveryPort: 0});
@@ -827,13 +844,20 @@ test('link: the LAN listener caps frame size and live channels (audit #90)', {sk
   assert.equal(second.closedWith, 4429);
 });
 
-test('link: UDP discovery answers only while a Wi-Fi pairing is open (audit #99)', {skip: noiseSkip, timeout: 30000}, async () => {
+test('link: UDP discovery answers only while a Wi-Fi pairing is open (audit #99)', {timeout: 30000}, async () => {
   const keys = {keys: {noise: noise.generateStaticKeyPair(), relay: noise.generateStaticKeyPair()}};
   keys.pcId = pcIdFor(keys.keys.relay.publicKey);
-  const discoveryPort = 18735 + (process.pid % 500);
+  // A free port, not 18735 + pid % 500 (t1 #6): parallel test files derive
+  // the same port from nearby pids and collide.
+  const discoveryPort = await new Promise((resolve, reject) => {
+    const probe = dgram.createSocket('udp4');
+    probe.once('error', reject);
+    probe.bind(0, '127.0.0.1', () => { const p = probe.address().port; probe.close(() => resolve(p)); });
+  });
   const link = new Link({serve: {port: 9, token: 't'}, relayUrl: null, lanPort: 0, discoveryPort, keys, store: tmpStore(), proxy: stubProxy});
   await link.start();
-  await new Promise(r => setTimeout(r, 100)); // let the UDP socket finish binding
+  // Poll until the UDP socket is actually bound instead of sleeping 100 ms.
+  for (let i = 0; i < 100; i++) { try { link.discovery.address(); break; } catch { await new Promise(r => setTimeout(r, 20)); } }
   const ask = () => new Promise(resolve => {
     const sock = dgram.createSocket('udp4');
     const timer = setTimeout(() => { try { sock.close(); } catch {} resolve(null); }, 400);
@@ -868,18 +892,21 @@ function controlLink(url, extra = {}) {
   return link;
 }
 
-test('link: a flapping relay backs off instead of reconnecting at the minimum forever (audit #100)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('link: a flapping relay backs off instead of reconnecting at the minimum forever (audit #100)', {timeout: 30000}, async t => {
   let attempts = 0;
   const {url} = await relayServer(t, ws => { attempts++; ws.close(); });
   const link = controlLink(url, {backoffMinMs: 50, backoffMaxMs: 400, controlHeartbeatMs: 0});
   link.connectControl();
-  await new Promise(r => setTimeout(r, 900));
+  // Poll for the attempts instead of one fixed 900 ms window (t1 #5): on a
+  // loaded machine the same backoff sequence simply takes longer.
+  const deadline = Date.now() + 10000;
+  while (attempts < 3 && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
   await link.stop();
   assert.ok(attempts >= 3, `expected several attempts, got ${attempts}`);
-  assert.ok(attempts <= 8, `backoff should stretch (50,100,200,400…), got ${attempts} attempts in 900 ms`);
+  assert.ok(attempts <= 8, `backoff should stretch (50,100,200,400…), got ${attempts} attempts`);
 });
 
-test('link: a stale control socket closing does not replace the healthy one (audit #100)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('link: a stale control socket closing does not replace the healthy one (audit #100)', {timeout: 30000}, async t => {
   const {url} = await relayServer(t, () => {});
   const link = controlLink(url, {controlHeartbeatMs: 0});
   link.connectControl();
@@ -899,14 +926,16 @@ test('link: a stale control socket closing does not replace the healthy one (aud
   await link.stop();
 });
 
-test('link: a silently dead relay control socket is detected and reconnected (audit #93)', {skip: noiseSkip, timeout: 30000}, async t => {
+test('link: a silently dead relay control socket is detected and reconnected (audit #93)', {timeout: 30000}, async t => {
   let conns = 0;
   // Pausing the server socket simulates a NAT drop: the TCP connection looks
   // open on both ends, but no pong ever comes back.
   const {url} = await relayServer(t, ws => { conns++; ws._socket.pause(); });
   const link = controlLink(url, {controlHeartbeatMs: 25, controlTimeoutMs: 75, backoffMinMs: 20});
   link.connectControl();
-  await new Promise(r => setTimeout(r, 1200));
+  // Poll for the reconnect instead of a fixed 1200 ms sleep (t1 #5).
+  const deadline = Date.now() + 10000;
+  while (conns < 2 && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
   await link.stop();
   assert.ok(conns >= 2, `the dead control socket should be terminated and reconnected, saw ${conns} connection(s)`);
 });

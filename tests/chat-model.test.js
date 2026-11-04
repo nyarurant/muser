@@ -49,6 +49,15 @@ test('messageFromEvent: payload fallbacks for content, seq, time and session', (
   assert.equal(messageFromEvent({message_id: 'a', role: 'assistant', display_text: 'x', reaction_emoji: 5}).reaction, null, 'non-string reaction dropped');
 });
 
+test('messageFromEvent: a trailing [usage] line is stripped only for the assistant (t4 #13)', () => {
+  const text = 'done\n\n[usage] context_tokens=130841 response_tokens=395 source=provider cost=unavailable';
+  const a = messageFromEvent({message_id: 'a', role: 'assistant', display_text: text});
+  assert.equal(a.content.trim(), 'done', 'the bookkeeping line is not reply content');
+  assert.ok(!a.content.includes('[usage]'));
+  const u = messageFromEvent({message_id: 'b', role: 'user', display_text: text});
+  assert.equal(u.content, text, 'a user quoting a [usage] line keeps it verbatim');
+});
+
 test('messageFromEvent: attachment markers split only for user messages', () => {
   const m = messageFromEvent({message_id: 'a', role: 'user', display_text: '見て\n[image:image/png workspace/pic.png]\n[file:application/pdf docs/a.pdf ]'});
   assert.equal(m.content, '見て');

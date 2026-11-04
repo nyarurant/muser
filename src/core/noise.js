@@ -100,6 +100,14 @@ function fields(input) {
 }
 const first = (f,n,fallback=null) => f.get(n)?.[0] ?? fallback;
 const CHUNK_TTL_MS = 30000;
+// Fix2 (c26 #1 / deep #222): the per-record 16MB check below can never fire —
+// one record holds at most 256 chunks x 65,489 bytes = 16,765,184 < 16 MiB —
+// and the 64-record cap alone let an authenticated peer pin 64 x ~16.7MB
+// (~1GB) for the 30s TTL. Cap the TOTAL bytes held across all incomplete
+// reassemblies instead: 32 MiB still fits two worst-case legitimate frames,
+// and overflow evicts the oldest incomplete record (same policy as the
+// 64-record cap) rather than killing the connection.
+const MAX_REASSEMBLY_TOTAL_BYTES = 32*1024*1024;
 class Transport {
   constructor(tx,rx) { this.tx=tx; this.rx=rx; this.next=1n; this.chunks=new Map(); }
   // Partial reassembly entries are timestamped at creation and dropped once they
@@ -152,6 +160,16 @@ class Transport {
       if(record.parts.get(index).equals(payload)) return null;
       clearTimeout(record.expireTimer); this.chunks.delete(id); return null;
     }
+    // Total-bytes cap (see MAX_REASSEMBLY_TOTAL_BYTES): make room for this
+    // chunk by evicting the OLDEST other incomplete reassembly. Computed from
+    // the map itself, so every delete/evict path above stays consistent.
+    let total=0; for(const v of this.chunks.values()) total+=v.size;
+    while(total+payload.length>MAX_REASSEMBLY_TOTAL_BYTES) {
+      let oldestKey=null;
+      for(const k of this.chunks.keys()) if(k!==id) { oldestKey=k; break; }
+      if(oldestKey===null) break;
+      const stale=this.chunks.get(oldestKey); clearTimeout(stale.expireTimer); total-=stale.size; this.chunks.delete(oldestKey);
+    }
     record.parts.set(index,payload); record.size+=payload.length;
     if(record.size>16*1024*1024) throw new Error('Muse response too large');
     if(record.parts.size<count) return null;
@@ -167,4 +185,4 @@ class Transport {
   }
   destroy() { this.tx.key?.fill(0); this.rx.key?.fill(0); this.tx.dead=true; this.rx.dead=true; for(const v of this.chunks.values()) clearTimeout(v.expireTimer); this.chunks.clear(); }
 }
-module.exports={NoiseXX,Cipher,Transport,fields,first,bytes,uint,str,cat};
+module.exports={NoiseXX,Cipher,Transport,fields,first,bytes,uint,str,cat,MAX_REASSEMBLY_TOTAL_BYTES};

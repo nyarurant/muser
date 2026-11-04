@@ -1,6 +1,7 @@
 'use strict';
 // HTTPS to muse.ai with the website login cookies from `muser login`, outside any browser.
 // Plays the role of Electron's session.defaultSession.fetch in muse-desktop-community.
+const crypto = require('node:crypto');
 const store = require('./secure-store');
 const {t} = require('./i18n');
 
@@ -38,6 +39,20 @@ function saveJar(jar, file = FILE) {
   store.save(file, jar);
   if (!accounts.get(id)) { store.remove(file); return false; }
   return true;
+}
+
+// Absorbed Set-Cookie refreshes are saved from call() below, where a save
+// failure used to be swallowed whole (deep #71 / c10 #3): the in-memory jar
+// held the fresh login, the disk kept the stale one, and the next launch
+// silently reverted to it. The request itself succeeded, so the failure is
+// reported (once per jar file per process) instead of failing the call —
+// but never silently. (saveJar returning false for a removed account is by
+// design and is not a failure; it does not reach this warning.)
+const jarSaveWarned = new Set();
+function warnJarSaveFailure(file, e) {
+  if (jarSaveWarned.has(file)) return;
+  jarSaveWarned.add(file);
+  console.error(t('ログイン情報の保存に失敗しました（{detail}）。次回はログインし直しが必要になることがあります。', {detail: e?.message || String(e)}));
 }
 
 function cookieHeader(jar, url) {
@@ -104,6 +119,18 @@ function absorb(jar, url, response) {
 
 const isTimeout = e => e?.name === 'TimeoutError' || e?.name === 'AbortError';
 
+// A successful response with no body (204, or a bodyless 200) is an empty
+// result, not a parse failure (deep #72 / c10 #4): all three wrappers used
+// to call r.json() unconditionally and throw {parse: true} for it. A 204
+// needs no parsing at all, and an empty body surfaces from Response.json()
+// as a SyntaxError 'Unexpected end of JSON input'. Anything else that
+// fails to parse is rethrown for the caller's own parse/timeout handling.
+async function readJson(r) {
+  if (r.status === 204) return null;
+  try { return await r.json(); }
+  catch (e) { if (e instanceof SyntaxError && /unexpected end of json input/i.test(e.message || '')) return null; throw e; }
+}
+
 function createWeb(jar, {file = FILE} = {}) {
   jar ??= loadJar(file);
   async function call(url, {method = 'GET', body, headers = {}, timeout = 12000, cookies = true, signal} = {}) {
@@ -127,7 +154,7 @@ function createWeb(jar, {file = FILE} = {}) {
       if (e instanceof TypeError && e.message === 'fetch failed') throw Object.assign(new Error(t('{host} に接続できません。', {host})), {network: true, cause: e});
       throw e;
     }
-    if (cookies && absorb(jar, url, response)) { try { saveJar(jar, file); } catch {} }
+    if (cookies && absorb(jar, url, response)) { try { saveJar(jar, file); } catch (e) { warnJarSaveFailure(file, e); } }
     return response;
   }
   // MuseClient's fetchJson: muse.ai website API with the login cookies.
@@ -145,15 +172,15 @@ function createWeb(jar, {file = FILE} = {}) {
     // (probeLogin, the login poll) misread it as a lapsed login. Wrap it, marked as a parse
     // failure and carrying the HTTP status. A body that timed out mid-read is a
     // timeout, not a parse failure (audit #202).
-    try { return await r.json(); }
-    catch (e) { if (isTimeout(e)) throw Object.assign(new Error(t('{host} に接続できません。', {host: 'muse.ai'})), {status: r.status, timeout: true, cause: e}); throw Object.assign(new Error(t('Muse のログインが必要です。`muser login` を実行してください。')), {status: r.status, parse: true, cause: e}); }
+    try { return await readJson(r); }
+    catch (e) { if (isTimeout(e)) throw Object.assign(new Error(t('{host} に接続できません。', {host: 'muse.ai'})), {status: r.status, timeout: true, cause: e}); throw Object.assign(new Error(t('Muse の応答を確認できませんでした。')), {status: r.status, parse: true, cause: e}); }
   }
   // PcAuth's request: native auth services, bearer only, never cookies.
   async function nativeRequest(scope, route, body, bearer, signal) {
     const root = scope === 'auth' ? 'https://hatch-api.meta.ai' : 'https://api.muse.ai';
     const r = await call(root + route, {method: body === undefined ? 'GET' : 'POST', body, cookies: false, timeout: 25000, signal,
       headers: {'X-API-Version': '1.0.0', ...(bearer ? {Authorization: 'Bearer ' + bearer} : {})}});
-    let result; try { result = await r.json(); } catch (e) { if (isTimeout(e)) throw Object.assign(new Error(t('Muse の PC 認証応答を確認できません。')), {status: r.status, timeout: true, cause: e}); throw Object.assign(new Error(t('Muse の PC 認証応答を確認できません。')), {status: r.status, parse: true, cause: e}); }
+    let result; try { result = await readJson(r); } catch (e) { if (isTimeout(e)) throw Object.assign(new Error(t('Muse の PC 認証応答を確認できません。')), {status: r.status, timeout: true, cause: e}); throw Object.assign(new Error(t('Muse の PC 認証応答を確認できません。')), {status: r.status, parse: true, cause: e}); }
     if (!r.ok) {
       // Keep the server's own error detail (audit #203): a bare "HTTP 400" hid
       // whether the code was merely wrong (retryable) or the state was fatal —
@@ -172,7 +199,7 @@ function createWeb(jar, {file = FILE} = {}) {
     // Like fetchJson / nativeRequest above: a non-JSON body (a proxy error page with a 200)
     // escaped as a bare SyntaxError with no status, so the login flow showed a raw parser
     // message. Wrap it, marked as a parse failure and carrying the HTTP status.
-    try { return await r.json(); }
+    try { return await readJson(r); }
     catch (e) { if (isTimeout(e)) throw Object.assign(new Error(t('SDK トークンの応答を確認できませんでした。')), {status: r.status, timeout: true, cause: e}); throw Object.assign(new Error(t('SDK トークンの応答を確認できませんでした。')), {status: r.status, parse: true, cause: e}); }
   }
   // muse.ai page text (HTML, JS chunks), used to look up a Next.js server action id.
@@ -198,9 +225,22 @@ function createWeb(jar, {file = FILE} = {}) {
 // A 'ready' verdict is reused for a short window per jar (audit #206): every
 // probe used to re-fetch the session AND mint a fresh hatch token with
 // force_refresh, so a 2 s poll that kept probing minted tokens endlessly.
-const probeReadyCache = new WeakMap();
+// The cache is keyed by the jar's CONTENTS, not the array object (deep #69
+// / c10 #1): the login poll (login.js pollLogin) rebuilds the jar with
+// jarFromCookies on every tick, so an identity-keyed WeakMap never hit on
+// that path and the token mint ran on every tick anyway. Two jars holding
+// the same cookies are the same login, whichever array carries them; the
+// cookie values are only kept as a SHA-256 digest, and the jar file is part
+// of the key so different accounts never share a verdict.
+const probeReadyCache = new Map();
+function probeCacheKey(jar, file) {
+  if (!Array.isArray(jar)) return null;
+  const parts = jar.map(c => JSON.stringify([c?.name ?? null, c?.value ?? null, c?.domain ?? null, c?.path ?? null, c?.expires ?? null, c?.secure ?? null])).sort();
+  return String(file) + '\n' + crypto.createHash('sha256').update(parts.join('\n')).digest('hex');
+}
 async function probe(jar, file = FILE) {
-  const cached = jar && typeof jar === 'object' ? probeReadyCache.get(jar) : null;
+  const key = probeCacheKey(jar, file);
+  const cached = key ? probeReadyCache.get(key) : null;
   if (cached && Date.now() - cached.at < 30000) return 'ready';
   const w = createWeb(jar, {file});
   let session;
@@ -213,7 +253,7 @@ async function probe(jar, file = FILE) {
   // 'error', not a token problem the user could fix.
   try { token = await w.fetchJson('/api/hatch/token', {vmAddress: session.endpoint_url, vmName: session.vm_name, force_refresh: true}); } catch (e) { return e.network || e.timeout || e.parse || e.status >= 500 || e.status === 429 ? 'error' : 'token'; }
   if (!token?.token) return 'token';
-  if (jar && typeof jar === 'object') probeReadyCache.set(jar, {at: Date.now()});
+  if (key) { for (const [k, v] of probeReadyCache) if (Date.now() - v.at >= 30000) probeReadyCache.delete(k); probeReadyCache.set(key, {at: Date.now()}); }
   return 'ready';
 }
 

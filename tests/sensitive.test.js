@@ -1,4 +1,14 @@
 'use strict';
+// Standalone isolation guard (t2 #16): isSensitivePath consults the muser
+// settings roots, so pin the scratch home/data folders here as well as
+// relying on tests/setup.mjs — run without the setup import this file must
+// not resolve paths against the real user's folders.
+{
+  const fs0 = require('node:fs'), os0 = require('node:os'), path0 = require('node:path');
+  process.env.MUSER_LANG = 'ja';
+  if (!/muser-test/.test(process.env.LOCALAPPDATA || '')) process.env.LOCALAPPDATA = fs0.mkdtempSync(path0.join(os0.tmpdir(), 'muser-test-data-'));
+  if (!/muser-test/.test(process.env.USERPROFILE || '')) process.env.USERPROFILE = process.env.HOME = fs0.mkdtempSync(path0.join(os0.tmpdir(), 'muser-test-home-'));
+}
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');

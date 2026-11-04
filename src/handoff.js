@@ -17,13 +17,45 @@ const MAX_TOTAL = 4000;      // the whole note is capped near this many characte
 const MAX_TURNS = 6;         // transcript turns kept (the newest ones)
 const MAX_TURN_CHARS = 300;  // per speaker text inside one transcript turn
 const MAX_GIT_LINES = 30;    // `git status --porcelain` lines kept
+// c21 #6: the caps above used to cover only the transcript and the git line COUNT.
+// Focus criteria, Todos and single git lines had no count or length cap at all, so
+// those blocks alone could exceed MAX_TOTAL and the final hard cut sliced the note
+// mid-section — including the record pointer that must survive (see buildHandoff).
+const MAX_CRITERIA = 20;     // focus criteria kept
+const MAX_TODOS = 30;        // todo items kept
+const MAX_ITEM_CHARS = 200;  // per focus criterion / todo item / git line
+const MAX_GOAL_CHARS = 300;  // the focus goal line
+const MAX_FIELD_CHARS = 500; // one-line fields: cwd, session title, labels, record path
 
 function str(v) { return typeof v === 'string' ? v.trim() : v == null ? '' : String(v).trim(); }
 
+// c21 #7: a one-line field must stay one line. str() only trims the ends, so a newline
+// inside cwd / a title / a label / a focus or Todo text / the record path used to be
+// embedded verbatim and could open a fake `■ …` section (even a fake record pointer)
+// inside a note the new account's Muse reads as trusted first context. Collapse every
+// run of line breaks (with surrounding space) to a single space.
+// t7 #19: a cut at a fixed UTF-16 length can land between a surrogate pair and
+// leave a lone high surrogate in the note. Cut one unit earlier instead.
+function safeCut(s, n) {
+  if (s.length <= n) return s;
+  const c = s.charCodeAt(n - 1);
+  return s.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+}
+
+function oneLine(v, n = MAX_FIELD_CHARS) {
+  const s = str(v).replace(/\s*[\r\n]+\s*/g, ' ');
+  return s.length > n ? safeCut(s, n) + '…' : s;
+}
+
+// Transcript prose keeps its line breaks (it is quoted conversation), but a line that
+// starts with ■ inside it would be indistinguishable from a real section heading, so
+// indent such lines: the text stays readable, the section structure stays ours.
+function defangSections(s) { return s.replace(/^■/gm, ' ■'); }
+
 // One speaker's text, cut to the per-turn budget with an ellipsis when it was longer.
 function clip(text, n = MAX_TURN_CHARS) {
-  const s = str(text);
-  return s.length > n ? s.slice(0, n) + '…' : s;
+  const s = defangSections(str(text));
+  return s.length > n ? safeCut(s, n) + '…' : s;
 }
 
 // Todo statuses arrive as pending / in_progress / completed (see todo.write in src/tools.js,
@@ -41,32 +73,39 @@ function normTodos(todos) {
   if (!Array.isArray(todos)) return [];
   const out = [];
   for (const t of todos) {
-    if (typeof t === 'string') { if (t.trim()) out.push({content: t.trim(), status: 'pending'}); continue; }
+    if (typeof t === 'string') { if (t.trim()) out.push({content: oneLine(t, MAX_ITEM_CHARS), status: 'pending'}); continue; }
     if (!t || typeof t !== 'object') continue;
-    const content = str(t.content ?? t.text);
+    const content = oneLine(t.content ?? t.text, MAX_ITEM_CHARS);
     if (content) out.push({content, status: todoStatus(t.status)});
   }
   // Unfinished work first (in progress before not started), finished last; the order
   // inside each group is the caller's order, so the note stays deterministic.
   const rank = {in_progress: 0, pending: 1, completed: 2};
-  return out.map((t, i) => [t, i]).sort((a, b) => rank[a[0].status] - rank[b[0].status] || a[1] - b[1]).map(([t]) => t);
+  // The count cap applies AFTER sorting, so the items dropped are the finished ones.
+  return out.map((t, i) => [t, i]).sort((a, b) => rank[a[0].status] - rank[b[0].status] || a[1] - b[1]).map(([t]) => t).slice(0, MAX_TODOS);
 }
 
 function normFocus(focus) {
   if (!focus || typeof focus !== 'object') return null;
-  const goal = str(focus.goal);
+  const goal = oneLine(focus.goal, MAX_GOAL_CHARS);
   const criteria = (Array.isArray(focus.criteria) ? focus.criteria : []).map(c => {
-    if (typeof c === 'string') return c.trim() ? {text: c.trim(), status: ''} : null;
+    if (typeof c === 'string') return c.trim() ? {text: oneLine(c, MAX_ITEM_CHARS), status: ''} : null;
     if (!c || typeof c !== 'object') return null;
-    const text = str(c.text ?? c.content);
-    return text ? {text, status: str(c.status)} : null;
-  }).filter(Boolean);
+    const text = oneLine(c.text ?? c.content, MAX_ITEM_CHARS);
+    return text ? {text, status: oneLine(c.status, 40)} : null;
+  }).filter(Boolean).slice(0, MAX_CRITERIA);
   return goal || criteria.length ? {goal, criteria} : null;
 }
 
 function normGit(gitLines) {
   if (!Array.isArray(gitLines)) return [];
-  return gitLines.map(l => String(l ?? '').replace(/\s+$/, '')).filter(l => l.trim());
+  // Porcelain lines start with status columns, so the front is never trimmed (oneLine
+  // would eat it via str()); only trailing space goes. Then the one-line/length caps:
+  // a file name can itself contain a newline, which must not become a fake section.
+  return gitLines.map(l => {
+    const s = String(l ?? '').replace(/\s+$/, '').replace(/\s*[\r\n]+\s*/g, ' ');
+    return s.length > MAX_ITEM_CHARS ? s.slice(0, MAX_ITEM_CHARS) + '…' : s;
+  }).filter(l => l.trim());
 }
 
 // Transcript turns are the objects sessions.transcript(id) returns, one per finished turn
@@ -95,7 +134,7 @@ function renderTurn(t) {
 
 function buildHandoff(input) {
   const {fromLabel, toLabel, cwd, sessionTitle, turns, todos, focus, gitLines, recordPath} = input || {};
-  const from = str(fromLabel), to = str(toLabel);
+  const from = oneLine(fromLabel, 100), to = oneLine(toLabel, 100);
   const head = from && to
     ? 'これは前のアカウント（' + from + '）から新しいアカウント（' + to + '）への引き継ぎメモです。ここまでの作業を、このアカウントで続けてください。'
     : from
@@ -104,8 +143,8 @@ function buildHandoff(input) {
 
   // Every section except the transcript, in a fixed order; empty sections are omitted.
   const blocks = [head];
-  if (str(cwd)) blocks.push('■ 作業フォルダー\n' + str(cwd));
-  if (str(sessionTitle)) blocks.push('■ セッション\n' + str(sessionTitle));
+  if (oneLine(cwd)) blocks.push('■ 作業フォルダー\n' + oneLine(cwd));
+  if (oneLine(sessionTitle)) blocks.push('■ セッション\n' + oneLine(sessionTitle));
   const f = normFocus(focus);
   if (f) {
     const lines = ['■ 進行中の作業'];
@@ -114,7 +153,12 @@ function buildHandoff(input) {
     blocks.push(lines.join('\n'));
   }
   const todoList = normTodos(todos);
-  if (todoList.length) blocks.push(['■ Todo', ...todoList.map(t => '- ' + TODO_MARK[t.status] + ' ' + t.content)].join('\n'));
+  if (todoList.length) {
+    const lines = ['■ Todo', ...todoList.map(t => '- ' + TODO_MARK[t.status] + ' ' + t.content)];
+    const given = Array.isArray(todos) ? todos.filter(t => (typeof t === 'string' && !!t.trim()) || (t && typeof t === 'object' && !!oneLine(t.content ?? t.text, MAX_ITEM_CHARS))).length : 0;
+    if (given > todoList.length) lines.push('… ほか ' + (given - todoList.length) + ' 件');
+    blocks.push(lines.join('\n'));
+  }
   const git = normGit(gitLines);
   if (git.length) {
     const lines = ['■ 変更中のファイル', ...git.slice(0, MAX_GIT_LINES)];
@@ -125,18 +169,38 @@ function buildHandoff(input) {
   // runs on this same PC and can read the file, so it pays only for the parts it actually
   // needs instead of burning its fresh allowance on the whole history up front. It sits in
   // blocks (not the transcript section), so the cap trimming below never drops it first.
-  const record = str(recordPath);
-  if (record) blocks.push('■ 前のセッションの記録\n' + record + '\n会話の全文が1ターン1行（JSONL）で残っています。必要なときだけ、要る箇所を検索・読み取りしてください（全部を読み込まないこと）。');
+  // c21 #6: the pointer is kept OUT of the droppable blocks below — when the other
+  // blocks alone exceed the cap, they are dropped (lowest sections first) and the
+  // pointer is appended intact; the old hard cut could slice it away entirely.
+  const record = oneLine(recordPath, 1000);
+  const recordBlock = record ? '■ 前のセッションの記録\n' + record + '\n会話の全文が1ターン1行（JSONL）で残っています。必要なときだけ、要る箇所を検索・読み取りしてください（全部を読み込まないこと）。' : null;
 
   // The transcript goes last and is what gets cut when the note would run over the cap:
-  // drop its oldest turns one at a time (the newest exchange matters most), and only if
-  // even that is not enough fall back to a hard cut of the whole note.
+  // drop its oldest turns one at a time (the newest exchange matters most). If the
+  // other blocks alone still exceed the cap, drop whole sections from the end (git,
+  // then Todo, then focus, …) instead of hard-cutting mid-section; only as a last
+  // resort hard-cut what precedes the record pointer, which stays intact.
   const recent = normTurns(turns);
+  const assemble = (keptBlocks, keep) => {
+    const parts = [...keptBlocks];
+    if (recordBlock) parts.push(recordBlock);
+    if (keep) parts.push('■ 直近のやり取り\n' + recent.slice(recent.length - keep).map(renderTurn).join('\n\n'));
+    return parts.join('\n\n');
+  };
   for (let keep = recent.length; keep >= 0; keep--) {
-    const parts = keep ? [...blocks, '■ 直近のやり取り\n' + recent.slice(recent.length - keep).map(renderTurn).join('\n\n')] : blocks;
-    const note = parts.join('\n\n');
+    const note = assemble(blocks, keep);
     if (note.length <= MAX_TOTAL) return note;
-    if (!keep) return note.slice(0, MAX_TOTAL - 1) + '…';
+    if (!keep) {
+      const kept = [...blocks];
+      while (kept.length > 1 && assemble(kept, 0).length > MAX_TOTAL) kept.pop();
+      const trimmed = assemble(kept, 0);
+      if (trimmed.length <= MAX_TOTAL) return trimmed;
+      if (recordBlock) {
+        const room = MAX_TOTAL - recordBlock.length - 2;
+        return (room > 0 ? safeCut(kept.join('\n\n'), Math.max(0, room - 1)) + '…' : '') + '\n\n' + safeCut(recordBlock, MAX_TOTAL);
+      }
+      return safeCut(trimmed, MAX_TOTAL - 1) + '…';
+    }
   }
   return blocks.join('\n\n'); // unreachable: keep = 0 always returns above
 }

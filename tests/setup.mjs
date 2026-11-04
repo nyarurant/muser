@@ -1,5 +1,10 @@
 // Tests read the Japanese UI strings; pin the language so a non-Japanese OS (CI) gives the same.
 process.env.MUSER_LANG = 'ja';
+// Same for colour: several tests assert the renderers emit SGR colour codes,
+// and the product honours NO_COLOR by design (src/tui/term.js). A shell that
+// exports NO_COLOR=1 must not turn those assertions red — third audit M20
+// (fixes-1101f and tui-polish failed under NO_COLOR=1).
+delete process.env.NO_COLOR;
 // Input history goes to a scratch file: tests that press Enter must never write ~/.muser/history.json
 // (one test's prompt landed in the user's real history on 2026-11-01).
 import os from 'node:os';

@@ -86,24 +86,33 @@ test('#112 proxy: a subscription that goes silent is failed by the idle watchdog
 });
 
 test('#114/#115 proxy: subscription errors fire onError exactly once and never after close()', async t => {
+  // t6 #4 (deep audit): fixed sleeps against the 30 ms destroy / 100 ms slow
+  // response flaked under load. Poll for the positive claim; for the negative
+  // claim, wait until the server has actually delivered its slow response
+  // (plus a settle window for a wrong onError to arrive), not a bare 300 ms.
+  let slowAnswered = false, slowRequested = false;
   const port = await serve(t, (req, res) => {
+    if (req.url === '/slow') slowRequested = true;
     if (req.url === '/drop') {
       res.writeHead(200, {'content-type': 'text/event-stream'});
       res.write('data: x\n\n');
       setTimeout(() => res.socket.destroy(), 30); // error AND end on the client side
       return;
     }
-    setTimeout(() => { res.writeHead(500); res.end('no'); }, 100); // slow failure
+    setTimeout(() => { slowAnswered = true; res.writeHead(500); res.end('no'); }, 100); // slow failure
   });
   const proxy = createProxy({port, token: 't'});
   let errors = 0;
   proxy.openSubscription('/drop', () => {}, () => { errors++; });
-  await wait(400);
+  await waitFor(() => errors >= 1, 'the drop onError');
+  await wait(150); // a duplicate onError from the paired end event would land here
   assert.equal(errors, 1, 'one onError despite error+end both firing');
   let late = 0;
   const close = proxy.openSubscription('/slow', () => {}, () => { late++; });
+  await waitFor(() => slowRequested, 'the slow request to reach the server');
   close();
-  await wait(300);
+  await waitFor(() => slowAnswered, 'the slow 500 response to be delivered');
+  await wait(150);
   assert.equal(late, 0, 'no onError after close()');
 });
 
@@ -279,7 +288,9 @@ test('#128 native-device: cleanup terminates a socket whose close handshake stal
   d._ws = ws; d._phase = 'connected';
   d.disconnect();
   assert.equal(terminated, false, 'close is tried first');
-  await wait(2300);
+  // t6 #4: the product grace timer is exactly 2000 ms; a fixed 2300 ms sleep
+  // leaves only 300 ms of slack for a loaded box. Poll with a real deadline.
+  await waitFor(() => terminated, 'terminate after the 2 s grace period', 10000);
   assert.equal(terminated, true, 'terminated after the grace period');
 });
 
@@ -327,7 +338,8 @@ test('#132 native-device: a watchdog-answered invoke keeps its concurrency slot 
   d._watchdogGraceMs = 20;
   d._sendResult = async () => true;
   d._dispatchInvoke({id: 'zombie', command: 'code.read', params: {}, timeout_ms: 10});
-  await wait(90); // watchdog (10 + 20 ms) has answered
+  // t6 #4: was a fixed 90 ms sleep for the watchdog's 10 + 20 ms; poll instead.
+  await waitFor(() => d._completedInvokes.has('zombie'), 'the watchdog (10 + 20 ms) to answer');
   assert.deepEqual(d._completedInvokes.get('zombie'), {ok: false, error: 'invoke_timeout'});
   assert.equal(d._inflightInvokes.has('zombie'), true, 'the still-running command still counts against the cap');
   await waitFor(() => !d._inflightInvokes.has('zombie'), 'slot release at real settlement');

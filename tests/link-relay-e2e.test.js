@@ -75,8 +75,9 @@ before(async () => {
     store: createRemoteStore(storeFile),
   });
   await link.start();
-  // The control socket needs a moment to register with the relay.
-  await new Promise(r => setTimeout(r, 300));
+  // Poll until the control socket is registered with the relay instead of a
+  // fixed 300 ms settle (t3 #5).
+  await waitFor(() => link.controlOpen, 10000);
 });
 
 after(async () => {
@@ -116,21 +117,29 @@ class Phone {
     this.ws.on('close', () => { this.closed = true; this.deliver(null); });
     await new Promise((res, rej) => { this.ws.once('open', res); this.ws.once('error', rej); });
   }
-  nextHandshakeMessage() {
+  nextHandshakeMessage(timeoutMs) {
     if (this.inbox.length) return Promise.resolve(this.inbox.shift());
-    return new Promise(r => this.inWaiters.push(r));
+    return new Promise(r => {
+      const w = v => { clearTimeout(tm); r(v); };
+      const tm = timeoutMs ? setTimeout(() => { const i = this.inWaiters.indexOf(w); if (i >= 0) this.inWaiters.splice(i, 1); r(null); }, timeoutMs) : null;
+      this.inWaiters.push(w);
+    });
   }
   async handshake(spam = 1) {
-    // The relay needs a moment to splice the data socket after {open}; in the
-    // real app the phone resends message 1 until message 2 arrives. Locally a
-    // short settle is enough. spam > 1 retransmits message 1 in a burst, like
-    // a phone whose resends were queued by the carrier: the responder must
-    // answer with message 2 again, not feed the duplicate to the Noise state
-    // as message 3 (that bug killed every real relay handshake).
-    await new Promise(r => setTimeout(r, 400));
+    // The relay needs a moment to splice the data socket after {open}; do
+    // what the real phone does — resend message 1 until message 2 arrives —
+    // instead of a fixed 400 ms settle (t3 #5). spam > 1 retransmits message
+    // 1 in a burst on the first attempt, like a phone whose resends were
+    // queued by the carrier: the responder must answer with message 2
+    // again, not feed the duplicate to the Noise state as message 3 (that
+    // bug killed every real relay handshake).
     const msg1 = this.noise.writeMessage(Buffer.alloc(0));
-    for (let i = 0; i < spam; i++) this.ws.send(msg1);
-    const msg2 = await this.nextHandshakeMessage();
+    let msg2 = null;
+    for (let attempt = 0; attempt < 40 && !msg2; attempt++) {
+      for (let i = 0; i < spam; i++) this.ws.send(msg1);
+      msg2 = await this.nextHandshakeMessage(250);
+    }
+    assert.ok(msg2, 'message 2 never arrived');
     this.noise.readMessage(msg2);
     this.ws.send(this.noise.writeMessage(Buffer.alloc(0)));
     assert.equal(this.noise.handshakeFinished, true);
@@ -164,9 +173,11 @@ test('phone pairs by QR code through the relay, then chats over the tunnel', {ti
   assert.deepEqual(phone.noise.remoteStatic, loadOrCreateLinkKeys().keys.noise.publicKey);
 
   phone.send({t: 'pair', code: 'WRONGCODE', name: 'Galaxy S26'});
-  // A wrong code in QR mode: no 'paired' — the next thing is the close.
-  const wrong = await Promise.race([phone.next(2500), new Promise(r => setTimeout(() => r('timeout'), 2600))]);
-  assert.ok(wrong === null || wrong === 'timeout' || wrong.t !== 'paired', 'wrong code must not pair');
+  // A wrong code in QR mode: a pair-failed or the close — and the channel
+  // must actually close (t3 #6: a timeout used to pass this test).
+  const wrong = await phone.next(2500); // rejects on timeout: a hang fails here now
+  assert.ok(wrong === null || wrong.t === 'pair-failed', 'wrong code must not pair: ' + JSON.stringify(wrong));
+  await waitFor(() => phone.closed, 5000);
   phone.close();
 
   const phone2 = new Phone('ws://127.0.0.1:' + relayPort + '/c?pc=' + pcId, phoneKeys);
@@ -207,8 +218,9 @@ test('phone pairs by QR code through the relay, then chats over the tunnel', {ti
   await stranger.connect();
   await stranger.handshake().catch(() => {});
   stranger.send({t: 'req', id: 1, method: 'GET', path: '/api/state'});
-  const got = await Promise.race([stranger.next(3000), new Promise(r => setTimeout(() => r('timeout'), 3200))]);
-  assert.ok(got === null || got === 'timeout' || stranger.closed, 'unpaired static key must not be served');
+  const got = await stranger.next(3000); // rejects on timeout (t3 #6): silence is not a pass
+  assert.equal(got, null, 'unpaired static key must not be served');
+  assert.equal(stranger.closed, true);
   stranger.close();
 });
 
@@ -351,7 +363,7 @@ test('relay: phone frames sent before the splice are buffered, bounded, and flus
   const link2 = new Link({serve: {port: stubPort, token: TOKEN}, relayUrl: 'ws://127.0.0.1:' + port, lanPort: null, keys: loadOrCreateLinkKeys(), store: createRemoteStore(storeFile)});
   await link2.start();
   t.after(() => link2.stop().catch(() => {}));
-  await new Promise(r => setTimeout(r, 300));
+  await waitFor(() => link2.controlOpen, 10000); // poll, not a fixed settle (t3 #5)
   const {code} = link2.startPairing({mode: 'qr'});
   const conn = new NoiseConnection({pattern: 'XX', initiator: true, staticKeyPair: generateStaticKeyPair()});
   const decoder = new FrameDecoder();
@@ -414,6 +426,12 @@ test('relay: a peer that stops receiving ends the splice; undelivered bytes are 
     if (i % 20 === 19) await new Promise(r2 => setTimeout(r2, 1));
   }
   assert.equal(await dataClosed, 4429); // 'peer too slow', not a silent mid-stream drop
-  assert.ok(r.stats().forwardedBytesTotal < sent / 2, `charged ${r.stats().forwardedBytesTotal} of ${sent} sent bytes`);
+  // Not a ratio (t3 #7): how much the kernel buffers before the cap bites is
+  // machine-dependent. The invariant is that undelivered bytes are not all
+  // charged, and nothing more is charged once the splice has ended.
+  assert.ok(r.stats().forwardedBytesTotal < sent, `charged ${r.stats().forwardedBytesTotal} of ${sent} sent bytes`);
+  const charged = r.stats().forwardedBytesTotal;
+  await new Promise(r2 => setTimeout(r2, 150));
+  assert.equal(r.stats().forwardedBytesTotal, charged, 'no bytes are charged after the splice ended');
   ctl.ws.close();
 });

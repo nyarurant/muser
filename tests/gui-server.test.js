@@ -185,6 +185,23 @@ test('GET /api/state returns the spec snapshot; the discovery file names it', as
   assert.equal(fs.existsSync(discoveryFile), false, 'close removes the discovery file');
 });
 
+test('GET /api/state carries a selectable question: the choices in focus.ask and the picker state', async t => {
+  const {server, controller} = makeServer(t);
+  await server.start();
+  const ask = {questions: [{header: '猫', question: 'どの猫？', multi: false, options: [{label: '黒猫', description: '定番', preview: null}, {label: '三毛猫', description: null, preview: null}]}]};
+  controller.set({focus: {id: 'f1', status: 'needs_input', ask}});
+  controller.set({question: {questions: ask.questions, tab: 0, index: 1, checked: {}, picked: {}, custom: {}, answers: {}, notes: '', mode: 'list', typeText: ''}});
+  const res = await call(server, 'GET', '/api/state', {headers: AUTH});
+  assert.equal(res.status, 200);
+  const state = await res.json();
+  assert.deepEqual(state.focus.ask, ask, 'the choices ride in the focus snapshot, as the TUI gets them');
+  assert.equal(state.question.questions[0].options.length, 2);
+  assert.equal(state.question.index, 1, 'the picker state crosses as plain data');
+  controller.set({question: null, focus: null});
+  const after = await (await call(server, 'GET', '/api/state', {headers: AUTH})).json();
+  assert.equal(after.question, null, 'no picker open: null, like the menu');
+});
+
 test('v4: GET /api/muse-avatar serves the image set on muse.ai, fetched once; 404 without one', async t => {
   const {server, agent} = makeServer(t);
   const calls = [];
@@ -675,21 +692,54 @@ test('v6: GET /api/entries pages the full entry list backwards from `before`', a
   assert.equal((await call(server, 'GET', '/api/entries?before=999', {headers: AUTH})).status, 404);
 });
 
+// t5 #1 (deep audit): the clamp above was untestable with only 10 entries —
+// limit=9999 returned 10 whether the cap was 500, 5000 or gone entirely. With
+// MORE than 500 entries on hand the cap itself is what the answer must show.
+test('v6: GET /api/entries clamps an oversized limit to exactly 500 entries', async t => {
+  const {server, controller} = makeServer(t);
+  controller.set({entries: Array.from({length: 505}, (_, i) => ({id: i + 1, type: 'note', n: i + 1}))});
+  await server.start();
+  const all = await (await call(server, 'GET', '/api/entries?limit=9999', {headers: AUTH})).json();
+  assert.equal(all.entries.length, 500, 'limit=9999 is clamped to 500, so the page stays bounded');
+  assert.deepEqual([all.entries[0].id, all.entries[all.entries.length - 1].id], [6, 505], 'the newest 500, not the oldest');
+  assert.equal(all.hasMore, true, 'entries older than the page remain');
+  const exact = await (await call(server, 'GET', '/api/entries?limit=500', {headers: AUTH})).json();
+  assert.equal(exact.entries.length, 500, 'a limit of exactly 500 is honoured as-is');
+});
+
+// t5 #2 (deep audit): call() only ever sends JSON.stringify output, so the
+// malformed-JSON branch of readBody and the default 1 MB body cap on routes
+// other than /send were never exercised from this file.
+test('v6: a malformed JSON body is a 400, and a non-/send route keeps the 1 MB body cap', async t => {
+  const {server, controller} = makeServer(t);
+  await server.start();
+  const raw = (p, body) => fetch('http://127.0.0.1:' + server.port + p, {method: 'POST', headers: {...AUTH, 'content-type': 'application/json'}, body});
+  const bad = await raw('/api/mode', '{"mode": ');
+  assert.equal(bad.status, 400, 'truncated JSON is refused, not hung or 500');
+  assert.deepEqual(await bad.json(), {error: 'invalid JSON'});
+  assert.equal(controller.s.mode, 'default', 'nothing was applied from the broken body');
+  // 1 MB + slack of valid JSON on /api/mode (which uses the default cap, not
+  // /send's 16 MB): 413 before any parsing or applying happens.
+  const big = await raw('/api/mode', JSON.stringify({mode: 'default', pad: 'x'.repeat(1024 * 1024)}));
+  assert.equal(big.status, 413, 'over the default 1 MB cap');
+  assert.equal(controller.s.mode, 'default');
+});
+
 test('v6: POST /api/limit answers the pending limitInput through answerLimit', async t => {
   const {server, controller} = makeServer(t);
   await server.start();
   assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 5}})).status, 409, 'nothing pending');
   let done = null, backed = 0;
   controller.set({limitInput: {key: 'maxToolCallsPerTurn', label: '上限', text: '250', min: 1, max: 1000, hint: '1〜1000', done: v => { done = v; }, back: () => { backed++; }}});
-  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: '5'}})).status, 400, 'a non-number value');
-  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 0}})).status, 400, 'out of range (answerLimit refused)');
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: '5', key: 'maxToolCallsPerTurn'}})).status, 400, 'a non-number value');
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 0, key: 'maxToolCallsPerTurn'}})).status, 400, 'out of range (answerLimit refused)');
   assert.ok(controller.s.limitInput, 'a refused value leaves the input open');
-  const ok = await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 42}});
+  const ok = await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 42, key: 'maxToolCallsPerTurn'}});
   assert.equal(ok.status, 200);
   assert.equal(done, 42);
   assert.equal(controller.s.limitInput, null);
   controller.set({limitInput: {key: 'x', label: 'x', text: '1', back: () => { backed++; }}});
-  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {cancel: true}})).status, 200);
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {cancel: true, key: 'x'}})).status, 200);
   assert.deepEqual(controller.limitAnswers, [0, 42, null], 'the route went through answerLimit every time (the string never reached it)');
   assert.equal(backed, 1, 'cancel runs the back() fallback like Esc');
   assert.equal(controller.s.limitInput, null);
@@ -728,15 +778,15 @@ test('v6: the REAL Controller answers /limit and menu cancel end to end', async 
   assert.equal(snap.limitInput.key, 'concurrent');
   assert.equal(snap.clientStatus, 'connected');
   assert.deepEqual(snap.device, {name: 'fake-device', slot: 2, connected: true});
-  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 7}})).status, 200);
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 7, key: 'concurrent'}})).status, 200);
   assert.equal(ctrl.s.limitInput, null);
   assert.equal(ctrl.s.menu?.options?.[0]?.desc, '7', 'the limits menu reopened with the applied value');
   // A /settings-style edit (min/max + done): range and type are refused, a good value lands.
   let got = null;
   ctrl.set({menu: null, limitInput: {key: 'maxToolCallsPerTurn', label: '上限', text: '250', min: 1, max: 1000, hint: '1〜1000', done: v => { got = v; }}});
-  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 0}})).status, 400);
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 0, key: 'maxToolCallsPerTurn'}})).status, 400);
   assert.ok(ctrl.s.limitInput, 'still open after a refused value');
-  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 42}})).status, 200);
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 42, key: 'maxToolCallsPerTurn'}})).status, 200);
   assert.equal(got, 42);
   assert.equal(ctrl.s.limitInput, null);
   // Menu cancel: Esc semantics — no pick, cancel() runs.
@@ -806,6 +856,8 @@ test('audit #75/#76: /limit checks the input key and requires a safe integer', a
   controller.set({limitInput: {key: 'maxToolCallsPerTurn', label: 'x', text: '250', min: 1, max: 1000, done: v => { done = v; }, back() {}}});
   assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 42, key: 'otherKey'}})).status, 409, 'a stale dialog key is refused');
   assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {cancel: true, key: 'otherKey'}})).status, 409, 'a stale cancel is refused too');
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 42}})).status, 409, 'first #22: a missing key is refused too');
+  assert.equal((await call(server, 'POST', '/api/limit', {headers: AUTH, body: {cancel: true}})).status, 409, 'first #22: a keyless cancel is refused too');
   assert.ok(controller.s.limitInput, 'the current input stayed open');
   const frac = await call(server, 'POST', '/api/limit', {headers: AUTH, body: {value: 1.5, key: 'maxToolCallsPerTurn'}});
   assert.equal(frac.status, 400);
@@ -963,13 +1015,26 @@ test('audit #64: a failed start() can be retried, and concurrent start() shares 
 
 test('audit #65 (gui-server side): start() does not overwrite a live other server’s discovery files', async t => {
   const {spawn} = require('node:child_process');
-  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {stdio: 'ignore'});
+  // The fixture must be a REAL answering server (fix2 A8/A34): ownership is no
+  // longer decided by pid-liveness alone — start() probes the advertised port
+  // and only a server that answers /api/server with the file's own pid owns
+  // the file. A bare sleeper process on a dead port is indistinguishable from
+  // a reused pid and its file is (correctly) treated as stale now.
+  const childScript = "const http = require('http'); const s = http.createServer((req, res) => { res.writeHead(200, {'content-type': 'application/json'}); res.end(JSON.stringify({pid: process.pid})); }); s.listen(0, '127.0.0.1', () => console.log(s.address().port)); setTimeout(() => {}, 30000);";
+  const child = spawn(process.execPath, ['-e', childScript], {stdio: ['ignore', 'pipe', 'pipe']});
   t.after(() => { try { child.kill(); } catch {} });
+  const foreignPort = await new Promise((res, rej) => {
+    let buf = '';
+    const timer = setTimeout(() => rej(new Error('the fixture server did not report a port; output: ' + buf)), 15000);
+    child.stdout.on('data', d => { buf += d; const m = buf.match(/(\d+)\r?\n/); if (m) { clearTimeout(timer); res(Number(m[1])); } });
+    child.on('error', e => { clearTimeout(timer); rej(e); });
+    child.on('exit', c => { clearTimeout(timer); rej(new Error('the fixture server exited early: ' + c + '; output: ' + buf)); });
+  });
   const agent = new FakeAgent(), controller = new FakeController(agent);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-gui-'));
   t.after(() => fs.rmSync(dir, {recursive: true, force: true}));
   const guiFile = path.join(dir, 'gui.json'), srvFile = path.join(dir, 'server.json');
-  const foreign = JSON.stringify({pid: child.pid, port: 4242, token: 'other-token', startedAt: 1});
+  const foreign = JSON.stringify({pid: child.pid, port: foreignPort, token: 'other-token', startedAt: 1});
   fs.writeFileSync(guiFile, foreign); fs.writeFileSync(srvFile, foreign);
   const server = new GuiServer({controller, agent, token: 'test-token', port: 0, discoveryFile: guiFile, serverDiscoveryFile: srvFile});
   t.after(async () => { await server.close(); });

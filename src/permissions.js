@@ -10,7 +10,24 @@ const crypto = require('node:crypto');
 const {MODES} = require('./policy');
 
 function file() { return process.env.MUSER_PERMISSIONS_FILE || path.join(os.homedir(), '.muser', 'permissions.json'); }
-function key(cwd) { return path.resolve(cwd || '.').replace(/[\\/]+$/, '').toLowerCase(); }
+// The pre-fix key: a purely lexical, lower-cased path. Kept so load/update can
+// still find (and migrate) entries remembered before the key became canonical.
+function legacyKey(cwd) { return path.resolve(cwd || '.').replace(/[\\/]+$/, '').toLowerCase(); }
+// A folder's key must be its real identity, not one spelling of it (c29 #10):
+// path.resolve alone splits one folder into several keys when it is reached
+// through a junction / symlink / 8.3 short name / UNC spelling, so the mode
+// remembered there silently stopped applying; and unconditional lower-casing
+// merged two genuinely different folders on case-sensitive NTFS directories
+// into one entry, leaking a mode (bypass included) to a folder never chosen.
+// realpath resolves the spelling AND returns the on-disk casing, which unifies
+// case variants of the same folder on ordinary Windows volumes while keeping
+// case-distinct folders apart. A path that does not exist (yet) cannot be
+// resolved, so it keeps the old lexical lower-cased key.
+function key(cwd) {
+  const resolved = path.resolve(cwd || '.').replace(/[\\/]+$/, '');
+  try { return fs.realpathSync.native(resolved).replace(/[\\/]+$/, '') || resolved.toLowerCase(); }
+  catch { return resolved.toLowerCase(); }
+}
 
 // {bad: true} when the file is there but is not a permissions file (a hand edit with a stray comma):
 // the next change wrote back only its own folder and erased every other folder's mode and keys.
@@ -61,19 +78,22 @@ function locked(fn) { return require('./config').withLock(file(), fn); }
 function update(cwd, fn) {
   return locked(() => {
     try {
-      const data = readAll(), k = key(cwd);
+      const data = readAll(), k = key(cwd), lk = legacyKey(cwd);
       if (data.unreadable) return false; // never write over a file that could not be read
       if (data.bad) { try { fs.renameSync(file(), file() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} delete data.bad; }
-      const entry = data.folders[k] || {mode: null, allow: []};
+      // An entry remembered under the pre-fix lexical key is carried over to
+      // the canonical key on the folder's next change, not silently orphaned.
+      const entry = data.folders[k] || data.folders[lk] || {mode: null, allow: []};
       fn(entry); entry.updatedAt = new Date().toISOString();
-      data.folders[k] = entry; writeAll(data);
+      data.folders[k] = entry; if (lk !== k) delete data.folders[lk]; writeAll(data);
       return true;
     } catch { return false; } // remembering is a convenience; it never breaks a session
   });
 }
 
 function load(cwd) {
-  const raw = readAll().folders[key(cwd)];
+  const folders = readAll().folders;
+  const raw = folders[key(cwd)] ?? folders[legacyKey(cwd)];
   const e = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   return {mode: typeof e.mode === 'string' && MODES.includes(e.mode) ? e.mode : null, allow: Array.isArray(e.allow) ? e.allow.filter(x => typeof x === 'string') : []};
 }

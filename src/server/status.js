@@ -10,7 +10,8 @@
 // /api/server, whose sessions list carries cwd / account / busy / approval /
 // lastUsedAt per conversation) plus one GET /api/s/:id/state per conversation
 // for the waiting states the list cannot express (a menu, a reason or limit
-// prompt, a queued approval) and the live turn start. No new IPC. The state
+// prompt, a queued approval, an open selectable question) and the live turn
+// start. No new IPC. The state
 // fetch is best-effort: a conversation whose snapshot fails still gets a row
 // from the session list alone. GETs never touch a host entry's lastUsedAt
 // (audit #61), so asking is observation, not use.
@@ -19,13 +20,28 @@
 // descriptors and `now`) so tests drive them without any server.
 const {t} = require('../i18n');
 
+// Strings here come from servers and other windows (conversation titles, todos,
+// progress reports, tool errors, cwds): they are data, not terminal control.
+// Strip escape sequences (OSC 52 could rewrite the clipboard) and flatten
+// newlines, so one field can never forge extra rows in the listing (c11 #2,
+// the CLI counterpart of TUI audit #184). Mirrors src/ui/sanitize.mjs's
+// stripControls, plus newline flattening because every field here is one line.
+const ESC_SEQ = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[PX^_][^\x1b]*(?:\x1b\\)|[@-Z\\-_])/g;
+function cleanText(v) {
+  return String(v ?? '').replace(ESC_SEQ, '').replace(/[\r\n\t]+/g, ' ').replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+}
+
 // What a conversation is doing, most urgent first: an approval outranks
 // work, and any other wait on the user outranks plain busyness. `session` is
 // one /api/server sessions entry (busy/approval booleans only); `state` is
 // the /api/state snapshot when it could be fetched, else null.
 function activityOf(session, state) {
   if (session?.approval || state?.approval) return 'approval';
-  if (state && (state.menu || state.reasonFor || state.limitInput || state.approvalQueue > 0)) return 'input';
+  // state.question: the selectable-question picker (focus.ask_user with options),
+  // published by gui-server's /api/state. It opens after the turn ended, so busy
+  // is false; without it the conversation read as idle while it waited for an
+  // answer (fifth c1-1, the server counterpart of window-status.js).
+  if (state && (state.menu || state.reasonFor || state.limitInput || state.question || state.approvalQueue > 0)) return 'input';
   if (session?.busy || state?.busy) return 'working';
   return 'idle';
 }
@@ -93,9 +109,9 @@ function formatRow(row, now = Date.now()) {
     : row.activity === 'working' ? t('作業中') : t('待機中');
   let line = '  ' + row.shortId + '  ' + word;
   if (row.isDefault) line += ' / ' + t('既定');
-  if (row.accountLabel) line += ' / ' + t('アカウント: {label}', {label: row.accountLabel});
-  if (row.focusStatus) line += ' / ' + t('Focus: {status}', {status: row.focusStatus});
-  line += '  ' + (row.cwd || '');
+  if (row.accountLabel) line += ' / ' + t('アカウント: {label}', {label: cleanText(row.accountLabel)});
+  if (row.focusStatus) line += ' / ' + t('Focus: {status}', {status: cleanText(row.focusStatus)});
+  line += '  ' + cleanText(row.cwd);
   const bits = [];
   if (row.activity === 'working' && row.turnStart) bits.push(t('経過: {span}', {span: durationText(now - row.turnStart)}));
   if (row.lastUsedAt) bits.push(t('最終利用: {ago}', {ago: t('{span}前', {span: durationText(now - row.lastUsedAt)})}));
@@ -110,7 +126,7 @@ function formatStatus(servers, now = Date.now()) {
   for (const srv of servers || []) {
     const rows = buildRows([srv]);
     if (!rows.length) continue;
-    const head = {pid: srv.pid, port: srv.port, version: srv.version, at: srv.startedAt ? new Date(srv.startedAt).toLocaleString() : ''};
+    const head = {pid: cleanText(srv.pid), port: cleanText(srv.port), version: cleanText(srv.version), at: srv.startedAt ? new Date(srv.startedAt).toLocaleString() : ''};
     lines.push(srv.kind === 'serve'
       ? t('単独 serve: pid {pid} / port {port} / version {version} / 起動 {at}', head)
       : t('Muser Server: pid {pid} / port {port} / version {version} / 起動 {at}', head));
@@ -146,12 +162,15 @@ async function gatherWindowStatus(deps = {}) {
     if (!live) continue;
     const sessions = Array.isArray(live.sessions) ? live.sessions : [];
     const states = {};
-    for (const s of sessions) {
+    // Fetch the snapshots in parallel (c11 #1): serially, N conversations cost
+    // up to N x the 3 s timeout and `muser status` shows nothing at all until
+    // every one has answered — the local windows included.
+    await Promise.all(sessions.map(async s => {
       try {
         const r = await request(info, 'GET', '/api/s/' + encodeURIComponent(s.id) + '/state', undefined, 3000);
         if (r?.status === 200 && r.json) states[s.id] = r.json;
       } catch { /* the row falls back to the session list alone */ }
-    }
+    }));
     servers.push({
       kind,
       pid: live.pid ?? info.pid,
@@ -174,10 +193,10 @@ async function gatherWindowStatus(deps = {}) {
 const ACTIVITY = {approval: '承認待ち', input: '入力待ち', working: '作業中', idle: '待機中'};
 const TODO_MARK = {completed: '✓', in_progress: '▶', pending: '☐'};
 const sinceText = (iso, now) => { const at = Date.parse(iso); return Number.isFinite(at) ? durationText(now - at) : null; };
-const callText = c => (c ? c.command + (c.summary ? '(' + c.summary + ')' : '') + (c.agent && c.agent !== 'main' ? ' [' + c.agent + ']' : '') : '');
+const callText = c => (c ? cleanText(c.command) + (c.summary ? '(' + cleanText(c.summary) + ')' : '') + (c.agent && c.agent !== 'main' ? ' [' + cleanText(c.agent) + ']' : '') : '');
 function focusText(f) {
   if (!f) return null;
-  return t('Focus: {status}', {status: f.status}) + (f.maxRounds ? ' ' + f.round + '/' + f.maxRounds : '') + (f.total ? ' ✓' + f.met + '/' + f.total : '');
+  return t('Focus: {status}', {status: cleanText(f.status)}) + (f.maxRounds ? ' ' + f.round + '/' + f.maxRounds : '') + (f.total ? ' ✓' + f.met + '/' + f.total : '');
 }
 
 // Running exec runs only: a finished run is in `muser exec --status`, not in the open windows.
@@ -204,11 +223,11 @@ function formatWindow(w, now = Date.now()) {
   // How long it has been like this: waiting on an approval since it was asked, working since the turn began.
   const since = w.activity === 'approval' ? w.approval?.since : w.activity === 'working' ? w.turnStartedAt : null;
   if (since) head[1] += ' ' + sinceText(since, now);
-  if (w.account?.label || w.account?.id) head.push(t('アカウント: {label}', {label: w.account.label || w.account.id}));
+  if (w.account?.label || w.account?.id) head.push(t('アカウント: {label}', {label: cleanText(w.account.label || w.account.id)}));
   if (!w.connected) head.push(t('未接続'));
-  const lines = [head.join('  ') + '  ' + (w.cwd || '')];
+  const lines = [head.join('  ') + '  ' + cleanText(w.cwd)];
   const bits = [];
-  if (w.session) bits.push(t('会話 {id}', {id: String(w.session.id).slice(0, 8)}) + (w.session.title ? ' 「' + w.session.title + '」' : ''));
+  if (w.session) bits.push(t('会話 {id}', {id: String(w.session.id).slice(0, 8)}) + (w.session.title ? ' 「' + cleanText(w.session.title) + '」' : ''));
   const ft = focusText(w.focus); if (ft) bits.push(ft);
   const working = (w.agents || []).filter(a => a.state === 'working').length;
   if (working) bits.push(t('エージェント {n} 体が作業中', {n: working}));
@@ -217,17 +236,17 @@ function formatWindow(w, now = Date.now()) {
   if (w.approval) lines.push('    ' + t('承認待ち: {call}', {call: callText(w.approval)}));
   else if (w.running) lines.push('    ' + t('実行中: {call}', {call: callText(w.running)}) + (w.running.since ? ' (' + sinceText(w.running.since, now) + ')' : ''));
   const doing = (w.todos || []).find(x => x.status === 'in_progress');
-  if (doing) lines.push('    ' + t('Todo: {item}（{done}/{total} 完了）', {item: doing.content, done: w.todos.filter(x => x.status === 'completed').length, total: w.todos.length}));
+  if (doing) lines.push('    ' + t('Todo: {item}（{done}/{total} 完了）', {item: cleanText(doing.content), done: w.todos.filter(x => x.status === 'completed').length, total: w.todos.length}));
   return lines;
 }
 function formatExec(v, now = Date.now()) {
-  const lines = ['  pid ' + v.pid + '  ' + t('作業中') + ' ' + (sinceText(v.startedAt, now) || '') + (v.account ? '  ' + t('アカウント: {label}', {label: v.account}) : '') + '  ' + (v.cwd || '')];
+  const lines = ['  pid ' + v.pid + '  ' + t('作業中') + ' ' + (sinceText(v.startedAt, now) || '') + (v.account ? '  ' + t('アカウント: {label}', {label: cleanText(v.account)}) : '') + '  ' + cleanText(v.cwd)];
   const bits = [];
-  if (v.prompt) bits.push('「' + String(v.prompt).split('\n')[0].slice(0, 60) + '」');
+  if (v.prompt) bits.push('「' + cleanText(String(v.prompt).split('\n')[0]).slice(0, 60) + '」');
   bits.push(t('ツール {n} 回', {n: v.tools || 0}));
-  if (v.focus?.status) bits.push(t('Focus: {status}', {status: v.focus.status}));
+  if (v.focus?.status) bits.push(t('Focus: {status}', {status: cleanText(v.focus.status)}));
   lines.push('    ' + bits.join(' · '));
-  if (v.last) lines.push('    ' + t('最後: {call}', {call: v.last}));
+  if (v.last) lines.push('    ' + t('最後: {call}', {call: cleanText(v.last)}));
   return lines;
 }
 function formatAll({windows = [], servers = [], execs = []} = {}, now = Date.now()) {
@@ -257,21 +276,21 @@ function formatDetail(hit, now = Date.now()) {
   if (hit.kind === 'server') return [formatRow(hit.item, now)];
   if (hit.kind === 'exec') return require('../exec-status').summary(hit.item, {now}).split('\n');
   const w = hit.item, lines = formatWindow(w, now);
-  if (w.focus?.open?.length && w.focus.status !== 'complete') lines.push('    ' + t('未完: {ids}', {ids: w.focus.open.join(', ')}) + (w.focus.reason ? ' — ' + w.focus.reason : ''));
-  if (w.goal) lines.push('    ' + t('常設ゴール: {goal}', {goal: w.goal}));
-  if (w.todos?.length) { lines.push(t('Todo')); for (const x of w.todos) lines.push('  ' + (TODO_MARK[x.status] || '☐') + ' ' + x.content); }
+  if (w.focus?.open?.length && w.focus.status !== 'complete') lines.push('    ' + t('未完: {ids}', {ids: w.focus.open.map(cleanText).join(', ')}) + (w.focus.reason ? ' — ' + cleanText(w.focus.reason) : ''));
+  if (w.goal) lines.push('    ' + t('常設ゴール: {goal}', {goal: cleanText(w.goal)}));
+  if (w.todos?.length) { lines.push(t('Todo')); for (const x of w.todos) lines.push('  ' + (TODO_MARK[x.status] || '☐') + ' ' + cleanText(x.content)); }
   if (w.agents?.length) {
     lines.push(t('エージェント'));
-    for (const a of w.agents) lines.push('  ' + a.tag + (a.type ? ' ' + a.type : '') + '  ' + a.state + '  ' + (a.title || '') + (a.lastTool ? '  · ' + a.lastTool : '') + (a.startedAt ? '  (' + sinceText(a.state === 'working' ? a.startedAt : a.endedAt || a.startedAt, now) + ')' : ''));
+    for (const a of w.agents) lines.push('  ' + cleanText(a.tag) + (a.type ? ' ' + cleanText(a.type) : '') + '  ' + cleanText(a.state) + '  ' + cleanText(a.title) + (a.lastTool ? '  · ' + cleanText(a.lastTool) : '') + (a.startedAt ? '  (' + sinceText(a.state === 'working' ? a.startedAt : a.endedAt || a.startedAt, now) + ')' : ''));
   }
   if (w.toolLog?.length) {
     lines.push(t('最近のツール'));
-    for (const x of w.toolLog.slice(-10)) lines.push('  ' + (x.ok ? '✓ ' : '✗ ') + callText(x) + (x.ok ? '' : '  ' + (x.error || '')) + '  ' + t('{span}前', {span: sinceText(x.at, now)}));
+    for (const x of w.toolLog.slice(-10)) lines.push('  ' + (x.ok ? '✓ ' : '✗ ') + callText(x) + (x.ok ? '' : '  ' + cleanText(x.error)) + '  ' + t('{span}前', {span: sinceText(x.at, now)}));
   }
-  if (w.progress?.length) { lines.push(t('経過報告')); for (const p of w.progress.slice(-3)) lines.push('  ' + (p.agent && p.agent !== 'main' ? '[' + p.agent + '] ' : '') + p.message); }
-  if (w.lastTurn) lines.push(t('前のターン: {state}', {state: w.lastTurn.ok ? t('完了') : w.lastTurn.aborted ? t('中断') : t('失敗: {error}', {error: w.lastTurn.error || ''})}) + ' (' + t('{span}前', {span: sinceText(w.lastTurn.endedAt, now)}) + ')' + (w.lastTurn.usage ? ' · ' + (w.lastTurn.usage.formatted || (require('../turn-usage').formatTokens(w.lastTurn.usage.inputTokens || 0) + ' in / ' + require('../turn-usage').formatTokens(w.lastTurn.usage.outputTokens || 0) + ' out')) : ''));
+  if (w.progress?.length) { lines.push(t('経過報告')); for (const p of w.progress.slice(-3)) lines.push('  ' + (p.agent && p.agent !== 'main' ? '[' + cleanText(p.agent) + '] ' : '') + cleanText(p.message)); }
+  if (w.lastTurn) lines.push(t('前のターン: {state}', {state: w.lastTurn.ok ? t('完了') : w.lastTurn.aborted ? t('中断') : t('失敗: {error}', {error: cleanText(w.lastTurn.error)})}) + ' (' + t('{span}前', {span: sinceText(w.lastTurn.endedAt, now)}) + ')' + (w.lastTurn.usage ? ' · ' + require('../turn-usage').usageText(w.lastTurn.usage) : ''));
   return lines;
 }
 
-module.exports = {activityOf, accountLabelOf, buildRows, durationText, formatRow, formatStatus, gatherWindowStatus,
+module.exports = {activityOf, accountLabelOf, buildRows, durationText, formatRow, formatStatus, gatherWindowStatus, cleanText,
   execRuns, gatherAll, formatWindow, formatExec, formatAll, find, formatDetail};

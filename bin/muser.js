@@ -8,7 +8,7 @@ if (process.env.MUSER_SGR === undefined) {
   const VALUED = ['--mode', '--cd', '--max-agents', '--max-agents-total', '--session', '--status-file', '--port', '--account', '--relay'];
   const args = process.argv.slice(2);
   let first = null;
-  for (let i = 0; i < args.length; i++) { if (args[i].startsWith('--')) { if (VALUED.includes(args[i])) i++; continue; } if (args[i].startsWith('-')) continue; first = args[i]; break; }
+  for (let i = 0; i < args.length; i++) { if (args[i] === '--') break; if (args[i].startsWith('--')) { if (VALUED.includes(args[i])) i++; continue; } if (args[i].startsWith('-')) continue; first = args[i]; break; }
   if (first === 'serve' || first === 'server') process.env.MUSER_SGR = '1';
 }
 const VERSION = require('../package.json').version;
@@ -91,11 +91,14 @@ function parse(argv) {
   // exec's words after the first prompt word), flag-shaped words in it are just words —
   // `muser fix the --json bug` used to switch modes and lose the word (audit #249). Flags
   // for those commands go before the prompt, as in --help.
+  // o.literal: a `--` came before ANY word, so even a word spelled like a subcommand
+  // is the prompt itself (`muser -- serve` asks Muse about "serve"; audit #29).
+  // main() reads it and dispatches no subcommand for such a run.
   let literal = false, promptTail = false;
   for (let i = 0; i < argv.length; i++) {
     let a = argv[i];
     if (literal || promptTail) { o._.push(a); continue; }
-    if (a === '--') { literal = true; continue; }
+    if (a === '--') { literal = true; if (!o._.length) o.literal = true; continue; }
     // --flag=value is the same as --flag value (--mode=bypass was an unknown option).
     let eqValue;
     const eq = /^--(mode|cd|max-agents|max-agents-total|session|status-file|port|account|relay|status)=/.exec(a);
@@ -185,7 +188,7 @@ async function startBundle(o, session) {
 function sessionFromFlags(o) {
   const sessions = require('../src/sessions');
   if (o.resume) return resumeTarget(sessions, o.resume);
-  if (o.continue) { const s = sessions.recent(o.cwd).find(s => s.turns); if (!s) throw new Error(t('このフォルダーで再開できる会話がありません。')); return s; }
+  if (o.continue) { const s = sessions.recent(o.cwd).find(s => s.turns); if (!s) throw new Error(t('再開できる会話はありません。新しい会話は `muser` を引数なしで実行すると始められます。')); return s; }
   return undefined;
 }
 
@@ -227,14 +230,26 @@ async function connect(o, log) {
     }
   }
   const {web, auth, account, files} = chosen;
+  // Assembly window (deep c3 #1): from subscribe() until the Agent exists, a throw
+  // (an MCP server that will not start, the Agent constructor) leaked the gateway
+  // client and the started MCP children — nothing owned them yet, so the process
+  // could hang after printing the error. The Agent-owned try below starts later.
   const subscribed = client.subscribe();
+  subscribed.catch(() => {}); // a cleanup disconnect may settle it as a rejection
   const {McpHub} = require('../src/mcp');
   const mcp = new McpHub();
-  if (Object.values(mcp.config.mcpServers || {}).some(s => s.enabled)) { log(t('MCP サーバーに接続しています…')); await mcp.start(); }
-  mcp.index();
-  const {Agent} = require('../src/agent');
-  const cwd = sessionFolder(session, o), remembered = require('../src/permissions').load(cwd);
-  const agent = new Agent({client, auth, cwd, mode: o.mode || remembered.mode || require('../src/settings').defaultMode(), allowAlways: remembered.allow, web, session, mcp, focusEnabled: !o.noFocus && require('../src/settings').switchValue('focus'), agentLimits: {maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal}, accountId: account.id, accountLabel: pool.multi() ? account.label : null, accountFiles: files, accountPool: pool.makePool()});
+  let agent;
+  try {
+    if (Object.values(mcp.config.mcpServers || {}).some(s => s.enabled)) { log(t('MCP サーバーに接続しています…')); await mcp.start(); }
+    mcp.index();
+    const {Agent} = require('../src/agent');
+    const cwd = sessionFolder(session, o), remembered = require('../src/permissions').load(cwd);
+    agent = new Agent({client, auth, cwd, mode: o.mode || remembered.mode || require('../src/settings').defaultMode(), allowAlways: remembered.allow, web, session, mcp, focusEnabled: !o.noFocus && require('../src/settings').switchValue('focus'), agentLimits: {maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal}, accountId: account.id, accountLabel: pool.multi() ? account.label : null, accountFiles: files, accountPool: pool.makePool()});
+  } catch (e) {
+    try { await mcp.close(); } catch {}
+    try { client.disconnect(false); } catch {}
+    throw e;
+  }
   log(t('この PC の CLI 端末をつないでいます…'));
   // A failure from here on must not leak the half-built agent (recovery scan):
   // its MCP children, gateway client and node slot would keep the process alive
@@ -277,9 +292,24 @@ function lastMuseName(accountId) { return require('../src/accounts').museName(ac
 async function prepare(o, overrides = {}) {
   const pool = require('../src/account-pool');
   pool.preloadAll();
-  const session = overrides.session !== undefined ? overrides.session : sessionFromFlags(o);
+  // Third H3: three distinct cases for overrides.session —
+  //  - 'new' (NEW_SESSION from src/server/sessions-host, sent by openNew /
+  //    POST /api/sessions): an EXPLICIT new conversation. It must NOT resume
+  //    anything, whatever --session/-c flags this server process was started
+  //    with, so the session is null (Agent treats it as a fresh session).
+  //  - a stored session object: re-open that conversation.
+  //  - absent/undefined: not specified (the CLI startup paths) — fall back
+  //    to the startup flags exactly as before.
+  const session = overrides.session === 'new' ? null : overrides.session !== undefined ? overrides.session : sessionFromFlags(o);
   const oo = {...o};
-  if (overrides.cwd) { oo.cwd = overrides.cwd; oo.cdGiven = true; }
+  if (overrides.cwd) {
+    // Server-supplied cwd gets the same existence check --cd gets in parse()
+    // (deep c3 #8): an unchecked folder made a conversation whose every file
+    // operation and command then failed obscurely.
+    let dir = false; try { dir = require('node:fs').statSync(overrides.cwd).isDirectory(); } catch {}
+    if (!dir) throw new Error(t('この会話のフォルダーがありません: {cwd}（別のフォルダーで続けるなら --cd <フォルダー> を付けてください）', {cwd: overrides.cwd}));
+    oo.cwd = overrides.cwd; oo.cdGiven = true;
+  }
   if (overrides.account) oo.account = overrides.account;
   if (overrides.mode) oo.mode = overrides.mode;
   const chosen = await startBundle(oo, session);
@@ -289,11 +319,16 @@ async function prepare(o, overrides = {}) {
   auth.vm().catch(() => {}); // the device link's VM credentials, fetched while the screen comes up
   const {McpHub} = require('../src/mcp');
   const mcp = new McpHub();
-  if (Object.values(mcp.config.mcpServers || {}).some(s => s.enabled)) await mcp.start(); // its tools are registered with the device
-  mcp.index();
-  const {Agent} = require('../src/agent');
-  const cwd = sessionFolder(session, oo), remembered = require('../src/permissions').load(cwd);
-  const agent = new Agent({client, auth, cwd, mode: oo.mode || remembered.mode || require('../src/settings').defaultMode(), allowAlways: remembered.allow, web, session, mcp, focusEnabled: !o.noFocus && require('../src/settings').switchValue('focus'), agentLimits: {maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal}, accountId: account.id, accountLabel: pool.multi() ? account.label : null, accountFiles: files, accountPool: pool.makePool()});
+  // Same assembly window as connect() (deep c3 #1): a throw from mcp.start() or
+  // the Agent constructor leaked the started MCP children, as no Agent owned them.
+  let agent;
+  try {
+    if (Object.values(mcp.config.mcpServers || {}).some(s => s.enabled)) await mcp.start(); // its tools are registered with the device
+    mcp.index();
+    const {Agent} = require('../src/agent');
+    const cwd = sessionFolder(session, oo), remembered = require('../src/permissions').load(cwd);
+    agent = new Agent({client, auth, cwd, mode: oo.mode || remembered.mode || require('../src/settings').defaultMode(), allowAlways: remembered.allow, web, session, mcp, focusEnabled: !o.noFocus && require('../src/settings').switchValue('focus'), agentLimits: {maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal}, accountId: account.id, accountLabel: pool.multi() ? account.label : null, accountFiles: files, accountPool: pool.makePool()});
+  } catch (e) { try { await mcp.close(); } catch {} throw e; }
   try {
     const usage = require('../src/usage');
     agent.on('tool-end', () => { try { usage.record({toolCalls: 1}); } catch {} });
@@ -330,7 +365,20 @@ async function onboard({forceLogin = false, forceDevice = false, accountId} = {}
   // login step ran, so a login completed as a DIFFERENT muse.ai user skipped (or
   // kept) a device registration decided under the old login. onboard() re-asks
   // after the login step, reading the jar as it then stands.
-  const needDevice = () => forceDevice || createAuth(createWeb(loadJar(files.web), {file: files.web}), {file: files.device}).snapshot().phase !== 'authenticated';
+  // A pair can be phase 'authenticated' yet dead, or minted for another muse.ai
+  // user (first audit #36): the phase check alone skipped registration here and
+  // the failure only surfaced later at connect time. pcLogin() repairs exactly
+  // those cases when it runs, so probe the pair the way it does — once, before
+  // the screens — and let needDevice report it broken. (A network error is NOT
+  // a broken pair: it falls through as registered, as before.)
+  let deviceBroken = false;
+  if (!forceDevice && loadJar(files.web).length) {
+    const probeAuth = createAuth(createWeb(loadJar(files.web), {file: files.web}), {file: files.device});
+    if (probeAuth.snapshot().phase === 'authenticated') {
+      try { await probeAuth.vm(); } catch (e) { if (e.deviceMismatch || e.deadDevice || e.status === 401) deviceBroken = true; }
+    }
+  }
+  const needDevice = () => forceDevice || deviceBroken || createAuth(createWeb(loadJar(files.web), {file: files.web}), {file: files.device}).snapshot().phase !== 'authenticated';
   await require('../src/tui/onboard').onboard({
     needLogin, needDevice,
     login: progress => require('../src/login').login({log: s => progress(s.trim().replace(/^…\s*/, '')), profile: files.browser, jarFile: files.web}),
@@ -371,13 +419,19 @@ async function interactive(o, initial) {
   if (i18n.chosen() === null) await require('../src/tui/onboard').askLanguage();
   await onboardFor(o);
   const {agent, museName, web} = await prepare(o);
-  const {run} = await view;
+  // A view that fails to load must not strand the prepared agent (deep c3 #1).
+  let run;
+  try { ({run} = await view); } catch (e) { try { agent.close(); } catch {} throw e; }
   // The TUI comes up now; the gateway and the device link connect behind it.
   run({agent, museName, version: VERSION, initial, onReload: () => {
     // /reload: a fresh process on the current code, resuming this session. The flags that
     // shaped this window are carried over; the mode is the one in effect now.
     const args = [__filename];
-    if (agent.session?.turns) args.push('--session', agent.session.id);
+    // Always carry the session id, not only once it has turns (third M21): a
+    // conversation with a goal but no turn yet was dropped by /reload — the new
+    // process started fresh, the goal was lost and the old conversation was not
+    // even listed. The client path below already carried it unconditionally.
+    if (agent.session?.id) args.push('--session', agent.session.id);
     if (agent.accountId) args.push('--account', agent.accountId);
     args.push('--cd', agent.cwd, '--mode', agent.mode);
     if (o.noFocus) args.push('--no-focus');
@@ -409,7 +463,12 @@ async function clientInteractive(o, initial) {
   if ((live.protocol ?? 5) !== 6) throw new Error(t('動いている Muser Server のプロトコル {p} には対応していません（この muser はプロトコル 6 です）。`muser server stop` してから起動し直すか、--client を外してください。', {p: live.protocol ?? 5}));
   let sessionId;
   if (o.resume || o.continue) sessionId = sessionFromFlags(o)?.id;
-  const opened = await discovery.attachSession(info, {cwd: o.cwd, account: o.account, mode: o.mode, sessionId});
+  // The agent limits and Focus flag travel with the attach (first audit #32):
+  // discovery/sessions-host currently accept only cwd/account/mode/sessionId,
+  // so until those sides take them the server's own settings apply — but the
+  // values are at least offered here instead of dropped in bin. (Cross-file:
+  // src/server/discovery.js + src/server/sessions-host.js.)
+  const opened = await discovery.attachSession(info, {cwd: o.cwd, account: o.account, mode: o.mode, sessionId, maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal, noFocus: o.noFocus});
   process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
   process.stdout.write('\n  \x1b[1m\x1b[38;5;177mmuser\x1b[0m\x1b[2m  ' + t('起動しています…') + '\x1b[0m');
   const {createClient} = require('../src/server/client');
@@ -432,6 +491,8 @@ async function clientInteractive(o, initial) {
     args.push('--cd', o.cwd);
     if (o.mode) args.push('--mode', o.mode);
     if (o.noFocus) args.push('--no-focus');
+    if (o.maxAgents != null) args.push('--max-agents', String(o.maxAgents));
+    if (o.maxAgentsTotal != null) args.push('--max-agents-total', String(o.maxAgentsTotal));
     require('node:child_process').spawn(process.execPath, args, {stdio: 'inherit'}).unref();
     setTimeout(() => process.exit(0), 50);
   };
@@ -444,9 +505,22 @@ async function clientInteractive(o, initial) {
 // once by whatever launches the run; one that is still open after this is a launcher
 // holding the pipe open, not a prompt on its way (audit #154).
 const STDIN_TIMEOUT_MS = 30000;
+// A byte cap as well as the time cap (deep c3 #2): a fast pipe could fill memory
+// long before the 30 s timeout fired. 10 MB is far beyond any real task file.
+const STDIN_MAX_BYTES = 10 * 1024 * 1024;
+// Decode a stdin prompt (deep c3 #3): UTF-8 first, but a cp932 (Shift-JIS) file
+// piped on a Japanese Windows box used to be silently mangled into U+FFFD and
+// sent to Muse as-is. Invalid UTF-8 falls back to Shift-JIS; bytes that are
+// neither decode lossily as before.
+function decodeStdin(buf) {
+  try { return new TextDecoder('utf-8', {fatal: true}).decode(buf); } catch {}
+  try { return new TextDecoder('shift-jis', {fatal: true}).decode(buf); } catch {}
+  return buf.toString('utf8');
+}
 async function readStdinPrompt(timeoutMs) {
   const chunks = [];
-  const reading = (async () => { for await (const c of process.stdin) chunks.push(c); return Buffer.concat(chunks).toString('utf8'); })();
+  let bytes = 0;
+  const reading = (async () => { for await (const c of process.stdin) { bytes += c.length; if (bytes > STDIN_MAX_BYTES) throw new Error(t('標準入力（stdin）の上限（{mb} MB）を超えました。', {mb: Math.round(STDIN_MAX_BYTES / 1024 / 1024)})); chunks.push(c); } return decodeStdin(Buffer.concat(chunks)); })();
   reading.catch(() => {}); // a timeout destroys stdin below; that rejection is expected
   let timer;
   const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(t('標準入力（stdin）を {sec} 秒待っても読み終えませんでした。送り側がパイプを閉じていない可能性があります。', {sec: Math.round(timeoutMs / 1000)}))), timeoutMs); timer.unref?.(); });
@@ -522,7 +596,7 @@ async function exec(o, prompt) {
     await agent.cancelAll().catch(() => {});
     agent.close();
     status.finish({state: 'interrupted', exit: 130, ok: false, session: agent.session.id, error: 'interrupted'});
-    if (json) out({type: 'result', ok: false, session: agent.session.id, error: 'interrupted', duration_ms: Date.now() - t0});
+    if (json) out({type: 'result', ok: false, session: agent.session.id, error: 'interrupted', duration_ms: Date.now() - t0, status_file: status.file});
     process.exit(130);
   });
   // SIGTERM gets the same cleanup (recovery scan): ExecStatus's own SIGTERM path
@@ -533,7 +607,7 @@ async function exec(o, prompt) {
     await agent.cancelAll().catch(() => {});
     agent.close();
     status.finish({state: 'interrupted', exit: 143, ok: false, session: agent.session.id, error: 'interrupted'});
-    if (json) out({type: 'result', ok: false, session: agent.session.id, error: 'interrupted', duration_ms: Date.now() - t0});
+    if (json) out({type: 'result', ok: false, session: agent.session.id, error: 'interrupted', duration_ms: Date.now() - t0, status_file: status.file});
     process.exit(143);
   });
   agent.on('tool-end', tool);
@@ -571,7 +645,7 @@ async function exec(o, prompt) {
   } catch (e) {
     status.finish({exit: 1, ok: false, session: agent.session.id, error: e.message}); noteWriteError();
     if (!json) throw e;
-    out({type: 'result', ok: false, session: agent.session.id, error: e.message, duration_ms: Date.now() - t0}); process.exitCode = 1;
+    out({type: 'result', ok: false, session: agent.session.id, error: e.message, duration_ms: Date.now() - t0, status_file: status.file}); process.exitCode = 1;
   } finally { agent.close(); }
 }
 
@@ -589,7 +663,11 @@ async function exec(o, prompt) {
 // CLI is untouched by all of this.
 async function serve(o) {
   if (o.port != null && o.port > 65535) throw new Error(t('--port は 65535 以下の整数を指定してください（0 で空きポート）。'));
-  if (i18n.chosen() === null) await require('../src/tui/onboard').askLanguage();
+  // The language picker is a terminal UI (fifth c2-1): serve/link pair are often
+  // launched piped (a script, a launcher), where the clack select never answers
+  // and the command hung forever on a fresh home. Only ask on a real terminal;
+  // piped, the default language applies and the GUI picks its own.
+  if (i18n.chosen() === null && process.stdin.isTTY && process.stdout.isTTY) await require('../src/tui/onboard').askLanguage();
   const {Controller} = await import('../src/ui/controller.mjs');
   const {GuiServer} = require('../src/gui-server');
   // --demo: the GUI's look with nothing real behind it — the scripted DemoAgent of `muser demo`,
@@ -626,12 +704,26 @@ async function serve(o) {
       if ((live.protocol ?? 5) !== 6) throw new Error(t('動いている Muser Server のプロトコル {p} には対応していません（この muser はプロトコル 6 です）。`muser server stop` してから起動し直すか、--client を外してください。', {p: live.protocol ?? 5}));
       let sessionId;
       if (o.resume || o.continue) { const target = sessionFromFlags(o); sessionId = target?.id; }
-      const opened = await discovery.attachSession(info, {cwd: o.cwd, account: o.account, mode: o.mode, sessionId});
+      const opened = await discovery.attachSession(info, {cwd: o.cwd, account: o.account, mode: o.mode, sessionId, maxAgents: o.maxAgents, maxAgentsTotal: o.maxAgentsTotal, noFocus: o.noFocus});
       console.log(t('Muser Server はすでに動いています（pid {pid}）。そのサーバーで会話を開きました: {id}', {pid: info.pid, id: opened.id}));
       // Link flags name THIS process's server; an attached one keeps its own
       // settings. Say so instead of silently ignoring them (recovery scan).
-      if (o.noLink || o.noLan || o.relay) console.log(t('すでに動いている Server につなぎました。--relay / --no-link / --no-lan はその Server の設定が使われます。'));
-      if (pendingPairing) { pendingPairing = null; console.log(t('Server がすでに動いていたため、ペアリングは始まっていません。')); }
+      // The agent limits / Focus flag are the same (first audit #32): they are
+      // offered to attachSession above, but a resident server keeps the settings
+      // it was started with until discovery/sessions-host learn to take them.
+      if (o.noLink || o.noLan || o.relay || o.maxAgents != null || o.maxAgentsTotal != null || o.noFocus) console.log(t('すでに動いている Server につなぎました。--relay / --no-link / --no-lan / --max-agents / --max-agents-total / --no-focus はその Server の設定が使われます。'));
+      // A pairing armed by `muser link pair` starts through the live server's
+      // API instead of being dropped (deep c3 #7a): the earlier probe in
+      // linkCommand may simply have raced this server's start.
+      if (pendingPairing) {
+        const mode = pendingPairing; pendingPairing = null;
+        try {
+          if (!live.link) throw new Error(t('動いている Server でスマホ連携が有効になっていません（--no-link で起動された可能性があります）。'));
+          const resp = await discovery.request(info, 'POST', '/api/server/link/pair', {mode});
+          if (resp.status !== 200 || !resp.json?.code) throw new Error(resp.json?.error || t('ペアリングを開始できませんでした（サーバー応答: {status}）', {status: resp.status}));
+          await printPairingResult(mode, resp.json);
+        } catch (e) { console.log(t('ペアリングを開始できませんでした: {message}', {message: e.message})); process.exitCode = 1; }
+      }
       return;
     }
   }
@@ -676,7 +768,9 @@ async function serve(o) {
     // login window opens if that account's login lapsed), like a window would.
     let accountId;
     if (account) { const a = require('../src/accounts').resolve(account); if (!a) throw new Error(t('アカウントが見つかりません: {id}', {id: account})); accountId = a.id; }
-    else if (session) accountId = session.account || 'default';
+    // Third H3: session === 'new' is the explicit-new sentinel, not a stored
+    // session — it has no account of its own (the pool/flag logic below runs).
+    else if (session && session !== 'new') accountId = session.account || 'default';
     // No fixed account: onboardFor's pool logic decides whose login to check
     // (a lapsed default login is no reason to open its window when the pool
     // would start on another ready account).
@@ -684,7 +778,7 @@ async function serve(o) {
     else await onboard({accountId});
     const built = await prepare(o, {cwd, account, mode, session});
     const ctrl = makeController(built.agent, built.museName);
-    wireConversation(built.agent, ctrl, {resumed: !!session});
+    wireConversation(built.agent, ctrl, {resumed: !!session && session !== 'new'}); // Third H3: 'new' resumed nothing
     return {agent: built.agent, controller: ctrl, museName: built.museName};
   }});
   const defCtrl = makeController(agent, museName);
@@ -707,7 +801,14 @@ async function serve(o) {
       await link.start();
       const st = link.state();
       console.log(t('スマホ連携を開始しました（pcId: {pcId} / リレー: {relay} / LAN: {lan}）', {pcId: st.pcId, relay: st.relayConnected ? t('接続済み') : t('接続中'), lan: st.lan.length ? st.lan.join(', ') : t('なし')}));
-      if (pendingPairing) { const mode = pendingPairing; pendingPairing = null; const p = link.startPairing({mode}); await printPairing(link, mode, p); }
+      // Pairing is a separate step from starting the link (deep c3 #7b): its
+      // failure used to be reported as "link could not start" although the link
+      // was up, and no code/QR was shown. Say which step failed.
+      if (pendingPairing) {
+        const mode = pendingPairing; pendingPairing = null;
+        try { const p = link.startPairing({mode}); await printPairing(link, mode, p); }
+        catch (e) { console.log(t('ペアリングを開始できませんでした: {message}', {message: e.message})); }
+      }
     } catch (e) { console.log(t('スマホ連携を開始できませんでした: {message}', {message: e.message})); }
   }
   wireConversation(agent, defCtrl, {resumed: true});
@@ -720,7 +821,10 @@ async function serve(o) {
 // prints the token.
 async function serverCommand(rest, o) {
   const sub = rest[0];
-  if (!sub) return serve(o);
+  if (!sub) { if (rest.length) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.join(' ')})); return serve(o); }
+  // status / stop take no further words, autostart exactly one (first audit #31).
+  if ((sub === 'status' || sub === 'stop') && rest.length > 1) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(1).join(' ')}));
+  if (sub === 'autostart' && rest.length > 2) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(2).join(' ')}));
   const discovery = require('../src/server/discovery');
   if (sub === 'status') {
     const info = discovery.readServer();
@@ -751,9 +855,14 @@ async function serverCommand(rest, o) {
     // so a server believed stopped could still be running.
     const res = await discovery.request(info, 'POST', '/api/server/stop', {}).catch(() => null);
     if (!res || res.status >= 400) {
-      let killed = false;
-      try { process.kill(info.pid, 'SIGTERM'); killed = true; } catch {}
-      if (!killed) throw new Error(t('Muser Server を止められませんでした。'));
+      // The fallback kill must only ever hit the process the probe just verified
+      // (deep c3 #6): a stale or edited discovery file's pid can name an unrelated
+      // process after pid reuse. (probeServer already refuses a pid mismatch;
+      // this is the last check before the signal, including a race in between.)
+      if (live.pid !== info.pid) throw new Error(t('Server の pid が発見ファイルと一致しないため、強制終了はしませんでした。'));
+      let killed = false, gone = false;
+      try { process.kill(info.pid, 'SIGTERM'); killed = true; } catch (e) { if (e?.code === 'ESRCH') gone = true; } // already exited: stopped, not a failure
+      if (!killed && !gone) throw new Error(t('Muser Server を止められませんでした。'));
     }
     return console.log(t('Muser Server を止めました。'));
   }
@@ -774,6 +883,7 @@ async function serverCommand(rest, o) {
 // conversations. `muser status <pid | conversation id>` shows one in detail; --json prints the
 // same as data for another agent (Claude Code, Codex).
 async function statusCommand(rest, o) {
+  if (rest.length > 1) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(1).join(' ')}));
   const status = require('../src/server/status');
   const all = await status.gatherAll();
   const id = rest[0];
@@ -788,6 +898,12 @@ async function statusCommand(rest, o) {
   if (o.json) return console.log(JSON.stringify(hit, null, 1));
   for (const line of status.formatDetail(hit)) console.log(line);
 }
+
+// Text that came from outside this process (a phone's device name, a conversation
+// title) is printed by the list commands with plain console.log: strip control
+// characters first, or an ESC sequence in a name/title runs on the user's
+// terminal (OSC 52 clipboard writes, fake lines) when they merely list (deep c3 #4).
+function safeLine(s) { return String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' '); }
 
 // Show a pairing: the QR (which carries everything) plus the code in plain
 // text, or — for Wi-Fi pairing — the code alone, big enough to read aloud.
@@ -805,6 +921,20 @@ async function printPairing(link, mode, {code, expiresAt}) {
   console.log(payload);
 }
 
+// Show a pairing a server started through its API ({code, expiresAt, payload}):
+// the Wi-Fi code alone, or the QR plus the code in plain text.
+async function printPairingResult(mode, r) {
+  const until = new Date(r.expiresAt).toLocaleTimeString();
+  if (mode === 'wifi') {
+    console.log(t('Wi-Fi ペアリングのコード: {code}（{until} まで有効）', {code: r.code, until}));
+    console.log(t('スマホを同じ Wi-Fi につなぎ、アプリの「Wi-Fi」でこのコードを入れてください。'));
+    return;
+  }
+  try { console.log(await require('qrcode').toString(r.payload, {type: 'terminal', small: true})); } catch {}
+  console.log(t('スマホのアプリでこの QR を読み取ってください（コード: {code}、{until} まで有効）', {code: r.code, until}));
+  console.log(r.payload);
+}
+
 // `muser link`: the phone link that lives inside the resident server. When the
 // server is up, everything goes through its local API; when it is down, list /
 // revoke still work on the local files, and pair starts the server with the
@@ -815,6 +945,7 @@ async function linkCommand(rest, o) {
   const info = discovery.readServer();
   const live = info && await discovery.probeServer(info).catch(() => null);
   if (sub === 'pair') {
+    if (rest.length > 1) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(1).join(' ')}));
     // --no-link disables the link itself (recovery scan): the pairing was armed
     // and then silently never consumed, and the command became a plain server.
     if (o.noLink) throw new Error(t('--no-link のためペアリングできません。'));
@@ -823,15 +954,7 @@ async function linkCommand(rest, o) {
       if (!live.link) throw new Error(t('動いている Server でスマホ連携が有効になっていません（--no-link で起動された可能性があります）。'));
       const resp = await discovery.request(info, 'POST', '/api/server/link/pair', {mode});
       if (resp.status !== 200 || !resp.json?.code) throw new Error(resp.json?.error || t('ペアリングを開始できませんでした（サーバー応答: {status}）', {status: resp.status}));
-      const r = resp.json;
-      if (mode === 'wifi') {
-        console.log(t('Wi-Fi ペアリングのコード: {code}（{until} まで有効）', {code: r.code, until: new Date(r.expiresAt).toLocaleTimeString()}));
-        console.log(t('スマホを同じ Wi-Fi につなぎ、アプリの「Wi-Fi」でこのコードを入れてください。'));
-      } else {
-        try { console.log(await require('qrcode').toString(r.payload, {type: 'terminal', small: true})); } catch {}
-        console.log(t('スマホのアプリでこの QR を読み取ってください（コード: {code}、{until} まで有効）', {code: r.code, until: new Date(r.expiresAt).toLocaleTimeString()}));
-        console.log(r.payload);
-      }
+      await printPairingResult(mode, resp.json);
       return;
     }
     pendingPairing = mode;
@@ -852,12 +975,14 @@ async function linkCommand(rest, o) {
     return console.log(t('「{name}」のペアリングを取り消しました。', {name}));
   }
   if (sub === 'autostart') {
+    if (rest.length > 2) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(2).join(' ')}));
     const on = rest[1];
     if (on !== 'on' && on !== 'off') throw new Error(t('使い方: muser link autostart on|off'));
     const r = await require('../src/server/autostart').setAutostart(on === 'on', {binFile: __filename});
     return console.log(on === 'on' ? t('ログオン時に Muser Server を起動するようにしました（タスク: {task}）。', {task: r.task}) : t('ログオン時の自動起動を外しました。'));
   }
   if (!sub || sub === 'status') {
+    if (rest.length > 1) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(1).join(' ')}));
     const st = live?.link || null;
     let pcId = st?.pcId, devices = st?.devices || [];
     if (!st) {
@@ -868,7 +993,7 @@ async function linkCommand(rest, o) {
     if (pcId) console.log('  pcId: ' + pcId);
     if (st) console.log('  ' + t('リレー: {relay}', {relay: st.relayConnected ? t('接続済み') : t('接続中')}) + ' / LAN: ' + (st.lan?.length ? st.lan.join(', ') : t('なし')));
     if (!devices.length) console.log('  ' + t('ペアリング済みの端末はありません（muser link pair で追加できます）'));
-    for (const d of devices) console.log('  ' + d.name + '  (' + d.id.slice(0, 8) + ' / ' + t('最終接続: {at}', {at: d.lastSeen ? new Date(d.lastSeen).toLocaleString() : t('まだなし')}) + ')');
+    for (const d of devices) console.log('  ' + safeLine(d.name) + '  (' + d.id.slice(0, 8) + ' / ' + t('最終接続: {at}', {at: d.lastSeen ? new Date(d.lastSeen).toLocaleString() : t('まだなし')}) + ')');
     return;
   }
   throw new Error(t('「{word}」という link の操作はありません。使えるのは pair / revoke / autostart です', {word: sub}));
@@ -876,7 +1001,10 @@ async function linkCommand(rest, o) {
 
 async function main() {
   const o = parse(process.argv.slice(2));
-  const [cmd, ...rest] = o._;
+  const [rawCmd, ...rest] = o._;
+  // After a leading `--` every word is the prompt (audit #29): a word spelled
+  // like a subcommand dispatches nothing and starts the conversation instead.
+  const cmd = o.literal ? undefined : rawCmd;
   if (o.version) return console.log(VERSION);
   if (o.help || cmd === 'help') return process.stdout.write(HELP_LINES.map(l => t(l, {version: VERSION})).join('\n'));
   // The same spellings as /mode (--mode Bypass, --mode auto).
@@ -904,6 +1032,12 @@ async function main() {
     ['--no-lan', o.noLan, ['serve', 'server', 'link']],
     ['--wifi', o.wifi, ['link']],
     ['--demo', o.demo, ['serve', 'server']],
+    // The session selectors (first audit #30): doctor diagnosed the default
+    // account and logout logged out the default account while a --session named
+    // another conversation — both silently. They select a conversation for the
+    // interactive / exec / serve paths (and the server that hosts them) only.
+    ['--session', o.resume !== undefined, [undefined, 'exec', 'resume', 'serve', 'server', 'link']],
+    ['--continue', !!o.continue, [undefined, 'exec', 'resume', 'serve', 'server', 'link']],
   ];
   for (const [flag, set, okFor] of scoped) {
     if (set && !okFor.includes(cmd)) throw new Error(t('{flag} はこの使い方では使えません。使い方: muser --help', {flag}));
@@ -941,6 +1075,7 @@ async function main() {
     return console.log(usage.formatSummary());
   }
   if (cmd === 'demo') {
+    if (rest.length > 1) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(1).join(' ')}));
     const d = await import('../src/ui/demo.mjs');
     if (rest[0] && rest[0] !== 'login') {
       // An unknown demo word used to start the plain demo as if nothing was wrong.
@@ -949,20 +1084,24 @@ async function main() {
     }
     return rest[0] === 'login' ? d.demoLogin({version: VERSION, cwd: o.cwd, mode: o.mode}) : d.demo({version: VERSION, cwd: o.cwd, mode: o.mode});
   }
-  if (cmd === 'exec' && o.status) return execStatus(o.status, o);
+  // Words after these commands were silently dropped (first audit #31): a
+  // status read with prompt words ran no prompt, serve ignored its tail.
+  if (cmd === 'exec' && o.status) { noExtra(); return execStatus(o.status, o); }
   if (cmd === 'exec') return exec(o, rest.join(' '));
-  if (cmd === 'serve') return serve(o);
+  if (cmd === 'serve') { noExtra(); return serve(o); }
   if (cmd === 'server') return serverCommand(rest, o);
   if (cmd === 'status') return statusCommand(rest, o);
   if (cmd === 'link') return linkCommand(rest, o);
   if (cmd === 'resume') {
     if (!rest[0]) {
       const list = require('../src/sessions').recent().filter(s => s.turns).slice(0, 20);
-      if (!list.length) return console.log(t('再開できる会話はありません。'));
+      // One wording for "nothing to resume" at every bin entry, with the way
+      // forward (fourth M24; the TUI /resume side is controller.mjs's own text).
+      if (!list.length) return console.log(t('再開できる会話はありません。新しい会話は `muser` を引数なしで実行すると始められます。'));
       // The dimming goes through term.c like the rest of the UI: the raw escapes were printed
       // even into a pipe or with colours off (NO_COLOR / the color setting).
       const {c} = require('../src/tui/term');
-      for (const s of list) console.log(s.id.slice(0, 8) + '  ' + new Date(s.updated).toLocaleString().padEnd(22) + (s.title || '') + '  ' + c.dim(s.cwd));
+      for (const s of list) console.log(s.id.slice(0, 8) + '  ' + new Date(s.updated).toLocaleString().padEnd(22) + safeLine(s.title || '') + '  ' + c.dim(safeLine(s.cwd)));
       return console.log('\n' + t('muser resume <ID> で再開'));
     }
     o.resume = rest[0];
@@ -985,7 +1124,13 @@ function execStatus(ref, o = {}) {
   const file = ref === true ? s.latest() : require('node:path').resolve(ref);
   let v;
   try { if (!file) throw new Error('no run'); v = s.read(file); }
-  catch { console.log('gone · no status file' + (file ? ': ' + file : ' in ' + s.dir())); process.exitCode = s.GONE; return; }
+  catch {
+    // --json stays JSON even when there is no run to read (fifth c2-3): a
+    // polling script's most common case used to get plain text and fail to parse.
+    if (o.json) console.log(JSON.stringify({state: 'gone', ok: false, error: 'no status file', file: file || null}, null, 1));
+    else console.log('gone · no status file' + (file ? ': ' + file : ' in ' + s.dir()));
+    process.exitCode = s.GONE; return;
+  }
   // --json was silently ignored here (recovery scan): a script asking for data
   // gets the status object itself; the exit code keeps its meaning either way.
   if (o.json) console.log(JSON.stringify(v, null, 1));
@@ -994,6 +1139,7 @@ function execStatus(ref, o = {}) {
 }
 // `muser agent-skill [install|remove] [claude|codex]`: muser's skill for other agents (src/agent-skill.js).
 function agentSkillCommand(rest) {
+  if (rest.length > 2) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: rest.slice(2).join(' ')}));
   const s = require('../src/agent-skill');
   const [sub = 'status', which] = rest;
   if (!['status', 'install', 'remove'].includes(sub)) throw new Error(t('使い方: muser agent-skill [install|remove] [claude|codex]'));
@@ -1022,6 +1168,8 @@ async function accountCommand(rest, o) {
   const accounts = require('../src/accounts');
   const pool = require('../src/account-pool');
   const [sub, ...args] = rest;
+  if ((!sub && args.length) || (sub === 'list' && args.length)) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: args.join(' ')}));
+  if (sub === 'auto' && args.length > 1) throw new Error(t('余分な引数です: {words}。使い方: muser --help', {words: args.slice(1).join(' ')}));
   if (!sub || sub === 'list') {
     const all = await pool.statuses();
     if (all.length <= 1 && !accounts.hasLogin(accounts.DEFAULT_ID)) console.log(t('ログインしていません（`muser login` でログインできます）'));
@@ -1042,7 +1190,12 @@ async function accountCommand(rest, o) {
     // `muser account add` with the same name then said it already existed.
     try { await onboard({forceLogin: true, forceDevice: true, accountId: a.id}); }
     catch (e) {
-      if (!accounts.hasLogin(a.id)) { try { accounts.remove(a.id); } catch {} }
+      if (!accounts.hasLogin(a.id)) { try { accounts.remove(a.id); } catch {} throw e; }
+      // Login landed but device registration failed (first audit #33): the
+      // half-registered account used to stay with no word on how to finish it,
+      // and a re-add then just said the name already existed. Keep the login
+      // (removing it would waste it) and name the finishing command.
+      if (!accounts.hasDevice(a.id)) throw new Error(e.message + '\n' + t('アカウント {label} の端末登録が終わっていません。`muser login --account {id}` を実行すると、続きから行えます。', {label: a.label, id: a.id}));
       throw e;
     }
     // The same muse.ai user added under a second name is not a second allowance: the pool would
@@ -1098,6 +1251,9 @@ function nearCommand(word) {
 // left every file and command of the chat failing; it is reported with the way out instead.
 function sessionFolder(session, o) {
   if (!session || o.cdGiven) return o.cwd;
+  // A stored session with no folder at all (a pre-cwd record) falls back to the
+  // current folder (deep c3 #8): it used to fail with "…ありません: undefined".
+  if (!session.cwd) return o.cwd;
   let ok = false; try { ok = require('node:fs').statSync(session.cwd).isDirectory(); } catch {}
   if (!ok) throw new Error(t('この会話のフォルダーがありません: {cwd}（別のフォルダーで続けるなら --cd <フォルダー> を付けてください）', {cwd: session.cwd}));
   return session.cwd;
@@ -1128,14 +1284,20 @@ async function doctor(account) {
   const flag = id !== accounts.activeId() ? ' --account ' + id : '';
   const jar = loadJar(files.web);
   const web = createWeb(jar, {file: files.web});
+  // The login state the first step finds decides the gateway step's remedy
+  // (fifth c2-2): an expired login (probe 'waiting') used to get "check your
+  // network" on the gateway line and no remedy at all on its own line, so the
+  // one action that fixes it — `muser login` — was never named.
+  let loginState = null;
+  const loginRemedy = t('  → 直し方: `{cmd}` でログインし直してください', {cmd: 'muser login' + flag});
   const steps = [
-    [async () => t('Web ログイン  : {state}', {state: await probe(jar, files.web)}), t('  → 直し方: `{cmd}` でログインし直してください', {cmd: 'muser login' + flag})],
+    [async () => { loginState = await probe(jar, files.web); const line = t('Web ログイン  : {state}', {state: loginState}); return loginState === 'ready' ? line : line + '\n' + loginRemedy; }, loginRemedy, false, () => loginState !== null && loginState !== 'ready'],
     [async () => {
       const {connectChat} = require('../src/session');
       const client = await connectChat(web, {file: files.session});
       try { return t('ゲートウェイ  : 接続できました（会話 {n} 件）', {n: (await client.sessions())?.sessions?.length ?? '?'}); }
       finally { client.disconnect(false); }
-    }, t('  → 直し方: ネットワークを確認して、もう一度 `muser doctor` を実行してください')],
+    }, () => loginState && loginState !== 'ready' ? loginRemedy : t('  → 直し方: ネットワークを確認して、もう一度 `muser doctor` を実行してください')], 
     [async () => {
       const auth = require('../src/pc-login').createAuth(web, {file: files.device});
       const pc = auth.snapshot();
@@ -1159,9 +1321,9 @@ async function doctor(account) {
   // broken login or device. The two informational steps (marked soft) do not
   // fail it — their remedies say the work goes on without them.
   let failed = false;
-  for (const [run, remedy, soft] of steps) {
-    try { console.log(await run()); }
-    catch (e) { console.log(t('確認できませんでした: {error}', {error: e.message})); console.log(remedy); if (!soft) failed = true; }
+  for (const [run, remedy, soft, isBad] of steps) {
+    try { console.log(await run()); if (isBad && isBad()) failed = true; }
+    catch (e) { console.log(t('確認できませんでした: {error}', {error: e.message})); console.log(typeof remedy === 'function' ? remedy() : remedy); if (!soft) failed = true; }
   }
   if (failed) process.exitCode = 1;
 }

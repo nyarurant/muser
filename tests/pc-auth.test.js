@@ -2,6 +2,16 @@
 // Audit 2026-11-03, section M (#188-#200): PcAuth / pc-login regression tests.
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+// pcLogin falls back to the real secure-store when no store is injected, so
+// point every data folder at a throwaway one BEFORE loading any src module —
+// the same isolation accounts.test.js uses (t8 #8). `npm test` also isolates
+// via tests/setup.mjs, but a bare `node --test tests/pc-auth.test.js` does not.
+process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-pcauth-data-'));
+process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-pcauth-home-'));
+test.after(() => { for (const d of [process.env.LOCALAPPDATA, process.env.USERPROFILE]) { try { fs.rmSync(d, {recursive: true, force: true}); } catch {} } });
 const {PcAuth} = require('../src/core/pc-auth');
 
 function auth(over = {}) {
@@ -60,6 +70,37 @@ test('#188: malformed JSON shapes fail with stage errors, not bare TypeErrors', 
     const web = {sdkRequest: async () => null, nativeRequest: async () => { throw new Error('must not reach'); }, fetchJson: async () => ({})};
     const ui = {info: () => {}, close() {}, ask: async () => 'a@b.c', confirm: async () => true, pick: async () => 0, busy: async (_l, fn) => fn()};
     await assert.rejects(pcLogin(web, ui, {file: 'pc-auth-test-null/device.enc'}), e => !(e instanceof TypeError) && /発行状況を確認できません/.test(e.message));
+  }
+});
+
+test('#188b: malformed shapes with the wrong field types fail with stage errors, not bare TypeErrors', async () => {
+  // #188 covered null responses; the same stages also receive well-formed JSON
+  // whose fields have the wrong types (t8 #9).
+  {
+    const {a} = auth({listSdk: async () => ({tokens: 'x', maxActiveTokens: 2})});
+    await assert.rejects(a.start(true), e => !(e instanceof TypeError) && /発行状況を確認できません/.test(e.message));
+  }
+  {
+    const {a} = auth({listSdk: async () => ({tokens: [], maxActiveTokens: '2'})});
+    await assert.rejects(a.start(true), e => !(e instanceof TypeError) && /発行状況を確認できません/.test(e.message));
+  }
+  {
+    const {a} = auth({issueSdk: async () => ({token: 42, sdkToken: {id: 'id1'}})});
+    await assert.rejects(a.start(true), e => !(e instanceof TypeError) && /発行結果を確認できません/.test(e.message));
+  }
+  {
+    const {a} = auth({issueSdk: async () => ({token: 'not-an-mgst-token', sdkToken: {id: 'id1'}})});
+    await assert.rejects(a.start(true), e => !(e instanceof TypeError) && /発行結果を確認できません/.test(e.message));
+  }
+  {
+    const {a} = auth({disk: {sdkToken: 'mgst_x'}, request: async () => ({access_token: 42})});
+    await a.start(true);
+    await assert.rejects(a.send('a@b.c'), e => !(e instanceof TypeError) && /認証を開始できませんでした/.test(e.message));
+  }
+  {
+    const {a} = auth({disk: {sdkToken: 'mgst_x', nodeId: 'n1'}, request: async (s, route) => route.endsWith('/device_token/mint') ? {access_token: 42, refresh_token: 'drt'} : okFlow.request(s, route)});
+    await toCode(a);
+    await assert.rejects(a.confirm('123456'), e => !(e instanceof TypeError) && /認証情報を取得できませんでした/.test(e.message));
   }
 });
 

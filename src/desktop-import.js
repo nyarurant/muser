@@ -23,26 +23,40 @@ function unprotect(buf) {
   return Buffer.from(r.stdout.trim(), 'base64');
 }
 
+const keyFormatError = () => new Error(t('デスクトップ版の暗号鍵の形式が想定と違います。'));
+const dataFormatError = () => new Error(t('デスクトップ版の保存データの形式が想定と違います。'));
+
 function readDesktopFile(name) {
-  const state = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'Local State'), 'utf8'));
-  const wrapped = Buffer.from(state.os_crypt.encrypted_key, 'base64');
-  let key, blob, plain;
+  // Deep #100: only the magic prefixes used to be checked, so a missing or
+  // corrupt desktop file escaped as a bare ENOENT / SyntaxError / TypeError /
+  // crypto error. Validate the structure (fields present, key 32 bytes, blob
+  // long enough for v10 + nonce + tag) and map every structural failure onto
+  // the friendly format messages above; unprotect's own friendly error and
+  // the token check in desktopSdkToken() pass through unchanged.
+  let key, blob, plain, wrapped;
   try {
-    if (wrapped.subarray(0, 5).toString() !== 'DPAPI') throw new Error(t('デスクトップ版の暗号鍵の形式が想定と違います。'));
+    let state;
+    try { state = JSON.parse(fs.readFileSync(path.join(APP_DIR, 'Local State'), 'utf8')); } catch { throw keyFormatError(); }
+    if (typeof state?.os_crypt?.encrypted_key !== 'string' || !state.os_crypt.encrypted_key) throw keyFormatError();
+    wrapped = Buffer.from(state.os_crypt.encrypted_key, 'base64');
+    if (wrapped.length <= 5 || wrapped.subarray(0, 5).toString() !== 'DPAPI') throw keyFormatError();
     key = unprotect(wrapped.subarray(5));
-    blob = fs.readFileSync(path.join(APP_DIR, name));
-    if (blob.subarray(0, 3).toString() !== 'v10') throw new Error(t('デスクトップ版の保存データの形式が想定と違います。'));
+    if (!Buffer.isBuffer(key) || key.length !== 32) throw keyFormatError();
+    try { blob = fs.readFileSync(path.join(APP_DIR, name)); } catch { throw dataFormatError(); }
+    if (blob.length < 31 || blob.subarray(0, 3).toString() !== 'v10') throw dataFormatError();
     const nonce = blob.subarray(3, 15), tag = blob.subarray(blob.length - 16), data = blob.subarray(15, blob.length - 16);
-    const d = crypto.createDecipheriv('aes-256-gcm', key, nonce); d.setAuthTag(tag);
-    plain = Buffer.concat([d.update(data), d.final()]);
-    // plain.toString() is a JS string and cannot be zeroed; the Buffer is filled in finally.
-    return JSON.parse(plain.toString('utf8'));
+    try {
+      const d = crypto.createDecipheriv('aes-256-gcm', key, nonce); d.setAuthTag(tag);
+      plain = Buffer.concat([d.update(data), d.final()]);
+      // plain.toString() is a JS string and cannot be zeroed; the Buffer is filled in finally.
+      return JSON.parse(plain.toString('utf8'));
+    } catch { throw dataFormatError(); }
   } finally {
     // Zero decrypted key/plaintext material; filling blob also clears its nonce/tag/data views.
     plain?.fill(0);
     blob?.fill(0);
     key?.fill(0);
-    wrapped.fill(0);
+    wrapped?.fill(0);
   }
 }
 

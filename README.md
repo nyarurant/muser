@@ -9,8 +9,6 @@ https://github.com/user-attachments/assets/93eb5d68-4bc8-4f50-9d2e-21bcf1118a4c
 
 > **Unofficial.** muser is a personal project with no affiliation with Meta / Muse. It speaks the private protocol the Muse web app uses, so a change on Muse's side can break it at any time, and it may sit uneasily with the terms of service — use it at your own discretion.
 
-> **About the 0.3.7 release notes.** They say 0.3.7 added selectable questions and Ctrl+Shift+V / right-click paste. We thought those were in, but they did not make it into 0.3.7 — sorry for the confusion. Selectable questions and Ctrl+Shift+V come in 0.3.8. Right-click paste already works today, as a feature of the terminal itself (Windows Terminal, conhost).
-
 ## Requirements
 
 - Windows 10 / 11
@@ -59,6 +57,7 @@ Type what you want done and press Enter. Muse works on this PC and you see it ha
 | `@file` | Attach a file (Tab completes) |
 | `!command` | Run in PowerShell directly, without Muse; when it finishes, its output goes to Muse, which answers it, as in Claude Code (off in `/settings`: it then goes with your next message); append ` &` at the end to run it in the background |
 | Alt+V / Ctrl+V | Attach the clipboard image |
+| Ctrl+Shift+V | Paste the clipboard (an image attaches), where the terminal passes the key to muser |
 | Ctrl+O | Show the newest tool output in full (`/output` lists them all). In `--client` mode Ctrl+O always has nothing to show — the outputs stay on the server and the client never fetches them; use `/output` instead, which is forwarded to the server |
 | ↑↓ | Input history (kept across restarts) |
 
@@ -67,6 +66,8 @@ Main slash commands: `/help` `/settings` `/focus` `/goal` `/new` `/clear` `/resu
 `/settings` gathers every setting on one screen, each with its current value: agent limits, Focus and its automatic rounds and time limit, the tool-call limit per turn, a daily turn warning, the approval mode for this folder and for new folders, the language, the bell, the update check at startup, spinner animation, wrapping long code lines, colours and the kitty keyboard protocol (these two from the next start), skills and MCP servers. On/off items switch when chosen; numbers are typed in (with their allowed range). Everything is saved in `~/.muser/config.json` (`focus`, `focusRounds`, `focusMinutes`, `maxToolCallsPerTurn`, `dailyTurnLimit`, `defaultMode`, `bell`, `updateCheck`, `motion`, `codeWrap`, `color`, `kitty`); an environment variable such as `MUSER_NO_BELL=1`, `NO_COLOR` or `MUSER_MAX_TOOL_CALLS_PER_TURN` still wins and the screen says so. `/settings agents` opens the agent limits directly: they change the concurrent and per-task agent limits while muser is open. Enter a non-negative integer (0 = unlimited), then choose **Apply for this run** or **Apply and save defaults**. Existing agents keep working; new launches use the new limits. Saved defaults go into `~/.muser/config.json`; command-line flags and environment variables still override them on the next launch.
 
 While it works, Muse names its own spinner word for the task with `spinner.set` ("Untangling regexes…"); until it does, muser shows one of its own ("Musing…", "Daydreaming…"). For multi-step work, Muse is instructed to call `progress.report` at meaningful milestones. These short updates appear immediately in the terminal and are kept in the local turn transcript for `/resume`. Plain `exec` writes them to stderr; `exec --json` emits `type: "progress"` records. Updates are model-driven, so they are not guaranteed on a fixed timer. The exact presentation and retention of this custom command in Muse's Activity feed have not been verified.
+
+When the possible answers are known, Muse asks with choices (up to four questions, with multi-select, descriptions and previews). Pick with ↑↓ and Enter, or enter an answer of your own with "Type your own…"; `n` adds a note. Your answer goes back as your reply and the work resumes.
 
 Focus completion tracking is **on by default**. Muse records criteria for work with multiple actions or code changes, and links its conclusions to actual tool results. Clear unfinished work can continue in the same chat, up to 3 rounds or 15 minutes. Simple questions and single reads do not require a plan. Unknown/manual checks, declined commands, repeated lack of progress, or a queued user message stop automatic continuation. Existing work agents remain available; Focus does not start an independent reviewer.
 
@@ -145,7 +146,7 @@ Agents use a lot of your Muse allowance, so cap them with `--max-agents` / `--ma
 
 muser reads skills — folders with a `SKILL.md` (frontmatter `name` and `description`, then instructions) — from the project's `.muser/skills` and `.claude/skills`, and from `~/.muser/skills`, `~/.claude/skills`, `~/.codex/skills` and `~/.agents/skills`. Skills you already use with Claude Code or Codex work as they are; muser never writes to those folders.
 
-Muse sees only each skill's name and a short description, and reads a skill with the `skill.read` command when it needs it. `/skills` turns skills (or whole sources) on and off; `/skill <name> <request>` asks Muse to use one. Every enabled skill adds a line to a new conversation's first message, so turn off the ones you do not need.
+Muse sees only each skill's name and a short description, and reads a skill with the `skill.read` command when it needs it. `/skills` turns skills (or whole sources) on and off; `/skill <name> <request>` asks Muse to use one, and typing `$name` in a message (with completion) asks for that skill too. Every enabled skill adds a line to a new conversation's first message, so turn off the ones you do not need.
 
 ## MCP
 

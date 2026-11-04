@@ -189,8 +189,10 @@ test('record: real tokens from a live [usage] line accumulate separately from th
   assert.equal(s.today.realInTokens, 131841);
   assert.equal(s.today.realOutTokens, 400);
   assert.equal(s.last7.realInTokens, 131841);
-  // The estimate is untouched by the real numbers: both are shown, labelled.
-  assert.match(usage.formatSummary(), /今日: ターン 2 \/ ツール 0 回 \/ 約/);
+  // With real numbers the window's line drops the characters ÷ 4 estimate (it read about a
+  // thousand times smaller than the real line under it); turns and tools stay.
+  assert.match(usage.formatSummary(), /^今日: ターン 2 \/ ツール 0 回$/m);
+  assert.equal(s.today.approxTokens > 0, true, 'the estimate is still kept in the data');
   assert.match(usage.formatSummary(), /今日の実績: 131\.8k in \/ 400 out（Muse の実測値）/);
 });
 

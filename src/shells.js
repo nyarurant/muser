@@ -23,6 +23,26 @@ function launch(command, {shell, cwd}) {
 // True only when taskkill itself reports success: a pid that is already gone (or was never
 // ours) answers non-zero, and callers must not report that as a kill.
 function killTree(pid) { if (!pid) return false; try { const r = spawnSync('taskkill', ['/pid', String(pid), '/t', '/f'], {windowsHide: true}); return !r.error && r.status === 0; } catch { return false; } }
+// The same kill without blocking the event loop on spawnSync: taskkill takes
+// tens to hundreds of ms, and the synchronous version froze the TUI (input,
+// rendering, every other shell's output) for its whole run — killAll paid it
+// once per shell, in series. Callers that must report the verdict in their
+// return value (Shells.kill, behind the shell.kill tool) keep the sync path;
+// fire-and-forget killers (killAll, runOnce's timeout/abort path) use this.
+function killTreeAsync(pid) {
+  return new Promise(resolve => {
+    if (!pid) return resolve(false);
+    let child;
+    try { child = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {windowsHide: true}); } catch { return resolve(false); }
+    child.on('error', () => resolve(false));
+    child.on('close', code => resolve(code === 0));
+  });
+}
+// A 'change'/'finished' listener is UI code called from data handlers and
+// timers; its exception used to propagate straight through them and take
+// the host process down. Listener failures are contained at the emit site —
+// the shell machinery itself keeps working.
+function safeEmit(emitter, event, arg) { try { emitter.emit(event, arg); } catch {} }
 
 // Where the buffer front may be cut without splitting a character or an escape sequence:
 // cutting at an arbitrary code unit left a lone surrogate (rendered as U+FFFD) or the tail of
@@ -93,7 +113,7 @@ class Shells extends EventEmitter {
     // for every chunk made a command printing many small chunks churn the UI without bound.
     // The trailing emit keeps the last state visible; done() always emits immediately.
     let lastChange = 0, changeTimer = null;
-    const emitChange = () => { lastChange = Date.now(); if (changeTimer) { clearTimeout(changeTimer); changeTimer = null; } this.emit('change', this.snapshot(s)); };
+    const emitChange = () => { lastChange = Date.now(); if (changeTimer) { clearTimeout(changeTimer); changeTimer = null; } safeEmit(this, 'change', this.snapshot(s)); };
     const queueChange = () => { const wait = 100 - (Date.now() - lastChange); if (wait <= 0) emitChange(); else if (!changeTimer) { changeTimer = setTimeout(() => { changeTimer = null; emitChange(); }, wait); changeTimer.unref?.(); } };
     const add = d => {
       s.out += String(d).replace(/\r\n/g, '\n');
@@ -108,12 +128,12 @@ class Shells extends EventEmitter {
     // done() is idempotent: a spawn failure emits both 'error' and 'close', and the completion
     // notification / auto-resume must fire once, with the first verdict kept.
     let finished = false;
-    const done = code => { if (finished) return; finished = true; Object.assign(s, {running: false, exit: code, ended: Date.now()}); emitChange(); this.emit('finished', {...this.snapshot(s), status: s.stopped ? 'stopped' : code === 0 ? 'completed' : 'failed'}); this.evictFinished(); };
+    const done = code => { if (finished) return; finished = true; Object.assign(s, {running: false, exit: code, ended: Date.now()}); emitChange(); safeEmit(this, 'finished', {...this.snapshot(s), status: s.stopped ? 'stopped' : code === 0 ? 'completed' : 'failed'}); this.evictFinished(); };
     child.on('close', done);
     child.on('error', e => { add('[error] ' + e.message + '\n'); done(-1); });
     this.list.set(id, s);
     lastChange = Date.now();
-    this.emit('change', this.snapshot(s));
+    safeEmit(this, 'change', this.snapshot(s));
     return s;
   }
   get(id) { const s = this.list.get(String(id || '').trim()); if (!s) throw new Error('No background shell ' + id + ' (see shell.list)'); return s; }
@@ -151,7 +171,7 @@ class Shells extends EventEmitter {
   // a shell whose pid was already gone report 'stopped', and killAll never marked it at all,
   // so shells stopped that way reported 'failed' instead.
   kill(id) { const s = this.get(id); const killed = s.running ? killTree(s.pid) : false; if (killed) s.stopped = true; return {id: s.id, killed}; }
-  killAll() { for (const s of this.list.values()) if (s.running && killTree(s.pid)) s.stopped = true; }
+  killAll() { for (const s of this.list.values()) if (s.running) void killTreeAsync(s.pid).then(killed => { if (killed) s.stopped = true; }); }
   snapshot(s) { return {id: s.id, title: s.title, command: s.command, shell: s.shell, running: s.running, exit: s.exit, started: s.started, ended: s.ended, tail: frames(s.out.slice(-8000)).trimEnd().split('\n').slice(-3)}; }
   all() { return [...this.list.values()].map(s => this.snapshot(s)); }
 }
@@ -178,8 +198,13 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
     const onAbort = () => kill('cancelled');
     // `combined` keeps stdout and stderr interleaved in arrival order: an adopted shell seeded
     // with stdout + stderr concatenated lost the chronology of the two streams.
-    const onStdout = d => { const t = String(d); stdout += t; combined += t; onOutput?.(t); if (stdout.length > 4 * maxOut) stdout = clip(stdout, 2 * maxOut); if (combined.length > 4 * maxOut) combined = combined.slice(-2 * maxOut); };
-    const onStderr = d => { const t = String(d); stderr += t; combined += t; onOutput?.(t); if (stderr.length > 4 * maxOut) stderr = clip(stderr, 2 * maxOut); if (combined.length > 4 * maxOut) combined = combined.slice(-2 * maxOut); };
+    // onOutput is the caller's display callback, invoked from a stream 'data'
+    // handler: an exception in it used to escape as an uncaught exception and
+    // take muser itself down mid-command. A broken display callback loses
+    // its notifications, not the run.
+    const notify = t => { try { onOutput?.(t); } catch {} };
+    const onStdout = d => { const t = String(d); stdout += t; combined += t; notify(t); if (stdout.length > 4 * maxOut) stdout = clip(stdout, 2 * maxOut); if (combined.length > 4 * maxOut) combined = combined.slice(-2 * maxOut); };
+    const onStderr = d => { const t = String(d); stderr += t; combined += t; notify(t); if (stderr.length > 4 * maxOut) stderr = clip(stderr, 2 * maxOut); if (combined.length > 4 * maxOut) combined = combined.slice(-2 * maxOut); };
     const finish = result => {
       if (done) return; done = true;
       if (timer) clearTimeout(timer);
@@ -201,10 +226,12 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
         if (s) { child.stdout.removeListener('data', onStdout); child.stderr.removeListener('data', onStderr); return finish({code: null, stdout, stderr, backgrounded: s.id}); }
       }
       if (!killed) killed = why;
-      try { killTree(child.pid); } catch {}
+      void killTreeAsync(child.pid).catch(() => {});
       // The force resolve retries the kill first: the first taskkill may have raced a process
-      // that was still starting its tree.
-      if (!forceTimer) forceTimer = setTimeout(() => { try { killTree(child.pid); } catch {} finish({code: typeof child.exitCode === 'number' ? child.exitCode : -1, stdout, stderr, killed}); }, 2000);
+      // that was still starting its tree. If the tree is STILL alive at the force resolve, the
+      // result says so and names the pid: the run used to resolve with nothing that could find
+      // or stop the survivor — no pid, no shell id, nothing in shell.list — an untracked orphan.
+      if (!forceTimer) forceTimer = setTimeout(() => { void killTreeAsync(child.pid).catch(() => {}); const alive = typeof child.exitCode !== 'number'; finish({code: alive ? -1 : child.exitCode, stdout, stderr, killed, pid: child.pid, ...(alive ? {orphaned: true} : {})}); }, 2000);
     };
     timer = setTimeout(() => kill('timeout'), timeout);
     if (signal) {
@@ -220,4 +247,4 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
   });
 }
 
-module.exports = {Shells, runOnce, killTree};
+module.exports = {Shells, runOnce, killTree, killTreeAsync};

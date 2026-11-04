@@ -12,7 +12,7 @@ const {frames} = require('./tui/term');
 const {t} = require('./i18n');
 
 const MAX_READ_LINES = 2000, MAX_LINE = 2000, MAX_OUT = 60000;
-const MAX_READ_BYTES = 10 * 1024 * 1024, MAX_GLOB_RESULTS = 2000;
+const MAX_READ_BYTES = 10 * 1024 * 1024;
 
 function resolve(ctx, p) {
   if (typeof p !== 'string' || !p || p.length > 4096 || p.includes('\0')) throw new Error('Invalid path');
@@ -37,11 +37,44 @@ function inside(root, file) { const r = path.relative(root, file); return !r.sta
 // (name:stream) is not part of the file's name, and trailing dots and spaces are stripped
 // by the file system, so '.ssh.' / '.ssh ' ARE '.ssh' and 'id_rsa.' IS 'id_rsa' (audit #214).
 function winName(s) { return s.split(':')[0].replace(/[. ]+$/, ''); }
+// A ':' in the last segment other than the drive letter itself ('C:') names an NTFS
+// alternate data stream: 'notes.txt:hiddenstream' is not notes.txt, it is a second,
+// hidden file riding on it. winName strips the stream off for the name rules above,
+// which rightly catches 'id_rsa:stream' — but an innocent base name with a stream
+// ('notes.txt:id_rsa') then passed as the plain file, so a stream component in the
+// file-name segment is itself sensitive (fourth audit H2). Only the last segment is
+// judged: a ':' earlier in the string is not a stream (git's 'HEAD:src/policy.js'
+// rev:path tokens are checked through this same function by policy.js).
+function hasStream(p) {
+  const parts = String(p).replace(/\\/g, '/').split('/').filter(Boolean);
+  const last = parts[parts.length - 1] || '';
+  return last.includes(':') && !/^[a-z]:$/i.test(last);
+}
 // Backup copies of a secret are still the secret: id_rsa.bak, credentials.json.bak,
-// .env.old, cert.pem.bak~ … (audit #215). The names a backup suffix hides, longest first.
+// .env.old, cert.pem.bak~ … (audit #215). The enumerated suffixes were only a start:
+// id_rsa.bak2, credentials.json.txt and five stacked .bak suffixes all slipped past
+// the list (deep audit c6 #4). So a suffix is stripped whenever it is see-through —
+// a backup suffix (.bak/.old/.orig/.save/.swp/.tmp/.copy/~), a numbered variant of
+// one (any suffix ending in a digit, like .bak2), or a plain-text wrapper (.txt /
+// .text: the content is still the raw file, just renamed) — up to 8 deep. Any other
+// suffix ENDS the chain: the outer extension defines what the file IS, so a markdown
+// document about a secret is not the secret (credentials.md, logins.json.bak.md and
+// src/id_util.js all stay readable), and a suffix that marks the file as public on
+// purpose (.pub, .example, .sample) is never stripped past at all.
+const SAFE_SUFFIXES = ['.pub', '.example', '.sample'];
+function seeThrough(suffix) {
+  return suffix === '~' || /^\.(bak|backup|old|orig|save|swp|tmp|copy|txt|text)$/i.test(suffix) || /\d$/.test(suffix);
+}
 function baseVariants(base) {
   const out = [base]; let b = base;
-  for (let i = 0; i < 4; i++) { const m = /^(.*)(\.bak|\.backup|\.old|\.orig|\.save|~)$/.exec(b); if (!m || !m[1] || m[1] === b) break; b = m[1]; out.push(b); }
+  for (let i = 0; i < 8; i++) {
+    let stem, suffix;
+    if (b.endsWith('~')) { stem = b.slice(0, -1); suffix = '~'; }
+    else { const d = b.lastIndexOf('.'); if (d <= 0) break; stem = b.slice(0, d); suffix = b.slice(d); }
+    if (!stem || stem === b) break;
+    if (SAFE_SUFFIXES.includes(suffix.toLowerCase()) || !seeThrough(suffix)) break;
+    b = stem; out.push(b);
+  }
   return out;
 }
 // The file-name rules of isSensitivePath, for one candidate base name; `lower` is the
@@ -54,10 +87,19 @@ function baseSensitive(base, lower) {
   // Tokens other tools keep in plain files: npm / yarn / pip, git's credential store, Codex,
   // Claude Code, GitHub CLI, Docker, kubectl.
   if (['.npmrc', '.yarnrc', '.yarnrc.yml', '.pypirc', '.git-credentials', '.credentials.json'].includes(base)) return true;
-  if (base === 'auth.json' && lower.includes('.codex')) return true;
-  if (base === 'hosts.yml' && lower.includes('github cli')) return true;
+  if (base === '.claude.json') return true; // Claude Code's OAuth store, directly in the home folder (audit #3)
+  // Standard secret files of other tools: PostgreSQL, MySQL, AWS CLI (s3cmd / boto).
+  if (['.pgpass', '.my.cnf', '.s3cfg', '.boto'].includes(base)) return true;
+  // Codex keeps auth.json under ~/.codex — and under ~/.codex-accounts/<name>/ in the
+  // multi-account layout — so any segment naming a Codex folder counts, not only the
+  // exact '.codex' segment (audit #3). A plain src/auth.json stays readable.
+  if (base === 'auth.json' && lower.some(s => s.includes('codex'))) return true;
+  if (base === 'hosts.yml' && (lower.includes('github cli') || lower.includes('gh'))) return true;
   if (base === 'config.json' && lower.includes('.docker')) return true;
   if (base === 'config' && lower.includes('.kube')) return true;
+  // A repo's .git/config holds its remote URLs, and those URLs often embed a plain
+  // access token (https://x-access-token:<PAT>@github.com/…) (deep audit c6 #3).
+  if (base === 'config' && lower.includes('.git')) return true;
   // Certificate and key stores.
   if (/\.(p12|pfx|ppk|jks|keystore|kdbx)$/.test(base)) return true;
   if (/^\.env($|[^a-z])/.test(base) || base.startsWith('.env')) {
@@ -72,28 +114,52 @@ function baseSensitive(base, lower) {
   // Credential files by their usual names only: a source file such as credentials_manager.js
   // or docs/secrets-handling.md is code to read, not a secret.
   if (base === 'credentials' || base === '.secrets') return true;
-  if (/^credentials\.(json|ya?ml|toml|env|ini|xml)$/.test(base)) return true;
+  if (/^credentials\.(json|ya?ml|toml|env|ini|xml|csv|tfrc\.json)$/.test(base)) return true;
+  if (/\.tfrc(\.json)?$/.test(base)) return true; // Terraform's credential files (*.tfrc / *.tfrc.json)
   if (/^secrets?\.(json|ya?ml|toml|env|txt)$/.test(base)) return true;
   return false;
 }
 function isSensitivePath(p) {
   if (typeof p !== 'string' || !p) return false;
+  if (hasStream(p)) return true;
   const norm = p.replace(/\\/g, '/');
   const parts = norm.split('/').filter(Boolean).map(winName);
   const base = (parts[parts.length - 1] || '').toLowerCase();
   const lower = parts.map(s => s.toLowerCase());
   if (lower.some(s => s === '.ssh' || s === '.aws' || s === '.gnupg' || s === '.azure')) return true;
-  // Google Cloud SDK credentials live under ~/.config/gcloud (legacy: the folder pair, in order).
-  if (lower.some((s, i) => s === 'gcloud' && i > 0 && lower[i - 1] === '.config')) return true;
+  // Google Cloud SDK credentials: ~/.config/gcloud on POSIX, but the Windows standard
+  // layout is %APPDATA%\gcloud (parent 'Roaming') with no .config parent —
+  // application_default_credentials.json and legacy_credentials\<account>\adc.json matched
+  // no file-name rule and leaked (deep audit C1). A 'gcloud' segment in a credential-store
+  // position (.config/gcloud, Roaming/gcloud, ~/gcloud) makes the path sensitive; a project
+  // folder that merely happens to be named gcloud (work/gcloud/notes.txt, SEC5) does not.
+  if (base === 'application_default_credentials.json') return true;
+  const homeSegs = os.homedir().replace(/\\/g, '/').split('/').filter(Boolean).length;
+  if (lower.some((s, i) => s === 'gcloud' && (lower[i - 1] === '.config' || lower[i - 1] === 'roaming' || i === homeSegs))) return true;
   // muser's own approval store, wherever it was moved to: policy.muserSettingsPath only
   // knows the two fixed roots, so a permissions.json relocated with MUSER_PERMISSIONS_FILE
   // could be rewritten through the coding tools to grant itself approvals (audit #220).
   // The store is muser's own state, never project code: the tools neither read nor write it.
   const permFile = process.env.MUSER_PERMISSIONS_FILE;
   if (permFile) {
-    const normAbs = x => path.resolve(x).replace(/\\/g, '/').split('/').map(s => winName(s.toLowerCase())).join('/');
+    // A UNC admin-share spelling of the same local file (\\localhost\C$\…) resolves
+    // to itself, never to the C: spelling, so the equality below missed it and the
+    // relocated store could be read back through its UNC name (fourth audit M1,
+    // tools.js side; policy.js's own muserSettingsPath is the policy owner's file).
+    const uncDrive = s => s.replace(/^\/\/\?\/unc\/[^/]+\/([a-z])\$\//i, '$1:/').replace(/^\/\/[^/]+\/([a-z])\$\//, '$1:/');
+    const normAbs = x => uncDrive(path.resolve(x).replace(/\\/g, '/').split('/').map(s => winName(s.toLowerCase())).join('/'));
     if (normAbs(p) === normAbs(permFile)) return true;
   }
+  // muser's own control files in its state folders (~/.muser, %LOCALAPPDATA%\muser):
+  // permissions.json maps every folder's mode (bypass included) and the remembered
+  // approval keys, gui.json / server.json carry the running server's bearer token,
+  // port and pid, and config.json / mcp.json describe the setup — reconnaissance
+  // material that code.read handed over with no approval at all (fourth audit M4,
+  // tools.js side; policy.js allowing reads in general is the policy owner's file).
+  // A plain 'muser' segment is NOT enough (the project folder itself is ~/muser):
+  // only the .muser folder, or AppData's Local\muser, counts as a state folder.
+  if (['permissions.json', 'config.json', 'mcp.json', 'gui.json', 'server.json'].includes(base) &&
+    (lower.includes('.muser') || lower.some((s, i) => s === 'muser' && lower[i - 1] === 'local'))) return true;
   return baseVariants(base).some(b => baseSensitive(b, lower));
 }
 // Where a path really leads: junctions and symlinks resolved on the deepest part that exists (the
@@ -109,8 +175,69 @@ function realOf(p) {
     rest.unshift(path.basename(cur)); cur = up;
   }
 }
+// A hardlink is a second name for the same file: realpath returns the alias spelling
+// unchanged, so no name or real-path check can see that 'hard-notes.txt' in the project
+// IS ~/.ssh/id_rsa (fourth audit H1). The phase-1 fix refused EVERY file with more
+// than one link, which broke pnpm trees (node_modules is built from hard links) and
+// lied about ordinary files being secret. The follow-up rule: a linked file is
+// refused only when one of its OTHER names is sensitive; when the other names
+// cannot be listed at all, it is refused with an accurate message, not the secret
+// one. Routing the unverifiable case through approval (ask) is not clean here:
+// policy.decide() returns 'allow' for kind 'read' unconditionally, and edit
+// approval happens before run() with no per-file verdict to ask about.
+const HARDLINK_LIST_TIMEOUT_MS = 5000, HARDLINK_CACHE_MAX = 1000;
+let hardlinkLister = null; // tests only: (file) => absolute names, or null when unlistable
+const hardlinkCache = new Map();
+function setHardlinkLister(fn) { hardlinkLister = typeof fn === 'function' ? fn : null; hardlinkCache.clear(); }
+function clearHardlinkCache() { hardlinkCache.clear(); }
+// Windows only: fsutil prints every name of the file, drive-relative
+// (e.g. \Users\...\lib.js), so the volume of the queried path is prefixed.
+function defaultListHardlinkNames(file) {
+  if (process.platform !== 'win32') return null;
+  let r;
+  try { r = spawnSync('fsutil', ['hardlink', 'list', file], {encoding: 'utf8', windowsHide: true, timeout: HARDLINK_LIST_TIMEOUT_MS, maxBuffer: 1024 * 1024}); } catch { return null; }
+  if (!r || r.error || r.status !== 0) return null;
+  const root = path.parse(file).root;
+  return String(r.stdout || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean).map(name => path.isAbsolute(name) ? path.resolve(name) : path.resolve(root, name.replace(/^\\+/, '')));
+}
+function listHardlinkNames(file) {
+  if (hardlinkLister) { try { const names = hardlinkLister(file); return Array.isArray(names) ? names : null; } catch { return null; } }
+  return defaultListHardlinkNames(file);
+}
+// 'single' | 'ok' | 'sensitive' | 'unknown'. The verdict belongs to the inode, not
+// to the alias asked about: from any alias, the other names are the same set minus
+// itself, so a sensitive verdict for one alias holds for all of them -- and the cache
+// key can be the inode, so a pnpm file met under several names is listed once.
+// The key carries nlink/size/mtime too, so a link added or removed later re-lists
+// instead of trusting a stale verdict. Files without a usable inode fall back to
+// the resolved path in the key.
+function hardlinkVerdict(file) {
+  let st;
+  try { st = fs.statSync(file); } catch { return 'single'; }
+  if (!st.isFile() || st.nlink <= 1) return 'single';
+  const key = st.ino ? [st.dev, st.ino, st.nlink, st.size, st.mtimeMs].join(':') : [path.resolve(file), st.nlink, st.size, st.mtimeMs].join(':');
+  const hit = hardlinkCache.get(key);
+  if (hit) return hit;
+  const names = listHardlinkNames(file);
+  let verdict;
+  if (!names) verdict = 'unknown';
+  else {
+    const norm = s => process.platform === 'win32' ? s.toLowerCase() : s;
+    const self = norm(path.resolve(file));
+    verdict = names.map(n => path.resolve(n)).filter(n => norm(n) !== self).some(o => isSensitivePath(o) || isSensitivePath(realOf(o))) ? 'sensitive' : 'ok';
+  }
+  if (hardlinkCache.size >= HARDLINK_CACHE_MAX) hardlinkCache.clear();
+  hardlinkCache.set(key, verdict);
+  return verdict;
+}
+function sensitiveError(file) { return new Error(t('機密ファイルのため読み取りを拒否しました: {file}（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）', {file})); }
+function hardlinkUnknownError(file) { return new Error(t('このファイルは別の名前（ハードリンク）ともつながっていて、そのすべてを確かめられないため読めません: {file}', {file})); }
 function assertNotSensitive(file) {
-  if (isSensitivePath(file) || (typeof file === 'string' && file && isSensitivePath(realOf(file)))) throw new Error(t('機密ファイルのため読み取りを拒否しました: {file}（.env・鍵・認証情報など機密ファイルは code.read / code.grep / code.glob では読み取れません）', {file}));
+  if (isSensitivePath(file) || (typeof file === 'string' && file && isSensitivePath(realOf(file)))) throw sensitiveError(file);
+  if (typeof file !== 'string' || !file) return;
+  const verdict = hardlinkVerdict(file);
+  if (verdict === 'sensitive') throw sensitiveError(file);
+  if (verdict === 'unknown') throw hardlinkUnknownError(file);
 }
 function readBytes(file) {
   assertNotSensitive(file);
@@ -287,9 +414,15 @@ function applyHunks(text, hunks, name) {
     // An @@ anchor that matches nothing must not be silently ignored: the hunk then
     // applied wherever its context first fit, which may be another function entirely
     // (audit #216).
-    if (h.anchor) { const a = findBlock(lines, [h.anchor], at); if (a < 0) throw new Error('Patch anchor not found in ' + name + ': ' + h.anchor.slice(0, 120)); at = a; }
+    let anchorAt = -1;
+    if (h.anchor) { const a = findBlock(lines, [h.anchor], at); if (a < 0) throw new Error('Patch anchor not found in ' + name + ': ' + h.anchor.slice(0, 120)); at = a; anchorAt = a; }
     const old = h.lines.filter(l => l[0] !== '+').map(l => l.slice(1)), neu = h.lines.filter(l => l[0] !== '-').map(l => l.slice(1));
-    const pos = old.length ? findBlock(lines, old, at) : lines.length - (lines[lines.length - 1] === '' ? 1 : 0);
+    // A pure-addition hunk (no context or removal lines) used to ignore the anchor
+    // it had just verified and append at the end of the file, so '@@ function a() {'
+    // followed by only '+' lines landed after the LAST function instead (deep audit
+    // c6 #6). With an anchor, the new lines go right after the anchor line; without
+    // one they still append at the end, as before.
+    const pos = old.length ? findBlock(lines, old, at) : anchorAt >= 0 ? anchorAt + 1 : lines.length - (lines[lines.length - 1] === '' ? 1 : 0);
     if (pos < 0) throw new Error('Patch context not found in ' + name + ' near: ' + (old.find(l => l.trim()) || '').slice(0, 120));
     // A context that fits more than one place was applied at the first one, silently, as code.edit
     // refuses a non-unique old_string. It must fit one place only — an @@ anchor narrows
@@ -345,7 +478,9 @@ function heavyGlobs(root) {
   if (norm === os.homedir().replace(/\\/g, '/').toLowerCase()) globs.push('!AppData/**');
   return globs;
 }
-const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/.envrc', '!**/*.pem', '!**/*.key', '!**/id_*', '!**/credentials', '!**/credentials.*', '!**/logins.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.azure/**', '!**/.config/gcloud/**', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/.docker/config.json', '!**/.kube/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx'];
+const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/.envrc', '!**/*.pem', '!**/*.key', '!**/id_*', '!**/credentials', '!**/credentials.*', '!**/logins.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.azure/**', '!**/.config/gcloud/**', '!**/Roaming/gcloud/**', '!**/application_default_credentials.json', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/*codex*/auth.json', '!**/.claude.json', '!**/.pgpass', '!**/.my.cnf', '!**/.s3cfg', '!**/.boto', '!**/*.tfrc', '!**/*.tfrc.json', '!**/gh/hosts.yml', '!**/.docker/config.json', '!**/.kube/config', '!**/.git/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx',
+  '!**/.muser/permissions.json', '!**/.muser/config.json', '!**/.muser/mcp.json', '!**/.muser/gui.json', '!**/.muser/server.json',
+  '!**/Local/muser/permissions.json', '!**/Local/muser/config.json', '!**/Local/muser/mcp.json', '!**/Local/muser/gui.json', '!**/Local/muser/server.json'];
 
 // The path an rg output line names, or null when the line carries none (a context
 // separator, or a hit in the single explicit file target, which was already vetted).
@@ -362,10 +497,30 @@ function grepLinePath(line, filesOnly) {
 // check — a line naming a sensitive path (as written, resolved, or through a
 // junction) is dropped, text and all.
 function dropSensitiveLines(lines, ctx, filesOnly) {
+  // The verdict for a path is memoised for the whole result: the filter used to
+  // re-run realpath (and a stat, inside hardlinkVerdict) for EVERY hit line, so a
+  // file with 50,000 hits paid 50,000 realpaths and a broad search spent seconds
+  // filtering lines that clip() then threw away (deep audit c6 #8, fourth audit
+  // M11 — the same defect in both reports). One verdict per distinct path prefix
+  // is enough: every line naming the same file gets the same answer.
+  const cache = new Map();
   const sensitive = named => {
-    if (isSensitivePath(named)) return true;
-    const abs = path.resolve(ctx.cwd, named);
-    return isSensitivePath(abs) || isSensitivePath(realOf(abs));
+    const hit = cache.get(named);
+    if (hit !== undefined) return hit;
+    let verdict;
+    if (isSensitivePath(named)) verdict = true;
+    else {
+      const abs = path.resolve(ctx.cwd, named);
+      // A hardlinked hit is an alias of some other file: its line is dropped when
+      // one of its other names is sensitive, or when the other names cannot be
+      // listed at all (fail closed; an explicit read of the same file reports the
+      // accurate hardlink message instead of dropping silently).
+      const hv = hardlinkVerdict(abs);
+      verdict = hv === 'sensitive' || hv === 'unknown' ? true : isSensitivePath(abs) || isSensitivePath(realOf(abs));
+    }
+    if (cache.size > 10000) cache.clear();
+    cache.set(named, verdict);
+    return verdict;
   };
   return lines.filter(line => {
     const named = grepLinePath(line, filesOnly);
@@ -393,6 +548,15 @@ function computeEdit(p, ctx) {
   checkWriteSize(after);
   return {file, raw, text, after, count: p.replace_all ? count : 1};
 }
+// The identity of a patch destination, as the file system sees it: on Windows,
+// 'NewFile.txt', 'newfile.txt' and 'newfile.txt.' are ONE file, but the string sets
+// in planPatch treated them as three — two Adds in one patch both passed, and the
+// second commit silently overwrote the first (deep audit c6 #5, the case/trailing-
+// dot bypass of the #212 fix). realOf can only canonicalise the part that exists,
+// so a not-yet-created name keeps its written spelling and needs this key instead.
+function destKey(file) {
+  return process.platform === 'win32' ? file.replace(/\\/g, '/').split('/').map(s => winName(s).toLowerCase()).join('/') : file;
+}
 function planPatch(p, ctx) {
   // Pre-validate EVERY file/hunk and stage the results before anything is written,
   // so any error (bad hunk, unread file, existing move destination, stale file)
@@ -404,26 +568,33 @@ function planPatch(p, ctx) {
     // One file, one operation per patch (audit #212): two operations on the same file
     // were both planned against the original content and the later write silently
     // discarded the earlier one's result at commit time.
-    if (seen.has(file) || dests.has(file)) throw new Error(o.path + ' is written twice by this patch; combine its changes into a single operation for that file');
+    if (seen.has(destKey(file)) || dests.has(destKey(file))) throw new Error(o.path + ' is written twice by this patch; combine its changes into a single operation for that file');
     if (o.op === 'add') {
+      // Creation is a write path too: a still-missing sensitive file must not be
+      // creatable just because no read ever vetted it (deep audit H2).
+      assertNotSensitive(file);
       checkWriteSize(o.content);
       if (fs.existsSync(file)) throw new Error(o.path + ' already exists');
-      dests.add(file);
+      dests.add(destKey(file));
       return {...o, file, before: '', after: o.content, ending: '\n'};
     }
     // Update / Delete must have been read first, like code.edit (Add of a new file is the only exception).
     if (!ctx.readFiles.has(file)) throw new Error('Read the file with code.read before patching it: ' + o.path);
-    seen.add(file);
+    seen.add(destKey(file));
     const raw = readVerified(ctx, file), before = toLf(raw);
     if (o.op === 'delete') return {...o, file, before, after: ''};
     const after = applyHunks(before, o.hunks, o.path);
     checkWriteSize(after);
-    const dest = o.moveTo ? resolve(ctx, o.moveTo) : file;
+    let dest = o.moveTo ? resolve(ctx, o.moveTo) : file;
+    // A move whose destination is the same file under another spelling (a case-only
+    // rename) is an in-place update, not a move onto an existing file.
+    if (o.moveTo && destKey(dest) === destKey(file)) dest = file;
     if (o.moveTo) {
+      if (dest !== file) assertNotSensitive(dest); // the move destination is a creation path (deep audit H2)
       if (dest !== file && fs.existsSync(dest)) throw new Error(t('Move destination already exists（移動先が既に存在します）: {path}', {path: o.moveTo}));
-      if (dest !== file && (dests.has(dest) || seen.has(dest))) throw new Error('Move destination is written twice by this patch: ' + o.moveTo);
+      if (dest !== file && (dests.has(destKey(dest)) || seen.has(destKey(dest)))) throw new Error('Move destination is written twice by this patch: ' + o.moveTo);
     }
-    dests.add(dest);
+    dests.add(destKey(dest));
     return {...o, file, before, after, ending: eol(raw), dest};
   });
 }
@@ -468,9 +639,12 @@ const TOOLS = {
       required: {path: {type: 'string', description: 'File path.'}, content: {type: 'string', description: 'The complete file content.'}}, optional: {}},
     summary: p => p.path,
     target: (p, ctx) => resolve(ctx, p.path),
-    preview(p, ctx) { const file = resolve(ctx, p.path); checkWriteSize(p.content ?? ''); const exists = fs.existsSync(file); return {diff: lineDiff(exists ? toLf(readVerified(ctx, file)) : '', toLf(String(p.content ?? ''))), created: !exists}; },
+    preview(p, ctx) { const file = resolve(ctx, p.path); assertNotSensitive(file); checkWriteSize(p.content ?? ''); const exists = fs.existsSync(file); return {diff: lineDiff(exists ? toLf(readVerified(ctx, file)) : '', toLf(String(p.content ?? ''))), created: !exists}; },
     run(p, ctx) {
       const file = resolve(ctx, p.path);
+      // A new sensitive file (one that does not exist yet, so no read ever vetted it)
+      // must not be creatable through code.write either (deep audit H2).
+      assertNotSensitive(file);
       if (typeof p.content !== 'string') throw new Error('content is required');
       checkWriteSize(p.content);
       const exists = fs.existsSync(file);
@@ -534,7 +708,7 @@ const TOOLS = {
   },
   'code.grep': {
     kind: 'read',
-    def: {description: 'Search file contents with ripgrep (regex). Respects .gitignore. Returns path:line:text, or only file paths with files_only. OneDrive folders (and AppData when searching from the home folder) are skipped unless path points inside them. Stops after 30 s: narrow path or glob.',
+    def: {description: 'Search file contents with ripgrep (regex). Respects .gitignore. Hidden files and folders are searched too (except .git internals and sensitive files). Returns path:line:text, or only file paths with files_only. OneDrive folders (and AppData when searching from the home folder) are skipped unless path points inside them. Stops after 30 s: narrow path or glob.',
       required: {pattern: {type: 'string', description: 'Regular expression (ripgrep syntax).'}},
       optional: {path: {type: 'string', description: 'Directory or file to search; default the working directory.'}, glob: {type: 'string', description: 'Only files matching this glob, e.g. *.ts'},
         ignore_case: {type: 'boolean', description: 'Case-insensitive.'}, files_only: {type: 'boolean', description: 'List matching files only.'}, context: {type: 'integer', description: 'Lines of context around matches.'}}},
@@ -542,12 +716,19 @@ const TOOLS = {
     async run(p, ctx) {
       if (p.path) assertNotSensitive(resolve(ctx, p.path));
       if (p.glob && isSensitivePath(String(p.glob))) assertNotSensitive(String(p.glob));
-      const args = ['--no-heading', '--line-number', '--color=never', '-M', '400', '--max-columns-preview'];
+      // --hidden: without it, rg's default made dot-folders and dot-files silently
+      // invisible from a search rooted above them — .github/workflows, .husky and
+      // .config never matched, and "no hits" read as "not there" (deep audit c6 #7).
+      // The sensitive-file boundary does not depend on rg's defaults: the -g
+      // exclusions below are the first pass and dropSensitiveLines re-filters every
+      // returned line through isSensitivePath. .git is excluded outright (rg
+      // --hidden DOES walk it): its internals are not project text.
+      const args = ['--hidden', '--no-heading', '--line-number', '--color=never', '-M', '400', '--max-columns-preview'];
       // Never let a directory search leak a sensitive file that happens to sit in it.
       // (Skipped for an explicit single file: assertNotSensitive above already vets it,
       // and an allowed file such as .env.example / id_rsa.pub must stay searchable.)
       let targetIsFile = false; try { targetIsFile = !!p.path && fs.statSync(resolve(ctx, p.path)).isFile(); } catch {}
-      if (!targetIsFile) for (const g of [...SENSITIVE_GLOBS, ...heavyGlobs(p.path ? resolve(ctx, p.path) : ctx.cwd)]) args.push('-g', g);
+      if (!targetIsFile) for (const g of ['!**/.git/**', ...SENSITIVE_GLOBS, ...heavyGlobs(p.path ? resolve(ctx, p.path) : ctx.cwd)]) args.push('-g', g);
       if (p.ignore_case) args.push('-i');
       if (p.files_only) args.push('-l');
       if (p.glob) args.push('-g', globSlashes(p.glob)); // "src\*.ts" matched nothing
@@ -564,7 +745,7 @@ const TOOLS = {
   },
   'code.glob': {
     kind: 'read',
-    def: {description: 'Find files by glob pattern (e.g. src/**/*.ts). Respects .gitignore. Newest first. OneDrive folders (and AppData when searching from the home folder) are skipped unless path points inside them. Stops after 30 s: narrow path or glob.',
+    def: {description: 'Find files by glob pattern (e.g. src/**/*.ts). Respects .gitignore. Hidden files and folders are included too (except .git internals and sensitive files). Newest first; count is the total number of matches, files shows the newest 500. OneDrive folders (and AppData when searching from the home folder) are skipped unless path points inside them. Stops after 30 s: narrow path or glob.',
       required: {pattern: {type: 'string', description: 'Glob pattern.'}}, optional: {path: {type: 'string', description: 'Directory to search; default the working directory.'}}},
     summary: p => p.pattern,
     async run(p, ctx) {
@@ -579,17 +760,35 @@ const TOOLS = {
       }
       assertNotSensitive(root);
       if (isSensitivePath(pattern)) assertNotSensitive(pattern);
-      const raw = (await rg(['--files', '-g', pattern, ...heavyGlobs(root).flatMap(g => ['-g', g])], root)).split('\n').filter(Boolean);
-      // Cap before statSync so a huge tree cannot blow up on stat calls; sensitive hits are dropped.
-      const capped = raw.slice(0, MAX_GLOB_RESULTS).filter(f => !isSensitivePath(f) && !isSensitivePath(path.join(root, f)));
-      const files = capped
+      // --hidden for the same reason as code.grep (c6 #7): '**/*.yml' used to miss
+      // .github/workflows entirely. .git internals stay excluded, and every result
+      // is re-filtered through isSensitivePath below.
+      const raw = (await rg(['--hidden', '--files', '-g', pattern, '-g', '!**/.git/**', ...heavyGlobs(root).flatMap(g => ['-g', g])], root)).split('\n').filter(Boolean);
+      // The result used to be cut to the first MAX_GLOB_RESULTS rg lines BEFORE
+      // sorting by age, and count reported that cut size: on a 100k-file tree the
+      // answer was count=2000 with the newest 500 OF AN ARBITRARY SUBSET, and the
+      // other 98k files existed in neither count nor files, with no way to page
+      // (fourth audit M13). Now every match is counted and age-sorted (rg's own
+      // 32MB output cap still bounds the list), count is the true number of
+      // non-sensitive matches, and files are the newest 500 of ALL of them. The
+      // expensive checks (realpath, hardlink listing) run only for the candidates
+      // actually returned, newest first, backfilling past any they drop.
+      const listed = raw.filter(f => !isSensitivePath(f) && !isSensitivePath(path.join(root, f)));
+      const stated = listed
         .map(f => { let t = 0; try { t = fs.statSync(path.join(root, f)).mtimeMs; } catch {} return [f, t]; })
-        .sort((a, b) => b[1] - a[1])
+        .sort((a, b) => b[1] - a[1]);
+      const files = []; let dropped = 0;
+      for (const [f] of stated) {
+        if (files.length >= 500) break;
+        const abs = path.join(root, f);
+        if (isSensitivePath(realOf(abs)) || ['sensitive', 'unknown'].includes(hardlinkVerdict(abs))) { dropped++; continue; }
         // Relative to the working folder (absolute outside it), as every other tool takes paths:
         // relative to the folder searched, with that folder not in the result, they named other files.
-        .map(([f]) => { const abs = path.join(root, f); return inside(ctx.cwd, abs) ? path.relative(ctx.cwd, abs) : abs; });
-      const truncated = raw.length > MAX_GLOB_RESULTS || files.length > 500;
-      return {payload: {count: files.length, files: files.slice(0, 500), ...(truncated ? {truncated: true} : {})}, view: {count: files.length}};
+        files.push(inside(ctx.cwd, abs) ? path.relative(ctx.cwd, abs) : abs);
+      }
+      const count = listed.length - dropped;
+      const truncated = count > files.length;
+      return {payload: {count, files, ...(truncated ? {truncated: true} : {})}, view: {count}};
     },
   },
   'system.run': {
@@ -686,4 +885,4 @@ const TOOLS = {
 
 function commandsV2() { return Object.fromEntries(Object.entries(TOOLS).map(([k, t]) => [k, t.def])); }
 
-module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of, dropSensitiveLines};
+module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of, dropSensitiveLines, hardlinkVerdict, setHardlinkLister, clearHardlinkCache};

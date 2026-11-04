@@ -19,7 +19,7 @@ const {t} = require('./i18n');
 const DIR = path.join(os.homedir(), '.muser');
 const FILE = path.join(DIR, 'mcp.json');
 const SECRETS_FILE = 'mcp-secrets.enc';
-const CONNECT_TIMEOUT = 15000, CALL_TIMEOUT = 120000, MAX_RESULT = 60000, MAX_LIST_PAGES = 20;
+const CONNECT_TIMEOUT = 15000, CALL_TIMEOUT = 120000, MAX_RESULT = 60000, MAX_LIST_PAGES = 20, MAX_LIST_TOOLS = 1000;
 
 // Values that must never appear verbatim in an error message or a log line. Only values
 // under a secret-looking KEY are noted (audit #234): noting every env value also redacted
@@ -46,6 +46,25 @@ function redact(text) {
   return out;
 }
 function isSecretRef(v) { return !!v && typeof v === 'object' && typeof v.$secret === 'string'; }
+// env/headers must be a plain name/value object. A string ("env": "FOO=bar") or an
+// array used to pass Object.entries() as characters / indices: save() then threw a
+// strict-mode TypeError on the string and silently rewrote an array env into
+// numeric $secret keys, corrupting the config (deep c14 #5).
+function isBag(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
+// Validate one server's env/headers bag and return it with scalar values as
+// strings (a TOML import can carry numbers). Anything else is a clear config
+// error naming the server and field, not an opaque TypeError or silent damage.
+function stringBag(name, kind, bag) {
+  if (bag === undefined || bag === null) return {};
+  if (!isBag(bag)) throw new Error('Invalid MCP server config for "' + name + '": "' + kind + '" must be an object of name/value pairs.');
+  const out = {};
+  for (const [k, v] of Object.entries(bag)) {
+    if (typeof v === 'string') out[k] = v;
+    else if (typeof v === 'number' || typeof v === 'boolean') out[k] = String(v);
+    else throw new Error('Invalid MCP server config for "' + name + '": "' + kind + '.' + k + '" must be a string value.');
+  }
+  return out;
+}
 
 function load() {
   let raw;
@@ -66,15 +85,29 @@ function load() {
 // clear message instead, using this record.
 let missingByServer = new Map();
 function missingSecrets(name) { return missingByServer.get(name) || []; }
+// The original {"$secret": key} for every reference the vault did not have, keyed by
+// server/kind/field (deep H7). resolveSecrets() still resolves a missing reference
+// to '' in the loaded config (so connect() can refuse via missingByServer above),
+// but save() must not write that '' back: an unrelated save (a setEnabled toggle,
+// an importServers add) used to destroy the reference permanently, after which the
+// missing-secret detection no longer fired and the server started with an empty
+// value even if the vault was later restored. save() restores these references
+// for fields that are still '' when it writes.
+let unresolvedRefs = new Map();
+const unresolvedKey = (name, kind, k) => name + '\0' + kind + '\0' + k;
 
 // Replace {"$secret": key} references in env/headers with values from the secure-store.
 // Plaintext values pass through untouched (backward compat) and are noted for redaction.
 function resolveSecrets(cfg) {
   missingByServer = new Map();
+  unresolvedRefs = new Map();
   let hasRefs = false;
   for (const s of Object.values(cfg.mcpServers || {})) {
     for (const kind of ['env', 'headers']) {
-      for (const [k, v] of Object.entries(s?.[kind] || {})) {
+      // Only a plain object is a name/value bag: a hand-edited string or array
+      // env used to be walked entry by entry (characters / indices) here.
+      if (!isBag(s?.[kind])) continue;
+      for (const [k, v] of Object.entries(s[kind])) {
         if (isSecretRef(v)) hasRefs = true; else noteSecret(v, k);
       }
     }
@@ -83,21 +116,64 @@ function resolveSecrets(cfg) {
   const vault = store.load(SECRETS_FILE) || {};
   for (const [name, s] of Object.entries(cfg.mcpServers || {})) {
     for (const kind of ['env', 'headers']) {
-      if (!s?.[kind]) continue;
+      if (!isBag(s?.[kind])) continue;
       for (const [k, v] of Object.entries(s[kind])) {
         if (isSecretRef(v)) {
           const val = vault[v.$secret];
           if (typeof val === 'string') { s[kind][k] = val; noteSecret(val, k); }
-          else { s[kind][k] = ''; if (!missingByServer.has(name)) missingByServer.set(name, []); missingByServer.get(name).push(v.$secret); }
+          else { s[kind][k] = ''; if (!missingByServer.has(name)) missingByServer.set(name, []); missingByServer.get(name).push(v.$secret); unresolvedRefs.set(unresolvedKey(name, kind, k), v.$secret); }
         }
       }
     }
   }
   return cfg;
 }
-function save(cfg) {
+// save() is a read-modify-write of BOTH mcp.json and the vault, shared by every
+// muser window: without a lock, two windows saving at once each wrote back their
+// own stale snapshot and silently dropped the other's toggle / secret (deep
+// c14 #2). The whole write runs under config.withLock on mcp.json, and the
+// load->modify->save entry points (setEnabled / importServers) hold the same
+// lock across their load too, so a change is never based on a stale snapshot.
+function save(cfg) { return require('./config').withLock(FILE, () => saveUnlocked(cfg)); }
+function saveUnlocked(cfg) {
   // Work on a copy: the caller's object keeps its resolved plaintext values.
   const out = JSON.parse(JSON.stringify(cfg ?? {mcpServers: {}}));
+  // Shape first (deep c14 #5): a non-object env/headers, or a non-string value
+  // inside one, is refused with a clear message before anything is written —
+  // the old code threw a strict-mode TypeError (string env) or silently
+  // rewrote the bag (array env) and vaulted values under numeric keys.
+  for (const [name, s] of Object.entries(out.mcpServers || {})) {
+    if (!isBag(s)) continue;
+    for (const kind of ['env', 'headers']) {
+      if (s[kind] === undefined || s[kind] === null) continue;
+      // The bag itself must be an object first (a string/array env is refused
+      // here, not walked entry by entry as characters / indices).
+      if (!isBag(s[kind])) stringBag(name, kind, s[kind]); // throws the clear error
+      // $secret references are not values: set them aside, validate the rest,
+      // and put them back untouched (stringBag() would refuse an object).
+      const plain = {}, refs = {};
+      for (const [k, v] of Object.entries(s[kind])) (isSecretRef(v) ? refs : plain)[k] = v;
+      const bag = stringBag(name, kind, plain);
+      for (const [k, v] of Object.entries(refs)) bag[k] = v;
+      s[kind] = bag;
+    }
+  }
+  // Deep H7: restore $secret references that load() could not resolve (the vault
+  // had no entry) and therefore turned into ''. Only a field that is still ''
+  // and still present is restored — a field the caller removed, or replaced with
+  // a real value, is left exactly as the caller left it.
+  if (unresolvedRefs.size) {
+    for (const [name, s] of Object.entries(out.mcpServers || {})) {
+      for (const kind of ['env', 'headers']) {
+        if (!s?.[kind]) continue;
+        for (const k of Object.keys(s[kind])) {
+          if (s[kind][k] !== '') continue;
+          const orig = unresolvedRefs.get(unresolvedKey(name, kind, k));
+          if (orig) s[kind][k] = {$secret: orig};
+        }
+      }
+    }
+  }
   const vault = {};
   let vaultLoaded = false, dirty = false;
   const loadVault = () => { if (!vaultLoaded) { Object.assign(vault, store.load(SECRETS_FILE) || {}); vaultLoaded = true; } };
@@ -163,19 +239,30 @@ function discover() {
   return found.filter(f => { const key = String(f.name).toLowerCase(); if (seen.has(key)) return false; seen.add(key); return true; });
 }
 function importServers(list) {
-  const cfg = load(); cfg.mcpServers = cfg.mcpServers || {};
-  for (const f of list) cfg.mcpServers[f.name] = {...f.server, enabled: false, importedFrom: f.from};
-  save(cfg); return cfg;
+  // Load + modify + save under the mcp.json lock (deep c14 #2): loading outside
+  // the lock and saving a stale snapshot dropped another window's changes.
+  let cfg;
+  require('./config').withLock(FILE, () => {
+    cfg = load(); cfg.mcpServers = cfg.mcpServers || {};
+    for (const f of list) cfg.mcpServers[f.name] = {...f.server, enabled: false, importedFrom: f.from};
+    saveUnlocked(cfg);
+  });
+  return cfg;
 }
 // The hub that has been start()ed in this process, if any. setEnabled() uses it to apply
 // enable/disable live instead of only editing the config for the next restart.
 let activeHub = null;
 function setEnabled(name, enabled, hub = activeHub) {
-  const cfg = load();
-  if (cfg.mcpServers?.[name]) {
-    cfg.mcpServers[name].enabled = enabled; save(cfg);
-    if (hub && hub.started) hub.applyEnabled(name, enabled, cfg.mcpServers[name]);
-  }
+  // Load + modify + save under the mcp.json lock (deep c14 #2), like importServers.
+  let cfg, serverCfg;
+  require('./config').withLock(FILE, () => {
+    cfg = load();
+    if (cfg.mcpServers?.[name]) {
+      cfg.mcpServers[name].enabled = enabled; saveUnlocked(cfg);
+      serverCfg = cfg.mcpServers[name];
+    }
+  });
+  if (serverCfg && hub && hub.started) hub.applyEnabled(name, enabled, serverCfg);
   return cfg;
 }
 // Remote MCP servers must be https: their headers may carry secrets, so plain http is
@@ -199,18 +286,50 @@ const slug = s => String(s).toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/
 // non-simple type) travels as a JSON-encoded string and call() parses it back strictly,
 // preserving floating point.
 function params(schema = {}) {
-  const props = schema.properties || {}, req = new Set(schema.required || []), required = {}, optional = {}, json = new Set(), types = {};
-  for (const [k, p] of Object.entries(props)) {
+  // A malformed schema from one server (a null property, a non-array enum, a
+  // non-object properties bag) must not throw here: index() turns whatever
+  // this returns into commands, and a throw used to take every server's
+  // commands down with it (deep c14 #7). Odd pieces are treated as absent.
+  const sch = schema && typeof schema === 'object' ? schema : {};
+  const props = isBag(sch.properties) ? sch.properties : {}, req = new Set(Array.isArray(sch.required) ? sch.required : []), required = {}, optional = {}, json = new Set(), types = {};
+  for (const [k, raw] of Object.entries(props)) {
+    const p = raw && typeof raw === 'object' ? raw : {};
     const t = Array.isArray(p.type) ? p.type.find(x => x !== 'null') : p.type;
     types[k] = t || 'value';
     const simple = ['string', 'integer', 'boolean'].includes(t) ? t : null;
     let desc = String(p.description || '').slice(0, 300);
-    if (p.enum) desc += ' One of: ' + p.enum.slice(0, 20).join(', ') + '.';
+    if (Array.isArray(p.enum)) desc += ' One of: ' + p.enum.slice(0, 20).map(x => String(x)).join(', ') + '.';
+    else if (p.enum !== undefined && p.enum !== null) desc += ' One of: ' + String(p.enum) + '.';
     const spec = simple ? {type: simple, description: desc} : {type: 'string', description: (desc + ' (JSON-encoded ' + (t || 'value') + ')').trim()};
     if (!simple) json.add(k);
     (req.has(k) ? required : optional)[k] = spec;
   }
   return {required, optional, json, types};
+}
+
+// Fetch every tools/list page under ONE overall deadline (deep c14 #6): the
+// timeout used to restart per page, so a server answering just inside each
+// page's 15 s could hold connect() for MAX_LIST_PAGES x 15 s (~300 s), and a
+// single page could carry an unbounded number of tools into memory. Returns
+// null when stale() fires mid-listing (the caller then closes the client).
+async function listAllTools(client, stale = () => false, timeoutMs = CONNECT_TIMEOUT, maxPages = MAX_LIST_PAGES, maxTools = MAX_LIST_TOOLS) {
+  const tools = [], seenCursors = new Set();
+  const deadline = Date.now() + timeoutMs;
+  for (let cursor, pages = 0; ;) {
+    if (++pages > maxPages) throw new Error(t('ツール一覧のページ数が上限 ({max}) を超えました', {max: maxPages}));
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(t('ツール一覧がタイムアウトしました'));
+    const r = await withTimeout(client.listTools(cursor ? {cursor} : {}), left, t('ツール一覧がタイムアウトしました'));
+    if (stale()) return null;
+    if (!r || !Array.isArray(r.tools)) throw new Error('Invalid tools/list response from MCP server');
+    tools.push(...r.tools);
+    if (tools.length > maxTools) throw new Error(t('ツール一覧の件数が上限 ({max}) を超えました', {max: maxTools}));
+    if (!r.nextCursor) break;
+    if (seenCursors.has(r.nextCursor)) throw new Error(t('ツール一覧のカーソルが繰り返されました: {cursor}', {cursor: r.nextCursor}));
+    seenCursors.add(r.nextCursor);
+    cursor = r.nextCursor;
+  }
+  return tools;
 }
 
 class McpHub {
@@ -279,16 +398,31 @@ class McpHub {
       // empty string (audit #233): fail here, where the reason can be said plainly.
       const missing = missingSecrets(name);
       if (missing.length) throw new Error('Secret(s) not found in the secure store (' + SECRETS_FILE + '): ' + missing.join(', ') + '. The server was not started with an empty value; save its config again to store the secret.');
-      for (const [k, v] of Object.entries(s.env || {})) noteSecret(v, k);
-      for (const [k, v] of Object.entries(s.headers || {})) noteSecret(v, k);
+      // Shape (deep c14 #5): validate here too — a config that never went
+      // through save() (hand-edited, or straight from discover()) reaches this
+      // point directly, and a string "args" used to hang the SDK for the full
+      // connect timeout instead of saying what is wrong.
+      const env = stringBag(name, 'env', s.env), headers = stringBag(name, 'headers', s.headers);
+      if (s.args !== undefined && s.args !== null && (!Array.isArray(s.args) || s.args.some(a => typeof a !== 'string')))
+        throw new Error('Invalid MCP server config for "' + name + '": "args" must be an array of strings.');
+      for (const [k, v] of Object.entries(env)) noteSecret(v, k);
+      for (const [k, v] of Object.entries(headers)) noteSecret(v, k);
       const {Client} = require('@modelcontextprotocol/sdk/client/index.js');
       let transport;
-      if (s.url || s.type === 'http' || s.type === 'sse') {
+      if (s.type === 'sse') {
+        // Legacy SSE servers speak a different handshake (GET stream + endpoint
+        // event for POSTs); StreamableHTTP cannot initialize against them, so
+        // type:'sse' needs the SDK's SSE transport (deep c14 #3). Its
+        // requestInit headers are merged into both the stream GET and the POSTs.
+        const {SSEClientTransport} = require('@modelcontextprotocol/sdk/client/sse.js');
+        transport = new SSEClientTransport(checkRemoteUrl(s.url), {requestInit: {headers}});
+      } else if (s.url || s.type === 'http') {
         const {StreamableHTTPClientTransport} = require('@modelcontextprotocol/sdk/client/streamableHttp.js');
-        transport = new StreamableHTTPClientTransport(checkRemoteUrl(s.url), {requestInit: {headers: s.headers || {}}});
+        transport = new StreamableHTTPClientTransport(checkRemoteUrl(s.url), {requestInit: {headers}});
       } else {
+        if (typeof s.command !== 'string' || !s.command) throw new Error('Invalid MCP server config for "' + name + '": "command" must be a non-empty string for a stdio server.');
         const {StdioClientTransport, getDefaultEnvironment} = require('@modelcontextprotocol/sdk/client/stdio.js');
-        transport = new StdioClientTransport({command: s.command, args: s.args || [], env: {...getDefaultEnvironment(), ...(s.env || {})}, cwd: s.cwd, stderr: 'pipe'});
+        transport = new StdioClientTransport({command: s.command, args: s.args || [], env: {...getDefaultEnvironment(), ...env}, cwd: s.cwd, stderr: 'pipe'});
         // Keep the server's stderr (bounded tail) so startup failures are diagnosable.
         const errStream = transport.stderr;
         if (errStream) errStream.on('data', d => { entry.stderrTail = (entry.stderrTail + d.toString()).slice(-2000); });
@@ -296,17 +430,8 @@ class McpHub {
       client = new Client({name: 'muser', version: require('../package.json').version});
       await withTimeout(client.connect(transport), CONNECT_TIMEOUT, t('接続がタイムアウトしました'));
       if (stale()) { try { await client.close(); } catch {} return; }
-      const tools = [], seenCursors = new Set();
-      for (let cursor, pages = 0; ;) {
-        if (++pages > MAX_LIST_PAGES) throw new Error(t('ツール一覧のページ数が上限 ({max}) を超えました', {max: MAX_LIST_PAGES}));
-        const r = await withTimeout(client.listTools(cursor ? {cursor} : {}), CONNECT_TIMEOUT, t('ツール一覧がタイムアウトしました'));
-        if (stale()) { try { await client.close(); } catch {} return; }
-        tools.push(...r.tools);
-        if (!r.nextCursor) break;
-        if (seenCursors.has(r.nextCursor)) throw new Error(t('ツール一覧のカーソルが繰り返されました: {cursor}', {cursor: r.nextCursor}));
-        seenCursors.add(r.nextCursor);
-        cursor = r.nextCursor;
-      }
+      const tools = await listAllTools(client, stale);
+      if (tools === null) { try { await client.close(); } catch {} return; } // went stale mid-listing
       Object.assign(entry, {client, transport, tools, status: 'connected'});
       // Liveness: from here on, a close/error from the transport or client means the
       // server is gone (crash, exit, dropped connection) — see _markDead. Intentional
@@ -328,24 +453,37 @@ class McpHub {
   async disconnect(name) { this.gens.set(name, (this.gens.get(name) || 0) + 1); const e = this.servers.get(name); if (!e) return; this.servers.delete(name); this.index(); try { await e.client?.close(); } catch {} }
   async close() { this.started = false; if (activeHub === this) activeHub = null; await Promise.all([...this.servers.keys()].map(n => this.disconnect(n))); this.index(); }
   index() {
-    this.commands.clear();
+    // Build the new index on the side and swap it in only when it is complete
+    // (deep c14 #7): this used to clear() first and rebuild in place, so one
+    // tool whose schema made params() throw left every server's commands
+    // gone or half-registered. A single unusable tool is now skipped and the
+    // previous index survives a failure anywhere else in the rebuild.
+    const built = new Map();
     const used = new Set();
     // Allocate command keys deterministically: iterating the servers Map in insertion
     // order made slug-collision suffixes (-2, -3, ...) depend on connect order, so a
     // reconnect (delete + set moves a server to the end) swapped which server owned the
     // unsuffixed key. Sorting servers and tools by name (codepoint order, not locale)
     // keeps the assignment stable across reconnects and restarts.
-    const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+    const byName = (a, b) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0);
     const entries = [...this.servers.values()].sort((x, y) => byName(x.name, y.name));
-    for (const e of entries) for (const t of [...(e.tools || [])].sort((x, y) => byName(x.name, y.name))) {
+    for (const e of entries) for (const t of (Array.isArray(e.tools) ? e.tools : []).filter(x => x && typeof x === 'object').sort((x, y) => byName(x.name, y.name))) {
+      let p;
+      try { p = params(t.inputSchema); } catch { continue; } // one broken tool must not take the others down
       let key = 'mcp.' + slug(e.name) + '.' + slug(t.name);
       // Distinct servers/tools can slug to the same command name; suffix instead of overwriting.
       if (used.has(key)) { let n = 2; while (used.has(key + '-' + n)) n++; key = key + '-' + n; }
       used.add(key);
-      const p = params(t.inputSchema);
-      this.commands.set(key, {server: e.name, tool: t.name, json: p.json, types: p.types, readOnly: t.annotations?.readOnlyHint === true,
+      built.set(key, {server: e.name, tool: t.name, json: p.json, types: p.types,
+        // Fourth audit M6, the mcp.js part: the readOnly flag stored here is the
+        // server's own annotation. A tool that ALSO declares itself destructive
+        // contradicts its read-only claim, so the claim is not recorded — the
+        // (separate, opt-in) trust decision in agent.js then has nothing to trust.
+        readOnly: t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true,
         def: {description: ('[MCP ' + e.name + '] ' + (t.description || t.name)).slice(0, 1500), required: p.required, optional: p.optional, timeout_ms: CALL_TIMEOUT + 5000}});
     }
+    this.commands.clear();
+    for (const [k, v] of built) this.commands.set(k, v);
   }
   defs() { return Object.fromEntries([...this.commands].map(([k, c]) => [k, c.def])); }
   async call(key, params, signal) {
@@ -357,7 +495,7 @@ class McpHub {
       // A value that cannot be coerced to the schema type is a clear, local error
       // result — never silently forwarded as a raw string / NaN for the server to
       // reject (or, worse, misinterpret).
-      const bad = () => ({isError: true, text: 'Invalid argument "' + k + '" for MCP tool ' + c.tool + ': expected ' + t + ', got ' + JSON.stringify(v)?.slice(0, 120)});
+      const bad = () => ({isError: true, text: redact('Invalid argument "' + k + '" for MCP tool ' + c.tool + ': expected ' + t + ', got ' + JSON.stringify(v)?.slice(0, 120))});
       if (v === undefined) { args[k] = v; continue; }
       if (typeof v === 'string' && (c.json.has(k) || t === 'number' || t === 'integer' || t === 'boolean')) {
         if (t === 'number' || t === 'integer') {
@@ -393,11 +531,18 @@ class McpHub {
       else if (t === 'string' && typeof v !== 'string') return bad();
       args[k] = v;
     }
-    const r = await e.client.callTool({name: c.tool, arguments: args}, undefined, {signal, timeout: CALL_TIMEOUT});
+    // Both directions of a tool call pass through redact() (deep c14 #4): a
+    // server that echoes its own credentials in an error or a result used to
+    // hand them verbatim to the agent and the logs, while every connect-path
+    // error was already redacted.
+    let r;
+    try { r = await e.client.callTool({name: c.tool, arguments: args}, undefined, {signal, timeout: CALL_TIMEOUT}); }
+    catch (err) { throw new Error(redact(err?.message || String(err))); }
     // Keep every content block visible: non-text blocks become placeholder lines
     // instead of being dropped, and structuredContent is appended as a JSON block
     // even when text content is also present.
     const parts = (r.content || []).map(x => {
+      if (!x || typeof x !== 'object') return '[unknown content]';
       if (x.type === 'text') return x.text ?? '';
       if (x.type === 'image') return '[image content]';
       if (x.type === 'audio') return '[audio content]';
@@ -406,7 +551,7 @@ class McpHub {
       return '[' + x.type + ' content]';
     });
     if (r.structuredContent !== undefined && r.structuredContent !== null) parts.push(JSON.stringify(r.structuredContent));
-    let text = parts.join('\n');
+    let text = redact(parts.join('\n'));
     if (text.length > MAX_RESULT) text = text.slice(0, MAX_RESULT) + '\n… (truncated)';
     return {isError: !!r.isError, text};
   }
@@ -414,4 +559,4 @@ class McpHub {
 
 function withTimeout(p, ms, msg) { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })]).finally(() => clearTimeout(t)); }
 
-module.exports = {McpHub, load, save, discover, importServers, setEnabled, FILE, redact, params, checkRemoteUrl, missingSecrets};
+module.exports = {McpHub, load, save, discover, importServers, setEnabled, FILE, redact, params, checkRemoteUrl, missingSecrets, listAllTools};

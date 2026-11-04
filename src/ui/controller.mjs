@@ -52,19 +52,56 @@ const ATTACH_TOTAL = 11 * 1024 * 1024; // images per message, before base64 (the
 const bell = () => { let on = true; try { on = switchValue('bell'); } catch {} if (on) process.stdout.write('\x07'); };
 const MAX_QUEUE = 5, MAX_HISTORY = 200, BANG_NOTE = 20000; // characters of a !command's output sent to Muse
 const HISTORY_FILE = process.env.MUSER_HISTORY_FILE || path.join(os.homedir(), '.muser', 'history.json'); // tests point it elsewhere
-function loadHistory() {
-  try { const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); return Array.isArray(h) ? h.filter(x => typeof x === 'string').slice(-MAX_HISTORY) : []; } catch { return []; }
+// The most text the composer (or the picker's editor) will hold (deep c1 #11):
+// the queue and the attachments are capped, but the draft was not — a multi-
+// megabyte paste went in whole and every keystroke then re-rendered it. Past
+// the cap, typing and pasting simply stop growing the text (paste says so).
+const MAX_INPUT = 1000000;
+function loadHistory() { return readHistoryDisk() || []; }
+// The history on disk, or null when the file is there but could not be read or
+// parsed: a read failure is not an empty history, and saving over it would
+// replace everything with the newest entry alone (fifth audit f1-3, the
+// read-side twin of the lost update below).
+function readHistoryDisk() {
+  try { const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); return Array.isArray(h) ? h.filter(x => typeof x === 'string').slice(-MAX_HISTORY) : []; }
+  catch (e) { return e && e.code === 'ENOENT' ? [] : null; }
+}
+// A short cross-window lock for the read-modify-write below (deep c1 #13):
+// two windows saving at the same moment each merged from the same stale copy,
+// and the later rename erased the earlier window's entry. The lock is a file
+// created exclusively; a holder lives for milliseconds, so a lock older than
+// 10 s is a crash leftover and is broken. When no lock can be had within a
+// second the save still goes ahead unlocked (the old behaviour) rather than
+// losing the entry outright.
+function acquireHistoryLock() {
+  const lock = HISTORY_FILE + '.lock';
+  try { fs.mkdirSync(path.dirname(HISTORY_FILE), {recursive: true}); } catch { return null; }
+  const deadline = Date.now() + 1000;
+  for (;;) {
+    try {
+      const fd = fs.openSync(lock, 'wx');
+      return () => { try { fs.closeSync(fd); } catch {} try { fs.unlinkSync(lock); } catch {} };
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') return null;
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 10000) { fs.unlinkSync(lock); continue; } } catch { continue; }
+      if (Date.now() >= deadline) return null;
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } catch { return null; }
+    }
+  }
 }
 // Appends to what is on disk now: every muser window wrote back its own copy from startup, so the
 // last window to send a message erased what was typed in the others.
 function saveHistory(history) {
+  const release = acquireHistoryLock();
   try {
-    const text = history[history.length - 1], disk = loadHistory();
+    const text = history[history.length - 1], disk = readHistoryDisk();
+    if (disk === null) return; // unreadable right now: never overwrite it with just the newest entry
     if (typeof text === 'string' && disk[disk.length - 1] !== text) disk.push(text);
     fs.mkdirSync(path.dirname(HISTORY_FILE), {recursive: true});
     const temp = HISTORY_FILE + '.tmp-' + process.pid;
     fs.writeFileSync(temp, JSON.stringify(disk.slice(-MAX_HISTORY))); fs.renameSync(temp, HISTORY_FILE);
   } catch {}
+  finally { try { release?.(); } catch {} }
 }
 
 // Editing steps by grapheme cluster, not code point (recovery scan): one
@@ -73,6 +110,11 @@ function saveHistory(history) {
 const graphemeSegmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
 function lastClusterLen(s) { if (!graphemeSegmenter) return [...s].pop()?.length || 0; let n = 0; for (const g of graphemeSegmenter.segment(s)) n = g.segment.length; return n; }
 function firstClusterLen(s) { if (!graphemeSegmenter) return [...s][0]?.length || 0; for (const g of graphemeSegmenter.segment(s)) return g.segment.length; return 0; }
+// Column math for vertical movement, in the same grapheme units (fifth f4-1):
+// a column counted in clusters, and the UTF-16 offset that many clusters into
+// a line (clamped to the line's end). Falls back to code points, like above.
+function clusterCount(s) { if (!graphemeSegmenter) return [...s].length; let n = 0; for (const g of graphemeSegmenter.segment(s)) n++; return n; }
+function offsetAtClusterCol(s, col) { if (!graphemeSegmenter) return [...s].slice(0, col).join('').length; let n = 0, off = 0; for (const g of graphemeSegmenter.segment(s)) { if (n >= col) break; off += g.segment.length; n++; } return off; }
 
 export class Controller {
   constructor({agent, museName, version, onExit, onReload}) {
@@ -82,13 +124,13 @@ export class Controller {
     this.s = {
       entries: [{id: nextId++, type: 'banner'}],
       stream: null, running: null, busy: false, turnStart: 0, status: '', activity: '', museRunning: '',
-      approval: null, reasonFor: null, promptFor: null, addFlow: null, todos: [], flash: '', deviceOk: !!agent.device?.connected,
+      approval: null, reasonFor: null, promptFor: null, question: null, addFlow: null, todos: [], flash: '', deviceOk: !!agent.device?.connected,
       account: agent.accountLabel ? {id: agent.accountId, label: agent.accountLabel} : null, accountReserved: null, goal: agent.standingGoal?.() || null,
       text: '', pos: 0, mode: agent.mode, clearCount: 0, attachments: [], agents: [], shells: [], queue: [],
     };
     // exitArmed is per-key (recovery scan): ctrl+c arming must not make one ctrl+d an exit.
-    this.history = loadHistory(); this.hIndex = -1; this.draft = ''; this.exitArmed = {key: null, at: 0}; this.queue = []; this.tabState = null; this.md = null; this.atPick = {key: null, idx: 0}; this.slashPick = {key: null, idx: 0};
-    this.accountSwitchReservation = null; this.quotaWarnedFor = new Map(); this.quotaKeep = new Map(); this.quotaWaitMs = QUOTA_WAIT_MS; this.quotaTimer = null; this.lastTurnEnd = null;
+    this.history = loadHistory(); this.hIndex = -1; this.draft = ''; this.exitArmed = {key: null, at: 0}; this.queue = []; this.tabState = null; this.md = null; this.atPick = {key: null, idx: 0}; this.slashPick = {key: null, idx: 0}; this.dollarPick = {key: null, idx: 0}; this.dollarDismissed = null; this._skillCache = null;
+    this.accountSwitchReservation = null; this.quotaWarnedFor = new Map(); this.quotaKeep = new Map(); this.quotaWaitMs = QUOTA_WAIT_MS; this.quotaTimer = null; this.lastTurnEnd = null; this.questionShownFor = '';
     this.wire();
     // Started from the home folder or a drive root, every search without a path walks all of it.
     const cwd = path.resolve(agent.cwd || '.');
@@ -220,7 +262,10 @@ export class Controller {
       // The name last seen for this account until /identity answers (the old account's Muse
       // stayed on screen), and the answer is remembered for this account's next window.
       try { const known = require('../accounts.js').museName(ev.id); if (known !== 'Muse' && known !== this.museName) { this.museName = known; this.set({}); } } catch {}
-      Promise.resolve(a.client?.request?.('GET', '/identity')).then(r => { const n = typeof r?.name === 'string' && r.name.trim() ? r.name.trim().slice(0, 40) : null; if (n) { try { require('../accounts.js').rememberMuseName(ev.id, n); } catch {} } if (n && n !== this.museName) { this.museName = n; this.set({}); } }).catch(() => {});
+      // deep c1 #8: the answer is remembered for ev.id either way, but it only
+      // goes on screen while that account is still the current one — a slow
+      // answer for the account just left used to rename the one just arrived.
+      Promise.resolve(a.client?.request?.('GET', '/identity')).then(r => { const n = typeof r?.name === 'string' && r.name.trim() ? r.name.trim().slice(0, 40) : null; if (n) { try { require('../accounts.js').rememberMuseName(ev.id, n); } catch {} } if (n && a.accountId === ev.id && n !== this.museName) { this.museName = n; this.set({}); } }).catch(() => {});
     });
     // A background shell that ends starts the work again on its own (see onShellFinished).
     a.shells?.on?.('finished', s => this.onShellFinished(s));
@@ -250,6 +295,14 @@ export class Controller {
       // footer and the reply text stays the last substantial block on screen.
       if (e.focus) this.push({type: 'focus', focus: e.focus});
       this.push({type: 'end', ...e});
+      // A selectable question the turn ended on (focus.ask_user with options): open the
+      // picker over the input. The key keeps a duplicate turn-end for the same ask from
+      // reopening a picker the user already closed — closing it loses nothing, the
+      // question stays in the Focus state and a typed reply still resumes the task.
+      if (e.focus?.status === 'needs_input' && e.focus.ask && !this.s.question) {
+        const askKey = e.focus.id + ':' + e.focus.round + ':' + e.focus.revision;
+        if (this.questionShownFor !== askKey) { this.questionShownFor = askKey; this.openQuestion(e.focus.ask); }
+      }
       // Local tally heads-up: today's turns reached the daily limit (if one is set).
       try { const lim = usage.limits(); if (e.ok && lim.dailyTurns > 0 && !this.usageWarned && usage.summary().today.turns >= lim.dailyTurns) { this.usageWarned = true; this.note(t('今日のターン上限（{n}）に達しました', {n: lim.dailyTurns})); } } catch {}
       // The real weekly usage, refreshed after every turn; say how much this turn moved it.
@@ -291,7 +344,7 @@ export class Controller {
           this.set({queue: []});
           this.setText(cur ? back + '\n' + cur : back);
           this.flash(t('待っていた {n} 件を入力欄に戻しました', {n}), 5000);
-        } else if (this.queue.length) { const next = this.queue.shift(); this.agent.dropSteer?.(next); this.agent.focusInputPending = this.queue.length > 0; this.set({queue: [...this.queue]}); this.submit(next); }
+        } else if (this.queue.length && !this.s.question) { const next = this.queue.shift(); this.agent.dropSteer?.(next); this.agent.focusInputPending = this.queue.length > 0; this.set({queue: [...this.queue]}); this.submit(next); }
         // A !command that finished during the turn: its output now (after esc it waits for the next message).
         else if (this.bangPending && !e.aborted) this.sendBangNotes();
         // A background shell that finished during the turn: the work resumes now, the same way.
@@ -326,7 +379,12 @@ export class Controller {
     // construction a prefix extension — so the revision check below cannot fire either.
     const prevTail = st.raw ? st.raw.split('\n').pop() : '';
     const delta = st.raw != null && st.clean != null && text.startsWith(st.raw) ? text.slice(st.raw.length) : null;
-    const fast = delta !== null && !held && !/[\[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(delta) && !partialEmbedTail(st.raw, 1000000) && !/(?:widget|letter)-[0-9a-fA-F-]{8,}$/.test(prevTail) && !prevTail.includes('embed_token');
+    // deep c1 #12: the tail checks only cover the line the delta CONTINUES. A
+    // bare-token line that starts inside the delta itself is one sanitizeEmbeds
+    // would replace, so the fast path must not take it either. The first delta
+    // line is checked joined with prevTail, which is the line it completes.
+    const bareInDelta = delta !== null && delta.split('\n').some((l, i) => /^\s*(?:(?:widget|letter)-[0-9a-fA-F-]{8,}|embed_token\b)/.test(i === 0 ? prevTail + l : l));
+    const fast = delta !== null && !held && !bareInDelta && !/[\[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(delta) && !partialEmbedTail(st.raw, 1000000) && !/(?:widget|letter)-[0-9a-fA-F-]{8,}$/.test(prevTail) && !prevTail.includes('embed_token');
     const clean = fast ? st.clean + delta : sanitizeEmbeds(held ? text.slice(0, text.length - held.length) : text);
     // Revision check: the new text must extend exactly the prefix already emitted to scrollback.
     // (The old check compared the text against its own slice, so it could never fire.) Scrollback
@@ -351,6 +409,9 @@ export class Controller {
   // Preview of the unfinished line; must not move the fence state of the real render.
   previewRow() {
     const st = this.s.stream; if (!st?.partial && !st?.table?.length) return null;
+    // deep Part B R4-9: a stream state set without onText (a snapshot, a future
+    // producer) has no md yet; remote-controller guards this, the original did not.
+    this.md ||= createMd();
     // Only the tail of an unfinished line that would not fit the screen: a 60,000-character line
     // (minified JSON) streamed as thousands of rows redrawn on every delta. Cut before Markdown
     // styling, so no escape sequence is split. The whole line is kept once it ends.
@@ -376,7 +437,14 @@ export class Controller {
     const tool = TOOLS[call.command];
     let preview = null;
     if (call.demoPreview) preview = call.demoPreview;
-    else if (tool.preview) { try { preview = tool.preview(call.params, this.agent.ctx); } catch (e) { preview = {error: e.message}; } }
+    // MCP calls (mcp.<server>.<tool>) have no TOOLS entry: reading .preview off
+    // undefined threw synchronously, the approval never opened and write MCP
+    // tools were unusable in default mode (fourth audit H4). Their preview is
+    // built by the view from the call itself (server / tool / params, as the
+    // agent provides them in call.mcp), so preview stays null here; a missing
+    // call.mcp is derived from the command name so the view can name both.
+    else if (tool?.preview) { try { preview = tool.preview(call.params, this.agent.ctx); } catch (e) { preview = {error: e.message}; } }
+    if (call.kind === 'mcp' && !call.mcp) { const parts = String(call.command || '').split('.'); call = {...call, mcp: {server: parts[1] || '', tool: parts.slice(2).join('.') || parts[1] || ''}}; }
     // Commands with shell syntax, or programs that run anything (powershell, node …), get no
     // "don't ask again": a remembered key must not cover more than the user saw (src/policy.js).
     const key = call.kind === 'exec' ? alwaysKey('exec', call.params) : null, word = key ? key.slice('exec:'.length) : '';
@@ -391,12 +459,16 @@ export class Controller {
     // outside-folder warning; the call itself still goes through the normal policy checks).
     let outside = false;
     try {
-      const targets = tool.target ? [].concat(tool.target(call.params, this.agent.ctx) || []) : [];
+      const targets = tool?.target ? [].concat(tool.target(call.params, this.agent.ctx) || []) : [];
       // As muser itself judges it (agent.execute): where the path really leads. startsWith('..') missed
       // another drive (D:\ from C:\ is not "..") and writes through a junction.
       const {inside, realOf} = require('../tools.js'), realCwd = realOf(this.agent.cwd);
       outside = targets.some(t => !inside(realCwd, realOf(t)));
     } catch { outside = true; }
+    // An approval landing over a menu freezes that menu (fifth f4-2): its
+    // buffered digit and timer die here, instead of picking a menu item
+    // behind the approval.
+    this.menuBuf = ''; clearTimeout(this.menuTimer);
     bell();
     return new Promise(resolve => {
       const req = {call, preview, options, index: 0, outside};
@@ -614,7 +686,7 @@ export class Controller {
   limitKey(input, k) {
     const edit = this.s.limitInput;
     if (k.escape || (k.ctrl && input === 'c')) return this.answerLimit(null);
-    if (k.return) {
+    if (k.return || input === '\n') { // '\n': ctrl+j, fifth f4-4
       const value = Number(edit.text);
       const range = () => this.flash(t('{min}〜{max} の整数を入力してください', {min: edit.min, max: edit.max}));
       if (!/^\d+$/.test(edit.text) || !Number.isSafeInteger(value)) return edit.min !== undefined ? range() : this.flash(t('0 以上の整数を入力してください（0 は無制限）'));
@@ -629,9 +701,23 @@ export class Controller {
     // #166: a menu with no options (pc-login's empty pick list) made the modulo NaN and
     // Enter read options[0] of nothing. Escape still cancels; everything else is a no-op.
     if (!n) { if (k.escape || (k.ctrl && input === 'c')) return this.cancelMenu(); return; }
+    // Fifth f4-3: fast typing can arrive as ONE input event holding several
+    // characters. The digit test below is single-character, so a chunk like
+    // '12' matched nothing and was dropped whole; feed it digit by digit
+    // instead (stopping if a pick closed or replaced this menu on the way).
+    if (/^[0-9]{2,}$/.test(input)) { for (const ch of input) { if (this.s.menu !== m) break; this.menuKey(ch, {}); } return; }
+    // Third M19: any non-digit key abandons a buffered first digit. The timer's
+    // identity guard only saved keys that REPLACED the menu object (arrows);
+    // an ignored key (a letter) left buffer and timer untouched, and the digit
+    // picked its item 400 ms later anyway.
+    if (!/^[0-9]$/.test(input)) { this.menuBuf = ''; clearTimeout(this.menuTimer); }
     if (k.upArrow) return this.set({menu: {...m, index: (m.index + n - 1) % n}});
     if (k.downArrow || k.tab) return this.set({menu: {...m, index: (m.index + 1) % n}});
-    const pick = i => { this.menuBuf = ''; clearTimeout(this.menuTimer); this.set({menu: null}); m.pick(m.options[i].value); };
+    // A pick that throws becomes a note instead of an uncaught error that ends muser: the
+    // config and sessions stores now refuse to write when another window holds their lock
+    // (phase 2), and some picks (/skills on/off) wrote without a catch of their own.
+    const failed = e => this.note(t('設定を変更できませんでした: {error}', {error: e?.message || String(e)}), 'error');
+    const pick = i => { this.menuBuf = ''; clearTimeout(this.menuTimer); this.set({menu: null}); try { const r = m.pick(m.options[i].value); if (r && typeof r.catch === 'function') r.catch(failed); } catch (e) { failed(e); } };
     // Two-digit picks: menus with 10+ options (/skills, /resume) could not be picked by number
     // at all. A first digit that could still grow (1 with 10+ options) is buffered briefly; a
     // second digit — or the timeout — settles it.
@@ -640,13 +726,16 @@ export class Controller {
       if (val >= 1 && val <= n && (buf.length === 2 || val * 10 > n)) return pick(val - 1);
       if (val >= 1 && val * 10 <= n) {
         this.menuBuf = buf; clearTimeout(this.menuTimer);
-        this.menuTimer = setTimeout(() => { this.menuBuf = ''; if (this.s.menu === m) pick(val - 1); }, 400); this.menuTimer.unref?.();
+        // Fifth f4-2: the timeout must not fire while an approval, a picker, a
+        // numeric input or a decline reason covers the menu — the pick would
+        // land unseen. (ask / openQuestion also clear the timer on open.)
+        this.menuTimer = setTimeout(() => { this.menuBuf = ''; if (this.s.menu === m && !this.s.approval && !this.s.question && !this.s.limitInput && !this.s.reasonFor) pick(val - 1); }, 400); this.menuTimer.unref?.();
         return this.set({});
       }
       if (buf.length > 1) { this.menuBuf = ''; return this.menuKey(input, k); }
       return;
     }
-    if (k.return) return pick(m.index);
+    if (k.return || input === '\n') return pick(m.index); // '\n': ctrl+j, fifth f4-4
     if (k.escape || (k.ctrl && input === 'c')) return this.cancelMenu();
   }
   // Closing the open menu without picking, exactly menuKey's escape (the
@@ -657,6 +746,195 @@ export class Controller {
     if (!m) return;
     this.menuBuf = ''; clearTimeout(this.menuTimer); this.set({menu: null}); m.cancel?.();
   }
+  // ---- selectable questions (focus.ask_user with options) ----
+  // Row layout per question tab, shared with the view: the options, then the
+  // type-something row as the last numbered choice (n+1, with a checkbox in
+  // multi select, its typed text counting as an answer), then — below a dim
+  // separator line the view draws, not a row here — the chat-about-this row.
+  // There is no submit row: multi select sends on enter (or advances, with
+  // 2+ questions), single select sends / advances on picking a choice.
+  // With 2+ questions, tab index questions.length is the Submit tab, with a
+  // single submit row; a single question has no Submit tab at all.
+  questionRows(qi) {
+    const item = this.s.question.questions[qi];
+    const rows = item.options.map((o, i) => ({kind: 'option', i}));
+    rows.push({kind: 'type', i: item.options.length});
+    rows.push({kind: 'chat'});
+    return rows;
+  }
+  openQuestion(ask) {
+    // deep c1 #6: the ask's shape was trusted whole — a question without options
+    // (a plain question mixed in) or an empty questions list threw here, inside
+    // the turn-end handler, and the rest of that handler (queue, bang / shell
+    // notes) never ran for the turn. Keep only questions the picker can
+    // actually ask (options with labels); with none left, no picker opens and
+    // the reply is typed in the composer instead, as for a plain question.
+    const questions = [];
+    for (const item of Array.isArray(ask?.questions) ? ask.questions : []) {
+      if (!item || !Array.isArray(item.options)) continue;
+      const options = item.options.map(o => typeof o === 'string' ? {label: o} : {...o}).filter(o => typeof o?.label === 'string' && o.label);
+      if (options.length) questions.push({...item, options});
+    }
+    if (!questions.length) return;
+    // A picker landing over a menu freezes that menu (fifth f4-2), like ask().
+    this.menuBuf = ''; clearTimeout(this.menuTimer);
+    this.set({question: {questions, tab: 0, index: 0, checked: {}, picked: {}, custom: {}, answers: {}, notes: '', mode: 'list', typeText: ''}});
+  }
+  setQuestion(q) { this.set({question: q}); }
+  closeQuestion(resume = true) {
+    this.set({question: null});
+    // First audit #26: the picker opened at a turn's end is what stopped the
+    // queue and the bang / shell notes (continueTurn skips them while a
+    // question is up). Closing the picker without answering must let them run
+    // again, or they sit until some later turn happens to end.
+    // submitQuestionAnswers passes resume=false: its own submit is the
+    // resumption, and the queued messages keep waiting for that turn's end.
+    if (!resume) return;
+    if (this.drainQueueOnce()) return;
+    if (this.bangPending) this.sendBangNotes();
+    else if (this.shellPending) this.sendShellNotes();
+  }
+  // Send the oldest queued message as a fresh turn, when nothing is running
+  // and no picker is up. Shared by closeQuestion (#26) and the end of an
+  // account switch (deep c1 #9's held messages).
+  drainQueueOnce() {
+    if (this.s.busy || this.s.question || !this.queue.length) return false;
+    const next = this.queue.shift();
+    this.agent.focusInputPending = this.queue.length > 0;
+    this.set({queue: [...this.queue]});
+    this.submit(next);
+    return true;
+  }
+  // The answer text for one question, from a given state (defaults to the live one):
+  // picked labels in option order, then the typed answer, joined the way the reply reads.
+  questionAnswerText(qi, from = this.s.question) {
+    const item = from.questions[qi], parts = [];
+    if (item.multi) parts.push(...[...(from.checked[qi] || [])].sort((a, b) => a - b).map(i => item.options[i].label));
+    else if (from.picked[qi] != null) parts.push(item.options[from.picked[qi]].label);
+    if (from.custom[qi]) parts.push(from.custom[qi]);
+    return parts.join('、');
+  }
+  // Store a patched question state, refreshing the Submit tab's answer line for one question.
+  patchQuestion(patch, qi) {
+    const next = {...this.s.question, ...patch};
+    if (qi != null) next.answers = {...next.answers, [qi]: this.questionAnswerText(qi, next)};
+    this.setQuestion(next);
+  }
+  questionTab(dir) {
+    const q = this.s.question;
+    if (q.questions.length <= 1) return; // one question: no tab row, no Submit tab to switch to
+    const n = q.questions.length + 1;
+    this.setQuestion({...q, tab: (q.tab + dir + n) % n, index: 0});
+  }
+  questionKey(input, k) {
+    const q = this.s.question;
+    if (q.mode !== 'list') return this.questionEditKey(input, k);
+    const rows = q.tab >= q.questions.length ? [{kind: 'submit'}] : this.questionRows(q.tab);
+    if (k.upArrow) return this.setQuestion({...q, index: (q.index + rows.length - 1) % rows.length});
+    if (k.downArrow) return this.setQuestion({...q, index: (q.index + 1) % rows.length});
+    if (k.tab) return this.questionTab(k.shift ? -1 : 1);
+    if (k.escape || (k.ctrl && input === 'c')) return this.closeQuestion();
+    if (input === 'n' && !k.ctrl && !k.meta) return this.setQuestion({...q, mode: 'notes', typeText: q.notes});
+    // Number keys reach the choices only (options, then type-something as
+    // n+1): the chat row below the separator is not a choice and has no number.
+    if (/^[0-9]$/.test(input)) {
+      if (q.tab >= q.questions.length) { if (input === '1') return this.questionActivate(rows[0], 0, 'return'); return; }
+      const choices = rows.filter(r => r.kind !== 'chat'), i = Number(input) - 1;
+      if (i >= 0 && i < choices.length) return this.questionActivate(choices[i], i, 'return');
+      return;
+    }
+    const row = rows[q.index];
+    if (!row) return;
+    // Return acts, space toggles: on a multi-select option return sends (or
+    // advances, with 2+ questions) while space only toggles it. On the
+    // type-something row space toggles its typed answer off, or opens the
+    // editor when there is none yet; return always opens the editor.
+    if (k.return || input === '\n') return this.questionActivate(row, q.index, 'return'); // '\n': ctrl+j, fifth f4-4
+    if (input === ' ' && (row.kind === 'option' || row.kind === 'type')) return this.questionActivate(row, q.index, 'space');
+  }
+  questionActivate(row, at, trigger = 'return') {
+    const q = this.s.question;
+    if (q.tab >= q.questions.length) return this.submitQuestionAnswers();
+    const qi = q.tab, item = q.questions[qi];
+    if (row.kind === 'chat') { this.closeQuestion(); return this.flash(t('入力欄で答えてください')); }
+    if (row.kind === 'type') {
+      if (trigger === 'space' && item.multi && q.custom[qi]) {
+        const custom = {...q.custom}; delete custom[qi];
+        return this.patchQuestion({custom, index: at}, qi);
+      }
+      return this.setQuestion({...q, mode: 'type', typeText: q.custom[qi] || '', index: at});
+    }
+    if (item.multi) {
+      if (trigger === 'return') {
+        // Enter sends what is checked (plus the typed answer, if any). With
+        // nothing checked it does nothing — the hint already says 1つ以上選択.
+        if (!this.questionAnswerText(qi)) return;
+        if (q.questions.length <= 1) return this.submitQuestionAnswers();
+        const answered = i => this.questionAnswerText(i);
+        let next = qi + 1;
+        while (next < q.questions.length && answered(next)) next++;
+        return this.setQuestion({...q, tab: next, index: 0});
+      }
+      const cur = new Set(q.checked[qi] || []);
+      if (cur.has(row.i)) cur.delete(row.i); else cur.add(row.i);
+      return this.patchQuestion({checked: {...q.checked, [qi]: [...cur]}, index: at}, qi);
+    }
+    // Single select: picking an option answers the question and moves on, like Claude's
+    // picker — the next unanswered tab, or the Submit tab when none is left. A single
+    // question has nowhere to move on to and no Submit tab: the pick sends at once.
+    const custom = {...q.custom}; delete custom[qi];
+    this.patchQuestion({picked: {...q.picked, [qi]: row.i}, custom}, qi);
+    if (q.questions.length <= 1) return this.submitQuestionAnswers();
+    const answered = i => this.questionAnswerText(i, this.s.question);
+    let next = qi + 1;
+    while (next < q.questions.length && answered(next)) next++;
+    this.setQuestion({...this.s.question, tab: next, index: 0});
+  }
+  questionEditKey(input, k) {
+    const q = this.s.question;
+    // First audit #23: every key routes to the picker while it is open, so the
+    // composer's paste keys never fired here and Ctrl+Shift+V / Ctrl+V were
+    // silently dropped in the editor. Mirror them: the clipboard read lands in
+    // typeText through paste() (which routes to the picker's text modes).
+    if (k.ctrl && k.shift && (input === 'V' || input === 'v')) { this.pasteFromClipboard(); return; }
+    if ((k.meta && input === 'v') || (k.ctrl && input === 'v') || input === '\x16') { this.pasteImage(); return; }
+    if (k.escape || (k.ctrl && input === 'c')) return this.setQuestion({...q, mode: 'list', typeText: ''});
+    if (k.return || input === '\n') { // '\n' is ctrl+j: it confirms like Enter instead of entering the one-line text (fifth f4-4)
+      const text = q.typeText.trim();
+      if (q.mode === 'notes') return this.setQuestion({...q, mode: 'list', notes: text, typeText: ''});
+      const qi = q.tab, custom = {...q.custom};
+      if (text) custom[qi] = text; else delete custom[qi];
+      const patch = {mode: 'list', custom, typeText: ''};
+      // deep c1 #4: an empty confirm only closes the editor — it must not also
+      // delete the option picked earlier for this question. A typed answer is
+      // what replaces the pick. (Deleting an existing custom still works: the
+      // editor opened with it as typeText, and picked is already unset then.)
+      if (!q.questions[qi].multi && text) { const picked = {...q.picked}; delete picked[qi]; patch.picked = picked; }
+      this.patchQuestion(patch, qi);
+      // A lone single-select question has no Submit tab, so a typed answer
+      // sends on confirm, just as picking an option does. (Multi sends on
+      // enter, so its typed answer only joins the checked picks until then.)
+      if (text && q.questions.length <= 1 && !q.questions[qi].multi) return this.submitQuestionAnswers();
+      return;
+    }
+    // deep c1 #5: step by grapheme cluster, like the composer — a code-unit
+    // slice left a lone surrogate / dangling ZWJ from an emoji, and the broken
+    // string was then sent as the answer.
+    if (k.backspace || k.delete) { const t = q.typeText; return this.setQuestion({...q, typeText: t.slice(0, t.length - lastClusterLen(t))}); }
+    if (input && !k.ctrl && !k.meta) return this.setQuestion({...q, typeText: (q.typeText + input.replace(/\r\n?/g, ' ').replace(/\n/g, ' ')).slice(0, MAX_INPUT)});
+  }
+  submitQuestionAnswers() {
+    const q = this.s.question;
+    const missing = q.questions.findIndex((_, i) => !this.questionAnswerText(i));
+    if (missing >= 0) { this.flash(t('未回答の質問があります')); return this.setQuestion({...q, tab: missing, index: 0}); }
+    const lines = q.questions.map((item, i) => item.question + ' → ' + this.questionAnswerText(i));
+    if (q.notes) lines.push(t('メモ: {text}', {text: q.notes}));
+    this.closeQuestion(false);
+    // Third M25: the answers are the Focus reply, never a decline reason that
+    // happens to be pending — submit's reasonFor branch is bypassed, and the
+    // reason stays pending for the composer afterwards.
+    this.submit(lines.join('\n'), {fromQuestion: true});
+  }
   submitReason(text) { const a = this.s.reasonFor; this.set({reasonFor: null}); this.restoreDraft(); a.resolve({allow: false, reason: text.trim()}); this.nextApproval(); }
   // The mode is remembered for this folder (src/permissions.js).
   setMode(m) { this.agent.mode = m; this.set({mode: m}); if (this.agent.client?.status !== 'demo') permissions.saveMode(this.agent.cwd, m); }
@@ -664,7 +942,7 @@ export class Controller {
 
   // ---- input ----
   setText(text, pos = text.length) { this.set({text, pos}); }
-  insert(t) { const {text, pos} = this.s; this.setText(text.slice(0, pos) + t + text.slice(pos), pos + t.length); }
+  insert(t) { const {text, pos} = this.s; const add = t.slice(0, Math.max(0, MAX_INPUT - text.length)); this.setText(text.slice(0, pos) + add + text.slice(pos), pos + add.length); }
   paste(t) {
     if (this.s.limitInput) {
       const edit = this.s.limitInput, digits = t.trim();
@@ -674,6 +952,13 @@ export class Controller {
     // #158: while a decline reason is being typed the composer belongs to it, even if a
     // menu opened meanwhile — the paste goes to the reason, not nowhere.
     if (this.s.approval || (this.s.menu && !this.s.reasonFor)) return;
+    if (this.s.question) {
+      // Into the picker's text modes (type-something / notes); the list itself takes no paste.
+      // Sanitised like any paste (stripControls), then flattened to one line, as typed input is.
+      const q = this.s.question;
+      if (q.mode === 'list') return;
+      return this.setQuestion({...q, typeText: (q.typeText + stripControls(t).replace(/\r\n?/g, ' ').replace(/\n/g, ' ')).slice(0, MAX_INPUT)});
+    }
     // Dropping image files into the terminal pastes their paths: attach them instead.
     const paths = clip.pastedImagePaths(t);
     if (paths) return paths.forEach(p => this.attach(p));
@@ -681,7 +966,10 @@ export class Controller {
     // normalised, so an OSC 52 / CSI sequence in a paste executed in the user's
     // terminal at render time — the #184 class, on the one input path
     // sanitize.mjs was never applied to. stripControls keeps \n and \t.
-    this.insert(stripControls(t.replace(/\r\n?/g, '\n')));
+    const cleaned = stripControls(t.replace(/\r\n?/g, '\n'));
+    const room = MAX_INPUT - this.s.text.length;
+    this.insert(cleaned);
+    if (cleaned.length > room) this.flash(i18n.t('入力が長すぎるため、{max} 文字までで切れました', {max: MAX_INPUT}), 6000); // i18n.t: this method's argument is named t
   }
   attach(file, temporary) {
     try {
@@ -694,22 +982,68 @@ export class Controller {
     }
     catch (e) { this.flash(e.message); }
   }
+  // Which input a paste would land in right now (deep c1 #10): a clipboard
+  // read can take a while (a process spawn on Windows), and the paste must go
+  // to the input that was current when the user asked — or nowhere — never
+  // into whatever happens to be open when the read finishes.
+  pasteTarget() { const s = this.s; return s.approval ? 'approval' : s.question ? 'question:' + s.question.mode : s.limitInput ? 'limit' : s.reasonFor ? 'reason' : s.menu ? 'menu' : 'composer'; }
   async pasteImage() {
-    this.flash(t('クリップボードを確認しています…'), 5000);
-    const {files, error} = await clip.clipboardImages();
-    // A clipboard that could not be read at all is not "no images".
-    if (error) return this.flash(t('クリップボードを読めませんでした: {error}', {error}), 6000);
-    if (!files.length) return this.flash(t('クリップボードに画像がありません'));
-    files.forEach(f => this.attach(f.path, f.temporary));
+    if (this.pasting) return; // a second press while a read is in flight would attach the same image twice
+    this.pasting = true;
+    const target = this.pasteTarget();
+    try {
+      this.flash(t('クリップボードを確認しています…'), 5000);
+      const {files, error} = await clip.clipboardImages();
+      if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
+      // A clipboard that could not be read at all is not "no images".
+      if (error) return this.flash(t('クリップボードを読めませんでした: {error}', {error}), 6000);
+      if (!files.length) return this.flash(t('クリップボードに画像がありません'));
+      files.forEach(f => this.attach(f.path, f.temporary));
+    } finally { this.pasting = false; }
+  }
+  // Paste whatever the clipboard holds (ctrl+shift+v, a right-click): whether the terminal
+  // pastes on those depends on the host, so with mouse reporting on (view enables it), they
+  // ask the clipboard itself — an image attaches, text inserts at the caret through paste()
+  // (the sanitised path), exactly like the paste keys.
+  async pasteFromClipboard() {
+    if (this.pasting) return; // deep c1 #10: one read at a time (see pasteImage)
+    this.pasting = true;
+    const target = this.pasteTarget();
+    try {
+      const {files, error} = await clip.clipboardImages();
+      if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
+      if (!error && files.length) return files.forEach(f => this.attach(f.path, f.temporary));
+      const text = await clip.clipboardText().catch(() => '');
+      if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
+      if (text) return this.paste(text);
+      if (error) return this.flash(t('クリップボードを読めませんでした: {error}', {error}), 6000);
+      this.flash(t('クリップボードに貼れるものがありません'));
+    } finally { this.pasting = false; }
+  }
+  // SGR mouse sequences (ESC [ < b ; x ; y M/m) arrive as input text once reporting is on.
+  // Only a right-button press means anything here; every sequence is swallowed so clicks
+  // never land in the composer as garbage characters.
+  mouseInput(input) {
+    const re = /\x1b\[<\d+;\d+;\d+[Mm]/g;
+    let right = false;
+    for (const seq of input.match(re) || []) if (/\x1b\[<2;\d+;\d+M/.test(seq)) right = true;
+    if (right && !this.s.approval && !this.s.menu && !this.s.limitInput && !(this.s.question && this.s.question.mode === 'list')) this.pasteFromClipboard();
   }
   key(input, k) {
+    if (input && input.includes('\x1b[<')) return this.mouseInput(input);
     if (this.s.approval) return this.approvalKey(input, k);
+    if (this.s.question) return this.questionKey(input, k);
+    // Third M18: the overlay order here must match the view's (view.mjs Live
+    // draws approval, then question, then menu, then limitInput): with a menu
+    // open over a numeric input, the screen showed the menu while the keys
+    // silently edited the invisible number. The menu the user sees takes the
+    // keys; the numeric input is still there when the menu closes.
+    if (this.s.menu && !this.s.reasonFor) return this.menuKey(input, k);
     if (this.s.limitInput) return this.limitKey(input, k);
     // #158: reasonFor was second-class in key routing — a menu opening while a decline
     // reason was being typed stole every key, and a deadline-less call stayed unresolved
     // forever. While a reason is pending the composer keys win; the menu is still there
     // when the reason is submitted or escaped.
-    if (this.s.menu && !this.s.reasonFor) return this.menuKey(input, k);
     if (!k.tab) this.tabState = null;
     const {text, pos} = this.s;
     if (k.ctrl && input === 'c') {
@@ -746,6 +1080,9 @@ export class Controller {
       if (this.s.promptFor) return this.cancelPrompt();
       if (this.s.busy) { this.agent.interrupt(); return this.flash(t('中断しています…')); }
       if (this.s.bangRunning) { this.bangStop?.abort(); return this.flash(t('中断しています…')); }
+      // Esc closes an open $skill list first (it is not an input-clearing esc).
+      const dctx = this.dollarContext(text, pos);
+      if (dctx) { this.dollarDismissed = dctx.key; return this.set({}); }
       // Twice to clear: one esc (closing the @ list, say) wiped a long draft.
       if (text) {
         if (Date.now() - (this.escArmed || 0) < 1500) { this.escArmed = 0; this.hIndex = -1; this.setText(''); return; }
@@ -754,6 +1091,9 @@ export class Controller {
       return;
     }
     if (k.tab && k.shift) return this.cycleMode();
+    // ctrl+shift+v (when the terminal passes it through instead of pasting itself): paste
+    // whatever the clipboard holds — text through paste(), an image as an attachment.
+    if (k.ctrl && k.shift && (input === 'V' || input === 'v')) { this.pasteFromClipboard(); return; }
     // alt+v (and ctrl+v when the terminal passes it through): image from the clipboard.
     if ((k.meta && input === 'v') || (k.ctrl && input === 'v') || input === '\x16') { this.pasteImage(); return; }
     // Backspace on an empty input removes the last attachment.
@@ -764,6 +1104,10 @@ export class Controller {
     // into thinking @ selection did not exist. A second Enter (after the pick, caret past
     // the completed path) sends as usual.
     if (k.return && !k.shift && !k.meta) {
+      // Enter while the $skill list is open completes to '$name ' instead of
+      // sending, exactly as with @ above.
+      const dctx = this.dollarContext(text, pos);
+      if (dctx?.list.length) return this.applyDollarPick(dctx.frag, dctx.list[this.dollarIndex(dctx.frag.fragment, dctx.list.length)]);
       const ctx = this.atContext(text, pos);
       const pick = ctx?.list.length ? ctx.list[this.atIndex(ctx.at.fragment, ctx.list.length)] : null;
       // A path already typed out in full sends, as Enter normally does (it took a second Enter).
@@ -801,6 +1145,13 @@ export class Controller {
     // ↑↓ while an @fragment is being typed moves in the candidate list the footer shows,
     // not through history (history used to swallow the keys, so the list looked unselectable).
     if (k.upArrow || k.downArrow) {
+      // ↑↓ while a $fragment is being typed moves in the skill list, not history.
+      const dctx = this.dollarContext(text, pos);
+      if (dctx?.list.length) {
+        const idx = this.dollarIndex(dctx.frag.fragment, dctx.list.length);
+        this.dollarPick.idx = (idx + (k.upArrow ? -1 : 1) + dctx.list.length) % dctx.list.length;
+        return this.set({}); // dollarPick is not store state: without a render the highlight did not move
+      }
       const ctx = this.atContext(text, pos);
       if (ctx?.list.length) {
         const idx = this.atIndex(ctx.at.fragment, ctx.list.length);
@@ -823,16 +1174,22 @@ export class Controller {
     // line movement existed, so a pasted multi-line prompt could not be edited.
     if ((k.upArrow || k.downArrow) && text.includes('\n')) {
       const lineStart = text.lastIndexOf('\n', pos - 1) + 1;
-      const col = pos - lineStart;
+      // The column is in grapheme clusters, not UTF-16 units (fifth f4-1):
+      // a UTF-16 column could land inside a ZWJ emoji / flag / combining
+      // sequence on the target line, and typing there split the cluster.
+      // Counting and landing by cluster (offsetAtClusterCol clamps to the
+      // target line's cluster count) keeps the caret on a boundary, the
+      // same unit ←/→ and Backspace already stepped by.
+      const col = clusterCount(text.slice(lineStart, pos));
       if (k.upArrow) {
         if (!lineStart) return;
         const prevEnd = lineStart - 1, prevStart = text.lastIndexOf('\n', prevEnd - 1) + 1;
-        return this.set({pos: prevStart + Math.min(col, prevEnd - prevStart)});
+        return this.set({pos: prevStart + offsetAtClusterCol(text.slice(prevStart, prevEnd), col)});
       }
       const lineEnd = text.indexOf('\n', pos);
       if (lineEnd < 0) return;
       const nextStart = lineEnd + 1, nextEnd = text.indexOf('\n', nextStart);
-      return this.set({pos: nextStart + Math.min(col, (nextEnd < 0 ? text.length : nextEnd) - nextStart)});
+      return this.set({pos: nextStart + offsetAtClusterCol(text.slice(nextStart, nextEnd < 0 ? text.length : nextEnd), col)});
     }
     if ((k.upArrow || k.downArrow) && !text.includes('\n')) {
       if (!this.history.length) return;
@@ -852,7 +1209,10 @@ export class Controller {
   // draws, so the highlight there and the pick here never disagree.
   atContext(text, pos) {
     const at = mention.fragmentAt(text, pos);
-    return at ? {at, list: mention.complete(at.fragment, this.agent.cwd)} : null;
+    // All matches, not the default limit of 6 (deep Part B R4-1): ↑↓ and the
+    // footer's window move through this whole list, so no candidate is
+    // silently unreachable. The view asks mentions for the same full list.
+    return at ? {at, list: mention.complete(at.fragment, this.agent.cwd, 10000)} : null;
   }
   // The highlighted candidate for a fragment; resets whenever the fragment changes.
   atIndex(fragment, n) {
@@ -868,6 +1228,40 @@ export class Controller {
   slashIndex(text, n) {
     if (this.slashPick.key !== text) this.slashPick = {key: text, idx: 0};
     return n ? ((this.slashPick.idx % n) + n) % n : 0;
+  }
+  // Skills on this PC, cached briefly: the footer asks on every render while a
+  // $fragment is being typed, and skills.load reads every SKILL.md it finds.
+  skillList() {
+    if (this._skillCache && Date.now() - this._skillCache.at < 3000 && this._skillCache.cwd === this.agent.cwd) return this._skillCache.list;
+    let list = [];
+    try { list = skills.load(this.agent.cwd); } catch { list = []; }
+    this._skillCache = {at: Date.now(), cwd: this.agent.cwd, list};
+    return list;
+  }
+  // The $skill fragment at the caret plus its candidates (enabled skills whose name
+  // starts with the fragment) — the list the footer draws. Null when the caret is
+  // not in a $fragment, or when Esc closed the list for this fragment.
+  dollarContext(text, pos) {
+    const frag = skills.dollarFragmentAt(text, pos);
+    if (!frag) return null;
+    const key = frag.start + ':' + frag.fragment;
+    if (this.dollarDismissed === key) return null;
+    const all = this.skillList();
+    const q = frag.fragment;
+    const list = all.filter(s => s.enabled && s.name.startsWith(q)).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    return {frag, key, list, noSkills: !all.some(s => s.enabled)};
+  }
+  // The highlighted $ candidate; resets whenever the fragment changes (atIndex's twin).
+  dollarIndex(fragment, n) {
+    if (this.dollarPick.key !== fragment) this.dollarPick = {key: fragment, idx: 0};
+    return n ? ((this.dollarPick.idx % n) + n) % n : 0;
+  }
+  applyDollarPick(frag, pick) {
+    const {text, pos} = this.s;
+    const ins = pick.name + ' ';
+    const nt = text.slice(0, frag.start) + ins + text.slice(pos);
+    this.tabState = null;
+    return this.setText(nt, frag.start + ins.length);
   }
   applyAtPick(at, pick) {
     const {text, pos} = this.s;
@@ -888,9 +1282,17 @@ export class Controller {
       this.tabState = {...prev, idx, text: nt, end: prev.start + ins.length};
       return this.setText(nt, prev.start + ins.length);
     }
+    const dctx = this.dollarContext(text, pos);
+    if (dctx) {
+      // Tab completes the highlighted $skill to '$name ' (no list, no completion).
+      if (!dctx.list.length) return;
+      return this.applyDollarPick(dctx.frag, dctx.list[this.dollarIndex(dctx.frag.fragment, dctx.list.length)]);
+    }
     const at = mention.fragmentAt(text, pos);
     if (at) {
-      const list = mention.complete(at.fragment, this.agent.cwd, mention.COMPLETE_LIMIT);
+      // Tab cycles the same full list atContext returns (see there): cycling
+      // only the first 6 made the rest unreachable however often Tab was hit.
+      const list = mention.complete(at.fragment, this.agent.cwd, 10000);
       if (!list.length) return;
       const format = pick => { const q = /\s/.test(pick) ? '"' + pick + '"' : pick; return pick.endsWith('/') ? q : q + ' '; };
       const ins = format(list[0]), nt = text.slice(0, at.start) + ins + text.slice(pos);
@@ -909,24 +1311,49 @@ export class Controller {
   }
   approvalKey(input, k) {
     const a = this.s.approval, n = a.options.length;
+    // Fifth f4-3: a chunk of digits in one input event — approvals take a
+    // single digit, so the first keystroke is the answer; the rest were typed
+    // before it landed and must not answer whatever opens next.
+    if (/^[0-9]{2,}$/.test(input)) input = input[0];
     if (k.upArrow) return this.set({approval: {...a, index: (a.index + n - 1) % n}});
     if (k.downArrow || k.tab) return this.set({approval: {...a, index: (a.index + 1) % n}});
     if (/^[1-9]$/.test(input) && Number(input) <= n) return this.answer(Number(input) - 1);
-    if (k.return) return this.answer(a.index);
+    if (k.return || input === '\n') return this.answer(a.index); // '\n': ctrl+j, fifth f4-4
     if (k.escape || (k.ctrl && input === 'c')) { this.set({approval: null}); a.resolve({allow: false}); this.nextApproval(); }
   }
 
   // ---- commands ----
-  async submit(text) {
+  async submit(text, {fromQuestion = false} = {}) {
     this.resumeEpoch = (this.resumeEpoch || 0) + 1; // a send supersedes a resume still loading (#177)
     // #158: a send from any surface (GUI /send included) answers a pending decline
     // reason first — it used to fall through and go to Muse as a chat message.
-    if (this.s.reasonFor) return this.submitReason(text);
-    if (this.s.promptFor) return this.submitPrompt(text);
+    // fromQuestion (submitQuestionAnswers) is the one exception, third M25:
+    // those answers belong to the Focus question that was asked, and a reason
+    // pending at the same time stays pending instead of eating them.
+    if (!fromQuestion) {
+      if (this.s.reasonFor) return this.submitReason(text);
+      if (this.s.promptFor) return this.submitPrompt(text);
+    }
     if (this.addingAccount) return this.flash(t('アカウントを追加しています。完了するまでお待ちください。'));
     if (text.startsWith('/')) return this.slash(text.trim());
     // Leading spaces too: a "! command" copied from Muse's reply on screen comes with its indent.
     if (text.trimStart().startsWith('!')) return this.bang(text.trimStart().slice(1).trim());
+    // $name skill calls (Codex style), here in submit so the resident server's
+    // submits from clients expand the same way: Muse gets one 'Use the skill …'
+    // sentence per enabled $name followed by the text as typed, while the screen
+    // and the transcript keep showing what the user typed. A disabled $name stays
+    // plain text and is noted; unknown names, $HOME, $env:PATH, $5 never match.
+    const drefs = (() => { try { return skills.dollarRefs(text, this.agent.cwd); } catch { return {names: [], disabled: []}; } })();
+    for (const name of drefs.disabled) this.note(t('{name} はオフです（/skills でオンにできます）', {name}));
+    const sendText = drefs.names.length ? drefs.names.map(n => skills.skillSentence(n)).join(' ') + ' ' + text : text;
+    // deep c1 #9: an account switch in flight — the message would reach the
+    // agent mid-switch (the closing session of the old account, or ahead of
+    // the handoff on the new one). Hold it in the queue instead; the switch's
+    // completion sends it on the new account (see requestAccountSwitch).
+    if (this.accountSwitching) {
+      if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
+      this.queue.push(sendText); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを切り替えています。そのあと送ります'));
+    }
     if (this.s.busy) {
       if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
       // First try to send it as what it is — a real chat message, through the same send a
@@ -934,9 +1361,12 @@ export class Controller {
       // apart from it; posted, it is a user message. The piggyback + queue stay as the
       // fallback for when posting is not possible.
       let posted = false;
-      try { posted = !!(await this.agent.postSteer?.(text)); } catch {}
+      try { posted = !!(await this.agent.postSteer?.(sendText)); } catch {}
       if (posted) { this.agent.focusInputPending = this.queue.length > 0; this.push({type: 'user', text}); return this.flash(t('作業中の会話にメッセージとして送りました')); }
-      this.queue.push(text); this.agent.queueSteer?.(text); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('作業中です。次のツール実行で Muse に伝えます（キュー {n} 件目）', {n: this.queue.length}));
+      // deep c1 #7: the turn may have ENDED during the postSteer await — then
+      // this is a fresh send, not a queue entry. Queueing it anyway left it in
+      // a queue nothing drains until some later turn ends.
+      if (this.s.busy) { this.queue.push(sendText); this.agent.queueSteer?.(sendText); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('作業中です。次のツール実行で Muse に伝えます（キュー {n} 件目）', {n: this.queue.length})); }
     }
     const attachments = this.s.attachments;
     this.agent.clearSteer?.(); // a fresh send supersedes any steer copy whose queue twin is gone
@@ -950,7 +1380,7 @@ export class Controller {
     const savedBang = this.bangNotes || [], savedShell = this.shellNotes || [];
     const extra = [...savedBang, ...savedShell, ex.block].filter(Boolean); this.bangNotes = []; this.shellNotes = [];
     // In the user's language: it is the user's message in the Muse chat (the app shows it too).
-    const body = (text || t('（画像を見てください）')) +(extra.length ? '\n\n' + extra.join('\n\n') : '');
+    const body = (sendText || t('（画像を見てください）')) +(extra.length ? '\n\n' + extra.join('\n\n') : '');
     try { await this.agent.send(body, {attachments, display: text}); }
     // #165/#174: a failed send used to take the notes AND the attachments with it — the
     // shell's task-notification existed nowhere else, and a clipboard image lived only in
@@ -963,7 +1393,9 @@ export class Controller {
   async sendBangNotes() {
     // #162: busy was the only guard — during account add / a prompt, this started an
     // automatic turn whose input then answered the prompt instead. Wait like a busy turn.
-    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor) { this.bangPending = true; return; }
+    // deep c1 #1: a picker answer or a decline reason in progress is the same
+    // kind of wait (#162 covered promptFor only).
+    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor || this.s.question || this.s.reasonFor) { this.bangPending = true; return; }
     this.bangPending = false;
     const notes = this.bangNotes || [];
     if (!notes.length) return;
@@ -988,7 +1420,9 @@ export class Controller {
     this.sendShellNotes();
   }
   async sendShellNotes() {
-    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor) { this.shellPending = true; return; }
+    // deep c1 #1: same guard as sendBangNotes — a picker answer or a decline
+    // reason in progress waits, instead of an unrelated automatic turn starting.
+    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor || this.s.question || this.s.reasonFor) { this.shellPending = true; return; }
     this.shellPending = false;
     const notes = this.shellNotes || [];
     if (!notes.length) return;
@@ -1264,6 +1698,9 @@ export class Controller {
   // end instead of being refused.
   requestAccountSwitch(target, st, {auto = false} = {}) {
     const a = this.agent;
+    // deep c1 #9: a switch already in flight — a second one would overwrite
+    // a.pendingHandoff mid-await and mix the two handoffs up.
+    if (this.accountSwitching) return this.note(t('アカウントを切り替えています…'));
     if (st && !st.hasLogin) return this.note(t('{label} はログインしていません。`muser login --account {id}` でログインしてください。', {label: target.label, id: target.id}), 'error');
     if (st && !st.device) return this.note(t('{label} はこの PC が未登録です。`muser pc-login --account {id}` で登録してください。', {label: target.label, id: target.id}), 'error');
     if (target.id === a.accountId) {
@@ -1276,7 +1713,7 @@ export class Controller {
       return this.note(t('このターンが終わったら {label} に切り替えます', {label: target.label}));
     }
     return this.switchToAccount(target, {reason: auto ? 'quota' : 'manual'})
-      .then(() => { if (auto && turnFailed(this.lastTurnEnd) && !this.queue.length) this.resumeAfterHandover(); })
+      .then(() => { if (!this.drainQueueOnce() && auto && turnFailed(this.lastTurnEnd) && !this.queue.length) this.resumeAfterHandover(); })
       .catch(e => this.note(t('アカウントを切り替えられませんでした: {error}', {error: e.message}), 'error'));
   }
   clearAccountReservation() {
@@ -1287,12 +1724,19 @@ export class Controller {
   // The handoff note for the new account's Muse is built BEFORE the old session is
   // dropped and left on the agent: it rides the first turn there (see Agent).
   async switchToAccount(target, {reason = 'manual'} = {}) {
+    // deep c1 #9: one switch at a time, marked for the whole await — submit()
+    // holds messages while this is set, and requestAccountSwitch refuses a
+    // second switch instead of overwriting the handoff below.
+    if (this.accountSwitching) throw new Error(t('アカウントを切り替えています…'));
+    this.accountSwitching = true;
     const a = this.agent;
-    try { a.pendingHandoff = this.buildAccountHandoff(target) || undefined; } catch { a.pendingHandoff = undefined; }
-    const pool = a.accountPool;
-    const next = pool?.bundleFor ? pool.bundleFor(target) : require('../account-pool.js').bundle(target);
-    try { await a.switchAccount(next, {reason}); }
-    catch (e) { a.pendingHandoff = undefined; throw e; }
+    try {
+      try { a.pendingHandoff = this.buildAccountHandoff(target) || undefined; } catch { a.pendingHandoff = undefined; }
+      const pool = a.accountPool;
+      const next = pool?.bundleFor ? pool.bundleFor(target) : require('../account-pool.js').bundle(target);
+      try { await a.switchAccount(next, {reason}); }
+      catch (e) { a.pendingHandoff = undefined; throw e; }
+    } finally { this.accountSwitching = false; }
   }
   // A reserved switch at a turn boundary. If the agent got busy again in the meantime
   // (a background resume beat us to it), the reservation stays for the next turn end.
@@ -1300,7 +1744,7 @@ export class Controller {
     const r = this.accountSwitchReservation;
     if (!r) return;
     const a = this.agent;
-    if (a.busy) return;
+    if (a.busy || this.accountSwitching) return; // a manual switch in flight: the reservation stays for the next turn end (deep c1 #9)
     const target = require('../accounts.js').get(r.id);
     this.clearAccountReservation();
     if (!target) { this.note(t('アカウントが見つかりません: {id}', {id: r.label}), 'error'); return; }
@@ -1453,7 +1897,10 @@ export class Controller {
     try { next = a.accountPool.peek ? await a.accountPool.peek(new Set([a.accountId])) : null; } catch {}
     // A switch during the read: this plan and this prediction belong to the old account.
     if (accountId && accountId !== a.accountId) return;
-    this.quotaWarnedFor.set(a.accountId, {resetsAt: p.resetsAt || null});
+    // deep c1 #3: without a resetsAt the record used to hold forever (the guard
+    // above treats null as unexpired), so the warning never came again — across
+    // week boundaries, until a restart. quotaKeep's #164 fix is the twin: a day.
+    this.quotaWarnedFor.set(a.accountId, {resetsAt: p.resetsAt || Date.now() + 24 * 3600 * 1000});
     const base = {label: a.accountLabel || a.accountId, n: p.percentUsed, threshold};
     this.note(next ? t('{label} の週の使用量が {n}% です（{threshold}% で、続けるか引き継ぐかを確認します）。引き継ぐなら {next} が軽いです。', {...base, next: next.label})
                    : t('{label} の週の使用量が {n}% です（{threshold}% で、続けるか引き継ぐかを確認します）。', base));
@@ -1541,7 +1988,11 @@ export class Controller {
     if (!this.onReload) return this.note(t('この起動方法では /reload は使えません。'));
     // #170: the guard missed a pending decline reason, a running !command and an Edge
     // login in flight — a /reload arriving via the GUI send path cut all three silently.
-    if (this.s.busy || this.s.approval || this.s.reasonFor || this.s.bangRunning || this.loggingIn || this.addingAccount || this.queue.length || (this.s.agents || []).some(a => a.state === 'working'))
+    // deep c1 #2: the guard also missed a prompt (the account-add name question
+    // is promptFor before addingAccount stands), an open picker (its picks and
+    // notes live only here), a numeric input, bang / shell notes not yet sent
+    // (they live only in memory), and a running background shell.
+    if (this.s.busy || this.s.approval || this.s.reasonFor || this.s.bangRunning || this.loggingIn || this.addingAccount || this.queue.length || this.s.promptFor || this.s.question || this.s.limitInput || (this.bangNotes || []).length || (this.shellNotes || []).length || (this.s.shells || []).some(sh => sh.state === 'working' || sh.running) || (this.s.agents || []).some(a => a.state === 'working'))
       return this.note(t('作業中は再起動できません。終わってから /reload してください（キューや実行中の作業が消えてしまいます）。'));
     this.note(t('再起動します…'));
     return this.onReload();
@@ -1639,7 +2090,11 @@ export class Controller {
       // Switching chats under a running turn re-pointed that turn at the other chat (its reply
       // stopped streaming); until a turn can move to the background, wait for it.
       if (this.s.busy) return this.flash(t('作業中は切り替えられません'));
-      const list = sessions.recent(a.cwd).filter(s => s.turns).slice(0, 9);
+      // All of this folder's chats, not the first 9 (deep Part B R3 R1): the
+      // menu itself windows long lists (12 rows plus a count of the rest) and its
+      // digit buffer picks 10+ by number, so no slice is needed here — with
+      // it, chats past the ninth were silently unreachable from the menu.
+      const list = sessions.recent(a.cwd).filter(s => s.turns);
       if (!list.length) return this.note(t('このフォルダーの過去の会話はありません。'));
       // Another account's chat is marked before it is picked (it cannot be continued here; see showResumed).
       const elsewhere = s => { const id = s.account || 'default'; if (!a.accountId || id === a.accountId) return ''; try { return ' · ' + t('アカウント {label}', {label: require('../accounts.js').get(id)?.label || id}); } catch { return ''; } };
@@ -1651,7 +2106,10 @@ export class Controller {
       // sessions.find's ambiguity refusal. An exact id wins; a prefix matching several
       // of this folder's chats is refused and the candidates are named.
       const recentAll = sessions.recent(a.cwd);
-      const matches = /^\d$/.test(arg) ? [list[Number(arg) - 1]].filter(Boolean) : recentAll.filter(x => x.id === arg || x.id.startsWith(arg));
+      // A number within the list's range is its line (10+ included, now that
+      // the list is no longer cut at 9); a number past the range falls
+      // through to the id lookup, as a digit-led id prefix did before.
+      const matches = /^\d+$/.test(arg) && Number(arg) >= 1 && Number(arg) <= list.length ? [list[Number(arg) - 1]] : recentAll.filter(x => x.id === arg || x.id.startsWith(arg));
       const s = matches.find(x => x.id === arg) || (matches.length === 1 ? matches[0] : null);
       if (!s && matches.length > 1) return this.note(t('候補が複数あります: {list} — もう少し長く指定してください', {list: matches.map(x => x.id).join(', ')}), 'error');
       if (!s) return this.note(t('見つかりません: {arg}', {arg}));
@@ -1703,7 +2161,7 @@ export class Controller {
       const all = skills.load(a.cwd), s = all.find(x => x.name === String(name || '').toLowerCase());
       if (!name || !s) return this.note([t('使い方: /skill <名前> <頼みたいこと>'), t('スキル: {list}', {list: all.filter(x => x.enabled).map(x => x.name).join(', ') || t('（ありません）')})]);
       if (!s.enabled) return this.note(t('{name} はオフです（/skills でオンにできます）', {name: s.name}));
-      return this.submit('Use the skill "' + s.name + '" (read it with skill.read first). ' + request);
+      return this.submit(skills.skillSentence(s.name) + ' ' + request);
     }
     if (cmd === '/status') return this.push({type: 'status'});
     // In the user's language: it is their message in the chat, and AGENTS.md came out in Japanese for English users.

@@ -65,6 +65,15 @@ test('an older muser window (relay entry, no node lock) keeps the saved node id 
   assert.strictEqual(claim('n', {dir: other}).nodeId, 'n');
 });
 
+test('a relay entry whose pid is dead is stale: it does not hold the saved node id (t4 #15)', async () => {
+  const dir = scratch();
+  const child = spawn(process.execPath, ['-e', ''], {stdio: 'ignore'});
+  await new Promise(r => child.on('exit', r)); // a real pid that was alive and is now gone
+  fs.writeFileSync(path.join(dir, 'muser-' + child.pid + '-abcdef012345.json'), '{}');
+  const s = claim('n', {dir});
+  assert.deepStrictEqual([s.slot, s.nodeId], [1, 'n'], 'the dead window’s entry is ignored, unlike the live one above');
+});
+
 test('each account has its own pool: windows of one account do not take the slots of another account', () => {
   const dir = scratch();
   for (let i = 0; i < 2; i++) claim('homelink-default', {dir, max: 2});

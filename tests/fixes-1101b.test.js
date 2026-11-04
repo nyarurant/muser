@@ -10,6 +10,22 @@ const {TOOLS, copyReads} = require('../src/tools');
 
 function tmp(t, p = 'muser-b-') { const d = fs.mkdtempSync(path.join(os.tmpdir(), p)); t.after(() => fs.rmSync(d, {recursive: true, force: true})); return d; }
 
+// t5 #6/#7 (deep audit): poll for a condition instead of sleeping a fixed
+// span (a loaded Windows box misses a 20 ms window on correct code), and
+// never await a promise that only the mechanism under test can settle
+// without a deadline (a regression there hung the whole suite silently).
+async function waitFor(pred, what, ms = 5000) {
+  const t0 = Date.now();
+  for (;;) {
+    if (pred()) return;
+    if (Date.now() - t0 > ms) throw new Error('timed out waiting for ' + what);
+    await new Promise(r => setTimeout(r, 10));
+  }
+}
+function withTimeout(promise, what, ms = 10000) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for ' + what)), ms))]);
+}
+
 test("a parallel agent's code.write refuses a file changed on disk since main read it", t => {
   const dir = tmp(t), f = path.join(dir, 'a.txt'); fs.writeFileSync(f, 'one\n');
   const main = {cwd: dir, readFiles: new Set(), todos: []};
@@ -68,10 +84,31 @@ test('a UTF-16 file (PowerShell `>`) is read as text and stays UTF-16 when edite
   assert.equal(b.subarray(2).toString('utf16le'), 'こんにちは\r\n2行目\r\n');
 });
 
-test('secure-store writes through a temp file of its own (no shared ".tmp")', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'secure-store.js'), 'utf8');
-  assert.ok(!/target \+ '\.tmp';/.test(src));
-  assert.match(src, /'\.tmp-' \+ process\.pid/);
+// t5 #5 (deep audit): this used to assert two regexes over the source text —
+// a refactor to another unique-temp scheme failed it innocently, and the
+// shared ".tmp" could have returned inside a comment while it stayed green.
+// Exercise the claim instead: two PROCESSES saving the same file at the same
+// time both succeed, the survivor is one writer's whole value, and no temp
+// file is left behind.
+test('secure-store writes through a temp file of its own (no shared ".tmp")', async t => {
+  const dir = tmp(t);
+  const {spawn} = require('node:child_process');
+  const script = "const ss=require('./src/secure-store');const who=Number(process.argv[1]);for(let i=0;i<6;i++)ss.save('race-b.enc',{who,i});";
+  const run = who => new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, ['-e', script, String(who)], {cwd: path.join(__dirname, '..'), env: {...process.env, LOCALAPPDATA: dir}, stdio: ['ignore', 'pipe', 'pipe']});
+    let err = '';
+    p.stderr.on('data', d => { err += d; });
+    p.on('error', reject);
+    p.on('exit', c => c === 0 ? resolve() : reject(new Error('saver ' + who + ' exit ' + c + ': ' + err)));
+  });
+  await Promise.all([run(0), run(1)]);
+  const storeDir = path.join(dir, 'muser');
+  assert.deepEqual(fs.readdirSync(storeDir).filter(n => n.includes('.tmp')), [], 'no temp file is left behind by either saver');
+  const {execFileSync} = require('node:child_process');
+  const out = execFileSync(process.execPath, ['-e', "const ss=require('./src/secure-store');console.log(JSON.stringify(ss.load('race-b.enc')))"], {cwd: path.join(__dirname, '..'), env: {...process.env, LOCALAPPDATA: dir}, encoding: 'utf8', timeout: 30000});
+  const v = JSON.parse(out.trim());
+  assert.ok(v.who === 0 || v.who === 1, 'the surviving value is one whole writer value, not a mix: ' + out);
+  assert.ok(Number.isInteger(v.i) && v.i >= 0 && v.i < 6, 'and one of its actual saves');
 });
 
 test('a UTF-16 file sent with @ goes as text, not "binary"', t => {
@@ -115,7 +152,7 @@ test('an approval still open when Muse stops waiting closes itself and nothing r
   const ctrl = await ctrlWith(t);
   const answer = ctrl.ask({command: 'system.run', kind: 'exec', params: {command: 'npm test'}, summary: 'npm test', deadline: Date.now() + 150});
   assert.ok(ctrl.get().approval);
-  const r = await answer;
+  const r = await withTimeout(answer, 'the deadline to expire the approval');
   assert.equal(r.expired, true);
   assert.equal(ctrl.get().approval, null);
   assert.match(ctrl.get().entries.at(-1).lines.join(' '), /行いませんでした/);
@@ -155,10 +192,10 @@ test('a change waiting for approval does not run once its task was stopped; the 
   const ctrl = await ctrlWith(t);
   a.approver = call => ctrl.ask(call);
   const p = a.execute('code.write', {path: 'after-stop.txt', content: 'x'}, 30000, 'i1');
-  await new Promise(r => setTimeout(r, 20));
+  await waitFor(() => ctrl.get().approval, 'the approval to be asked');
   assert.ok(ctrl.get().approval, 'asked');
   turn.controller.abort(); a.main.turn = null; // esc
-  const r = await p;
+  const r = await withTimeout(p, 'the stopped execute() to settle');
   assert.equal(r.ok, false);
   assert.equal(ctrl.get().approval, null, 'the approval went away');
   assert.equal(fs.existsSync(path.join(dir, 'after-stop.txt')), false);

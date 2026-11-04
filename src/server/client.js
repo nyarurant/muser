@@ -10,6 +10,14 @@ const discovery = require('./discovery');
 
 const BACKOFF_FIRST_MS = 250;
 const BACKOFF_MAX_MS = 5000;
+// A snapshot frame alone does not prove a stream healthy for backoff purposes (deep audit
+// c25 #7): every connection starts with one, so it resets the backoff only once the
+// connection has also survived this long. Real (non-snapshot) events reset it at once.
+const SNAPSHOT_RESET_MS = 10000;
+// An unterminated frame may not grow the buffer without bound (deep audit c25 #9): past
+// this, the connection is dropped and reconnected instead of eating the resident client's
+// memory forever on a server that never sends the blank-line terminator.
+const MAX_BUFFER_CHARS = 32 * 1024 * 1024;
 
 // One SSE connection, reconnecting while not closed. onClose fires exactly once
 // per connection that ends (a drop that will be retried, and the final close),
@@ -67,16 +75,30 @@ function sseStream(info, path, {onEvent, onClose} = {}) {
         // forever. It resets only once a real event has come through (below).
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
+        const connectedAt = Date.now();
         let buffer = '';
         for (;;) {
+          if (closed) break; // close() lands between reads too (deep audit c25 #8)
           const {done, value} = await reader.read();
-          if (done) break;
+          if (done || closed) break;
           buffer += decoder.decode(value, {stream: true});
           buffer = drain(buffer.replace(/\r\n/g, '\n'), text => {
+            // close() from inside onEvent (the usual reaction to a terminal event) stops
+            // delivery at once: the rest of this chunk's frames are not handed out after
+            // the caller has closed the stream (deep audit c25 #8).
+            if (closed) return;
             let event; try { event = JSON.parse(text); } catch { return; }
-            attempt = 0; // a stream that actually delivered restarts the backoff
+            // #66, completed by c25 #7: the initial snapshot frame is not by itself proof
+            // of a healthy stream — a server that accepts, snapshots and instantly drops
+            // was retried every ~250 ms forever because the snapshot reset the backoff.
+            // A snapshot resets it only for a connection that has survived a while; any
+            // other event still resets it at once, as does a long-lived stream's drop.
+            const snapshot = event && (event.kind === 'state' || event.kind === 'server');
+            if (!snapshot || Date.now() - connectedAt >= SNAPSHOT_RESET_MS) attempt = 0;
             try { onEvent?.(event); } catch {}
           });
+          // What is left in the buffer is one unterminated frame: bound it (c25 #9).
+          if (buffer.length > MAX_BUFFER_CHARS) throw new Error('events frame exceeds the size limit');
         }
       } catch { /* a drop, a refused connection, or close()'s abort: all reconnect-or-stop below */ }
       reportClose();

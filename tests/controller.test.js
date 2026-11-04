@@ -374,7 +374,7 @@ test('an account picked mid-turn is reserved, then switches at the turn end with
     assert.equal(agent.switched.length, 0, 'no switch mid-turn');
     agent.busy = false;
     agent.emit('turn-end', {ok: true});
-    for (let i = 0; i < 100 && !agent.switched.length; i++) await new Promise(r => setTimeout(r, 20));
+    await untilState(() => agent.switched.length === 1);
     assert.equal(agent.switched.length, 1, 'the reserved switch ran at the turn boundary');
     assert.equal(agent.switched[0].next.account.id, second.id);
     assert.equal(agent.switched[0].opts.reason, 'reserved');
@@ -447,7 +447,7 @@ test('/account <name> to an account without a login explains itself instead of s
   } finally { accounts.remove(second.id); }
 });
 
-const untilState = async (fn) => { for (let i = 0; i < 200 && !fn(); i++) await new Promise(r => setTimeout(r, 10)); };
+const untilState = async (fn) => { for (let i = 0; i < 1000 && !fn(); i++) await new Promise(r => setTimeout(r, 10)); }; // 10 s budget (t2 #2): 200×10 ms elapsed under parallel load before slow state changes landed
 
 test('/account add <name> runs the add flow on this window\'s prompts', async () => {
   const dir = fs2.mkdtempSync(require('node:path').join(os.tmpdir(), 'muser-acct-add-'));
@@ -642,7 +642,7 @@ test('at the weekly limit the user chooses: go on with the extra, or hand over t
     // The turn end with the limit reached: a question, not a switch.
     ctrl.refreshPlan = () => Promise.resolve(plan);
     agent.emit('turn-end', {ok: true, text: 'done'});
-    await new Promise(r => setTimeout(r, 20));
+    await untilState(() => ctrl.get().menu?.quotaChoice); // poll, not a fixed 20 ms (t2 #2)
     const menu = ctrl.get().menu;
     assert.ok(menu?.quotaChoice, 'the choice is asked');
     assert.equal(agent.switched.length, 0, 'nothing switches on its own');
@@ -652,7 +652,7 @@ test('at the weekly limit the user chooses: go on with the extra, or hand over t
     assert.match(menu.options[1].desc, /Limit Second/);
     // Hand over: the same switch as /account, with its handoff.
     ctrl.key('', {downArrow: true}); ctrl.key('', {return: true});
-    await new Promise(r => setTimeout(r, 20));
+    await untilState(() => agent.switched.length === 1);
     assert.equal(agent.switched.length, 1);
     assert.equal(agent.switched[0].next.account.id, second.id);
     assert.ok(agent.pendingHandoff, 'the work is handed over');
@@ -691,27 +691,36 @@ test('from 90% the plan is re-read after every tool call, and the limit is asked
     const ctrl = await accountCtrl(agent);
     let reads = 0, next = {percentUsed: 89, quotaStatus: 'SUFFICIENT'};
     ctrl.refreshPlan = () => { reads++; ctrl.set({plan: next}); return Promise.resolve(next); };
-    const tick = () => new Promise(r => setTimeout(r, 20));
     ctrl.set({plan: {percentUsed: 85, quotaStatus: 'SUFFICIENT'}});
     agent.emit('tool-end', {command: 'code.read', ok: true});
     assert.equal(reads, 0, 'below 90% a tool call reads nothing');
-    ctrl.set({plan: {percentUsed: 92, quotaStatus: 'SUFFICIENT'}, busy: true}); agent.busy = true;
+    // Exactly 90% (t2 #3): the guard is percentUsed < threshold - 10 (= 90),
+    // so 90 itself is already "from 90%" and reads — previously the test
+    // only bracketed the boundary with 85 and 92.
+    ctrl.set({plan: {percentUsed: 90, quotaStatus: 'SUFFICIENT'}, busy: true}); agent.busy = true;
+    next = {percentUsed: 92, quotaStatus: 'SUFFICIENT'};
+    agent.emit('tool-end', {command: 'code.read', ok: true});
+    await untilState(() => reads === 1); // poll the read, not a fixed tick (t2 #2)
+    assert.equal(reads, 1, 'at exactly 90% a tool call reads the plan');
     next = {percentUsed: 95, quotaStatus: 'SUFFICIENT'};
-    agent.emit('tool-end', {command: 'code.read', ok: true}); await tick();
-    agent.emit('agent-tool', {command: 'code.read', ok: true}); await tick();
+    agent.emit('agent-tool', {command: 'code.read', ok: true});
+    await untilState(() => reads === 2);
     assert.equal(reads, 2, 'every tool call (parallel agents too) reads the plan');
     assert.equal(ctrl.get().menu, null, 'not at the limit yet');
     // The user is typing: the question waits (an Enter would pick an option).
     next = {percentUsed: 100, quotaStatus: 'SUFFICIENT', resetsAt: Date.now() + 3600e3};
     ctrl.set({text: 'half a message'});
-    agent.emit('tool-end', {command: 'code.read', ok: true}); await tick();
+    agent.emit('tool-end', {command: 'code.read', ok: true});
+    await untilState(() => reads === 3);
     assert.equal(ctrl.get().menu, null);
     ctrl.set({text: ''});
-    agent.emit('tool-end', {command: 'code.read', ok: true}); await tick();
+    agent.emit('tool-end', {command: 'code.read', ok: true});
+    await untilState(() => ctrl.get().menu?.quotaChoice);
     const menu = ctrl.get().menu;
     assert.ok(menu?.quotaChoice, 'asked while the task runs');
     assert.match(menu.options[1].desc, /この作業が終わったら Watch Second/);
-    ctrl.key('', {downArrow: true}); ctrl.key('', {return: true}); await tick();
+    ctrl.key('', {downArrow: true}); ctrl.key('', {return: true});
+    await untilState(() => ctrl.get().accountReserved === 'Watch Second');
     assert.equal(agent.switched.length, 0, 'no switch under a running turn');
     assert.equal(ctrl.get().accountReserved, 'Watch Second', 'reserved for the turn end');
   } finally { accounts.remove(second.id); }
@@ -738,48 +747,51 @@ test('an unanswered limit question follows /settings: by default go on with extr
     let {agent, ctrl} = await make();
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 120, resetsAt: week});
     assert.match(ctrl.get().menu.hint, /1 秒答えがなければ「このまま追加を利用する」/);
-    await tick(60);
+    await untilState(() => ctrl.get().menu === null); // the 30 ms fallback, polled (t2 #2)
     assert.equal(ctrl.get().menu, null);
     assert.equal(agent.switched.length, 0);
+    await untilState(() => notesWith(ctrl, /1 秒答えがなかったので、default でこのまま続けます/).length === 1);
     assert.equal(notesWith(ctrl, /1 秒答えがなかったので、default でこのまま続けます/).length, 1);
     // None bought, idle window whose last turn failed: hand over, then the work resumes there.
     ({agent, ctrl} = await make());
     ctrl.lastTurnEnd = {ok: false, error: 'weekly limit'};
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 0, resetsAt: week});
-    await tick(60);
+    await untilState(() => agent.switched.length === 1);
     assert.equal(agent.switched.length, 1);
     assert.equal(agent.switched[0].opts.reason, 'quota');
+    await untilState(() => ctrl.sent.length === 1); // the resume send lands after the switch
     assert.equal(ctrl.sent.length, 1, 'the unfinished work is picked up on the new account');
     assert.match(ctrl.sent[0], /引き継ぎました/);
     // Mid-task: reserved, then at the failed turn's end switched and resumed.
     ({agent, ctrl} = await make());
     agent.busy = true; ctrl.set({busy: true});
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 0, resetsAt: week});
-    await tick(60);
+    await untilState(() => ctrl.get().accountReserved === 'Away Second');
     assert.equal(ctrl.get().accountReserved, 'Away Second');
     agent.busy = false;
     agent.emit('turn-end', {ok: false, error: 'weekly limit'});
-    await tick(20);
+    await untilState(() => agent.switched.length === 1);
     assert.equal(agent.switched.length, 1);
+    await untilState(() => ctrl.sent.length === 1);
     assert.equal(ctrl.sent.length, 1);
     // A turn that finished on its own: switched for the next one, nothing sent by itself.
     ({agent, ctrl} = await make());
     ctrl.lastTurnEnd = {ok: true, text: 'done'};
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 0, resetsAt: week});
-    await tick(60);
+    await untilState(() => agent.switched.length === 1);
     assert.equal(agent.switched.length, 1);
     assert.equal(ctrl.sent.length, 0);
     // "ask": nothing happens without an answer; an answer cancels the wait.
     settings.setQuotaFallback('ask', {save: false});
     ({agent, ctrl} = await make());
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 0, resetsAt: week});
-    await tick(60);
+    await tick(300); // negative: 10× the 30 ms fallback wait, so a fallback that wrongly fires has time to (t2 #2)
     assert.ok(ctrl.get().menu?.quotaChoice, 'still waiting for the user');
     settings.setQuotaFallback('auto', {save: false});
     ({agent, ctrl} = await make());
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 0, resetsAt: week});
     ctrl.key('', {return: true}); // the user picks "go on"
-    await tick(60);
+    await tick(300); // negative, as above: past the fallback window before asserting it never ran
     assert.equal(agent.switched.length, 0, 'the fallback never runs after an answer');
     assert.throws(() => settings.setQuotaFallback('bogus', {save: false}));
   } finally { accounts.remove(second.id); require('../src/settings').setQuotaFallback('auto', {save: false}); }
@@ -795,7 +807,7 @@ test('an automatic "go on" with no extra usage bought says the work may stop, no
     const ctrl = await accountCtrl(agent);
     ctrl.quotaWaitMs = 20;
     await ctrl.askQuotaChoice({percentUsed: 100, topupBalance: 0, resetsAt: Date.now() + 3600e3});
-    await new Promise(r => setTimeout(r, 50));
+    await untilState(() => notesWith(ctrl, /追加購入分はないため、上限で止まることがあります/).length === 1);
     assert.equal(notesWith(ctrl, /追加購入分はないため、上限で止まることがあります/).length, 1);
     assert.equal(notesWith(ctrl, /追加購入分を使います/).length, 0);
   } finally { accounts.remove(other.id); }
@@ -1218,4 +1230,367 @@ test('/account add typed at the name prompt runs after the outer flow closes (au
   await untilState(() => implLabel);
   assert.equal(implLabel, 'Inner', 'the inner add ran with its own name');
   assert.ok(screenDuring, 'the inner add had its screen up while it ran');
+});
+
+// ---------- selectable questions (focus.ask_user with options) ----------
+const ASK = {questions: [
+  {header: '猫', question: 'どの猫？', multi: false, options: [{label: '黒猫', description: '定番', preview: '/_/\n( o.o )'}, {label: '三毛猫', description: null, preview: null}]},
+  {header: '付け合わせ', question: '付け合わせは？', multi: true, options: [{label: 'ちゅ〜る', description: null, preview: null}, {label: '段ボール箱', description: null, preview: null}, {label: '日なたぼっこ', description: null, preview: null}]},
+]};
+async function questionCtrl() {
+  const dir = fs2.mkdtempSync(require('node:path').join(os.tmpdir(), 'muser-question-'));
+  const agent = new FakeAgent(dir);
+  const sent = [];
+  agent.send = async (body, opts) => { sent.push({body, opts}); };
+  const ctrl = await accountCtrl(agent);
+  return {ctrl, sent};
+}
+const tick = () => new Promise(r => setTimeout(r, 0));
+// The picker alone, rendered the way the render tests do: ink's renderToString at 80 columns.
+async function renderQuestion(ctrl, W = 79) {
+  const React = (await import('react')).default, {renderToString} = await import('ink');
+  const {Question} = await import('../src/ui/view.mjs');
+  const {strip} = require('../src/tui/term.js');
+  return strip(renderToString(React.createElement(Question, {q: ctrl.get().question, W}), {columns: 80}));
+}
+
+test('a turn ending on a selectable question opens the picker, once per ask; esc keeps a typed answer possible', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  const focus = {id: 'f1', round: 1, revision: 5, status: 'needs_input', ask: ASK};
+  ctrl.agent.emit('turn-end', {ok: true, focus});
+  assert.ok(ctrl.get().question, 'the picker opens');
+  assert.equal(ctrl.get().question.questions.length, 2);
+  ctrl.key('', {escape: true});
+  assert.equal(ctrl.get().question, null, 'esc closes it');
+  ctrl.agent.emit('turn-end', {ok: true, focus});
+  assert.equal(ctrl.get().question, null, 'the same ask does not reopen after the user closed it');
+  // The question is not lost: a free typed reply still goes to Muse as the answer.
+  ctrl.setText('自由回答');
+  ctrl.key('', {return: true});
+  await tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body, '自由回答');
+});
+
+test('a plain question (no choices) does not open the picker', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.agent.emit('turn-end', {ok: true, focus: {id: 'f2', round: 1, revision: 1, status: 'needs_input', ask: null}});
+  assert.equal(ctrl.get().question, null, 'plain ask_user stays text-only, as before');
+});
+
+test('a question with choices renders as a list (options, descriptions, preview, chat row)', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.openQuestion(ASK);
+  const React = (await import('react')).default, {render} = await import('ink');
+  const {Question} = await import('../src/ui/view.mjs');
+  const {EventEmitter} = require('node:events');
+  const out = new EventEmitter(); out.columns = 100; out.rows = 40; out.isTTY = false; out.buf = '';
+  out.write = d => { out.buf += d; return true; };
+  const app = render(React.createElement(Question, {q: ctrl.get().question, W: 100}), {stdout: out, debug: true, patchConsole: false, exitOnCtrlC: false});
+  const start = Date.now();
+  while (!out.buf) { if (Date.now() - start > 5000) throw new Error('no frame rendered'); await tick(); }
+  app.unmount();
+  const strip = require('../src/tui/term.js').strip || (s => s.replace(/\x1b\[[0-9;]*m/g, ''));
+  const plain = strip(out.buf);
+  assert.match(plain, /どの猫？/);
+  assert.match(plain, /❯ 1\. 黒猫/, 'the highlighted row is marked ❯, like the other menus');
+  assert.match(plain, /2\. 三毛猫/);
+  assert.match(plain, /定番/);
+  assert.match(plain, /\( o\.o \)/, 'the selected option preview shows beside the list');
+  assert.match(plain, /3\. 自分で書く…/, 'type-your-own is the last numbered choice (n+1) of a single-select question');
+  assert.match(plain, /この件について話す/, 'the chat row still renders (its separator position is checked below, without a preview)');
+});
+
+test('the Submit tab renders the review body: answers, unanswered marks, the warning and the submit row (t2 #4)', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.openQuestion(ASK);
+  ctrl.key('', {return: true}); // 黒猫 for Q1; Q2 left unanswered
+  ctrl.key('', {tab: true}); // to the Submit tab
+  const plain = await renderQuestion(ctrl);
+  assert.match(plain, /回答の確認/);
+  assert.match(plain, /猫: 黒猫/, 'the answered question shows its pick');
+  assert.match(plain, /付け合わせ: 未回答/, 'the unanswered question is marked');
+  assert.match(plain, /未回答があります。このまま送りますか？/);
+  assert.match(plain, /❯ 送信する/, 'the submit row is the cursor row');
+});
+
+test('an option preview longer than 8 display rows is cut with the omitted count (t2 #4)', async () => {
+  const {ctrl} = await questionCtrl();
+  const preview = Array.from({length: 12}, (_, i) => 'PVLINE-' + (i + 1)).join('\n');
+  ctrl.openQuestion({questions: [{header: '猫', question: 'どの猫？', multi: false, options: [{label: '黒猫', description: null, preview}, {label: '三毛猫', description: null, preview: null}]}]});
+  const plain = await renderQuestion(ctrl);
+  assert.match(plain, /PVLINE-1/);
+  assert.match(plain, /PVLINE-8/, 'the first 8 rows show');
+  assert.ok(!plain.includes('PVLINE-9'), 'rows past 8 are not rendered');
+  assert.ok(!plain.includes('PVLINE-12'));
+  assert.match(plain, /✂ 4 行を省略/, 'the cut is announced with its count');
+});
+
+test('single picks advance, multi toggles with space, enter advances, the Submit tab sends the composed answers', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion(ASK);
+  ctrl.key('', {return: true}); // 黒猫
+  let q = ctrl.get().question;
+  assert.equal(q.tab, 1, 'moved to the next question');
+  assert.equal(q.answers[0], '黒猫', 'the Submit tab line is maintained');
+  ctrl.key(' ', {}); // ちゅ〜る on (space toggles; enter would advance instead)
+  ctrl.key('', {downArrow: true});
+  ctrl.key(' ', {}); // 段ボール箱 on
+  q = ctrl.get().question;
+  assert.deepEqual(q.checked[1], [0, 1]);
+  assert.equal(q.answers[1], 'ちゅ〜る、段ボール箱');
+  ctrl.key('', {return: true}); // enter on a checked multi question advances, it does not send mid-list
+  assert.equal(ctrl.get().question.tab, 2, 'on the Submit tab');
+  ctrl.key('', {return: true});
+  await tick();
+  assert.equal(ctrl.get().question, null);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body, 'どの猫？ → 黒猫\n付け合わせは？ → ちゅ〜る、段ボール箱');
+});
+
+test('type-something and notes ride along; chat-about-this closes without sending', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true});
+  ctrl.key('', {return: true}); // Type something
+  assert.equal(ctrl.get().question.mode, 'type');
+  ctrl.paste('自家製');
+  ctrl.key('!', {});
+  ctrl.key('', {return: true});
+  assert.equal(ctrl.get().question.custom[0], '自家製!');
+  ctrl.key('n', {});
+  assert.equal(ctrl.get().question.mode, 'notes');
+  for (const ch of 'memo') ctrl.key(ch, {});
+  ctrl.key('', {return: true});
+  assert.equal(ctrl.get().question.notes, 'memo');
+  ctrl.key('', {upArrow: true});
+  ctrl.key('', {return: true}); // enter on a choice sends the single multi-select question at once, no Submit tab
+  await tick();
+  assert.equal(ctrl.get().question, null, 'enter sent the single multi-select question');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body, '付け合わせは？ → 自家製!\nメモ: memo');
+  // Chat about this: closes, sends nothing. (Rows now: options, type-your-own, chat.)
+  ctrl.openQuestion({questions: [ASK.questions[0]]});
+  ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true});
+  ctrl.key('', {return: true});
+  assert.equal(ctrl.get().question, null);
+  assert.equal(sent.length, 1, 'still just the earlier send');
+});
+
+test('the Submit tab refuses while a question is unanswered and jumps to it', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[0], ASK.questions[0]]});
+  ctrl.key('', {return: true}); // answer Q1 -> advance to Q2
+  assert.equal(ctrl.get().question.tab, 1);
+  ctrl.key('', {tab: true}); // Submit tab
+  assert.equal(ctrl.get().question.tab, 2);
+  ctrl.key('', {return: true});
+  await tick();
+  assert.equal(sent.length, 0, 'nothing sent');
+  assert.equal(ctrl.get().question.tab, 1, 'jumped back to the unanswered question');
+});
+
+test('an answered question shows [✓] in the tab row', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.openQuestion(ASK);
+  ctrl.key('', {return: true}); // answer Q1 (黒猫) -> advance to Q2
+  const plain = await renderQuestion(ctrl);
+  assert.match(plain, /\[✓\] 猫/, 'the answered tab is marked');
+  assert.match(plain, /\[ \] 付け合わせ/, 'the unanswered tab is not');
+});
+
+test('a single single-select question sends on enter, with no Submit tab', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[0]]});
+  ctrl.key('', {tab: true});
+  assert.equal(ctrl.get().question.tab, 0, 'tab does not switch: there is no Submit tab');
+  assert.ok(ctrl.get().question, 'still open');
+  ctrl.key('', {return: true}); // 黒猫
+  await tick();
+  assert.equal(ctrl.get().question, null, 'the pick sent the answer at once');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body, 'どの猫？ → 黒猫');
+});
+
+test('a single multi-select question sends on enter with the checked set', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  ctrl.key(' ', {}); // ちゅ〜る on
+  assert.deepEqual(ctrl.get().question.checked[0], [0]);
+  ctrl.key('', {return: true}); // enter sends the checked set at once, without a Submit tab
+  await tick();
+  assert.equal(ctrl.get().question, null, 'sent at once, without a Submit tab');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body, '付け合わせは？ → ちゅ〜る');
+});
+
+test('a multi-select question refuses enter with nothing checked', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  ctrl.key('', {return: true}); // nothing checked: no send, no advance, no close
+  await tick();
+  assert.ok(ctrl.get().question, 'still open');
+  assert.equal(sent.length, 0, 'nothing sent');
+  const plain = await renderQuestion(ctrl);
+  assert.match(plain, /enter 送信（1 つ以上選択）/, 'the hint says a selection is needed');
+});
+
+test('there is no 送信 row: rows are options, type-something, chat', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.openQuestion(ASK);
+  assert.deepEqual(ctrl.questionRows(0).map(r => r.kind), ['option', 'option', 'type', 'chat']);
+  assert.deepEqual(ctrl.questionRows(1).map(r => r.kind), ['option', 'option', 'option', 'type', 'chat']);
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  const lines = (await renderQuestion(ctrl)).split('\n');
+  assert.ok(!lines.some(l => /^\s*(❯ )?送信\s*$/.test(l)), 'no standalone 送信 row in the render');
+});
+
+test('自分で書く… is numbered n+1, has a multi checkbox, and counts as an answer', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  let plain = await renderQuestion(ctrl);
+  assert.match(plain, /\[ \] 4\. 自分で書く…/, 'the 3-option question numbers type-something 4, unchecked');
+  ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true});
+  assert.equal(ctrl.get().question.index, 3, 'on the type-something row');
+  ctrl.key('4', {}); // the number key reaches type-something like any choice
+  assert.equal(ctrl.get().question.mode, 'type', 'digit 4 opens the typed answer');
+  ctrl.key('', {escape: true});
+  ctrl.key('', {return: true}); // enter on type-something also opens it
+  assert.equal(ctrl.get().question.mode, 'type');
+  ctrl.paste('自家製');
+  ctrl.key('', {return: true});
+  assert.equal(ctrl.get().question.custom[0], '自家製');
+  assert.equal(ctrl.get().question.answers[0], '自家製', 'the typed text counts as the answer');
+  plain = await renderQuestion(ctrl);
+  assert.match(plain, /\[✓\] 4\. 自分で書く…/, 'the typed answer checks the type-something box');
+  assert.match(plain, /enter 送信（1 件）/, 'the hint counts the typed answer');
+  ctrl.key('', {upArrow: true});
+  ctrl.key('', {return: true}); // enter on a choice sends the typed answer with the checked set (here, just it)
+  await tick();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].body, '付け合わせは？ → 自家製');
+});
+
+test('この件について話す sits below a separator and still closes without sending', async () => {
+  const {ctrl, sent} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  const plain = await renderQuestion(ctrl);
+  const lines = plain.split('\n');
+  const sep = lines.findIndex(l => l.replace(/[│\s]/g, '') === '─'.repeat(12));
+  const type = lines.findIndex(l => l.includes('4. 自分で書く…'));
+  const chat = lines.findIndex(l => l.includes('この件について話す'));
+  assert.ok(sep > type && chat > sep, 'chat is below the separator line (type ' + type + ', separator ' + sep + ', chat ' + chat + ')');
+  assert.ok(!/^\s*(❯ )?\d+\. この件について話す/m.test(plain), 'chat has no choice number');
+  ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true}); ctrl.key('', {downArrow: true});
+  assert.equal(ctrl.get().question.index, 4, 'down moves past the separator to chat');
+  ctrl.key('', {return: true});
+  assert.equal(ctrl.get().question, null, 'chat closes the picker');
+  assert.equal(sent.length, 0, 'chat sends nothing');
+});
+
+test('a multi-select question shows the （複数選択） mark, a single-select one does not', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[1]]});
+  assert.match(await renderQuestion(ctrl), /付け合わせは？（複数選択）/);
+  ctrl.openQuestion({questions: [ASK.questions[0]]});
+  const plain = await renderQuestion(ctrl);
+  assert.match(plain, /どの猫？/);
+  assert.ok(!plain.includes('（複数選択）'), 'no mark on a single-select question: ' + plain);
+});
+
+test('a single question renders with no tab row', async () => {
+  const {ctrl} = await questionCtrl();
+  ctrl.openQuestion({questions: [ASK.questions[0]]});
+  const plain = await renderQuestion(ctrl);
+  assert.ok(!plain.includes('✓ 送信'), 'no Submit tab label: ' + plain);
+  assert.ok(!plain.includes('[ ] 猫'), 'no question tab either');
+  assert.match(plain, /どの猫？/, 'the question itself still shows');
+});
+
+test('questions without a header of their own get the short 質問 n tab label', async () => {
+  const {ctrl} = await questionCtrl();
+  const opts = [{label: 'はい', description: null, preview: null}, {label: 'いいえ', description: null, preview: null}];
+  // No header at all, and the production fallback (header copied from the question text).
+  for (const questions of [
+    [{question: '見出しなしの質問は？', multi: false, options: opts}, {question: '二つ目はどうする？', multi: true, options: opts}],
+    [{header: '見出しなしの質問は？', question: '見出しなしの質問は？', multi: false, options: opts}, {header: '二つ目はどうする？', question: '二つ目はどうする？', multi: true, options: opts}],
+  ]) {
+    ctrl.openQuestion({questions});
+    const plain = await renderQuestion(ctrl);
+    assert.match(plain, /質問 1/, 'the first tab is the short label');
+    assert.match(plain, /質問 2/, 'the second tab is the short label');
+    assert.equal(plain.split('見出しなしの質問は？').length - 1, 1, 'the question text is shown once, not in the tab and the body');
+    ctrl.closeQuestion();
+  }
+});
+
+test('the question hint line fits 79 columns in every mode (80-column render)', async () => {
+  const {width} = require('../src/tui/term.js');
+  const hintOf = async ctrl => {
+    const lines = (await renderQuestion(ctrl)).split('\n').filter(l => l.trim());
+    return lines[lines.length - 1];
+  };
+  const modes = [];
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion(ASK); modes.push(['single-select, several questions', await hintOf(ctrl), true, '↑↓ 移動']); }
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion(ASK); ctrl.key('', {return: true}); modes.push(['multi-select, several questions, nothing checked', await hintOf(ctrl), true, 'space 切替']); }
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion(ASK); ctrl.key('', {return: true}); ctrl.key(' ', {}); ctrl.key('', {downArrow: true}); ctrl.key(' ', {}); modes.push(['multi-select, several questions, 2 checked', await hintOf(ctrl), true, 'space 切替']); }
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion(ASK); ctrl.key('', {tab: true}); ctrl.key('', {tab: true}); modes.push(['Submit tab', await hintOf(ctrl), true, '↑↓ 移動']); }
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion({questions: [ASK.questions[0]]}); modes.push(['single-select, one question', await hintOf(ctrl), false, '↑↓ 移動']); }
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion({questions: [ASK.questions[1]]}); modes.push(['multi-select, one question, nothing checked', await hintOf(ctrl), false, 'space 切替']); }
+  { const {ctrl} = await questionCtrl(); ctrl.openQuestion({questions: [ASK.questions[1]]}); ctrl.key(' ', {}); ctrl.key('', {downArrow: true}); ctrl.key(' ', {}); modes.push(['multi-select, one question, 2 checked', await hintOf(ctrl), false, 'space 切替']); }
+  for (const [name, hint, hasTab, start] of modes) {
+    assert.ok(width(hint) <= 79, name + ': hint is ' + width(hint) + ' columns: ' + hint);
+    assert.match(hint, new RegExp('^ {2}' + start), name + ': the hint is a single line from its start: ' + hint);
+    assert.match(hint, /esc 閉じる$/, name + ': the hint ends on the same line (no wrap): ' + hint);
+    assert.equal(hint.includes('tab 質問'), hasTab, name + ': the tab part shows only with several questions');
+  }
+  // These modes have several questions: enter moves on to the next question / the send tab.
+  assert.match(modes[1][1], /enter 次へ（1 つ以上選択）/, 'the unchecked multi hint says a selection is needed');
+  assert.match(modes[2][1], /enter 次へ（2 件）/, 'the checked multi hint shows the count');
+  // The English hints are longer: the widest mode (multi, several questions,
+  // nothing checked) must fit too.
+  const i18n = require('../src/i18n');
+  try {
+    i18n.setLang('en', {save: false});
+    const {ctrl} = await questionCtrl(); ctrl.openQuestion(ASK); ctrl.key('', {return: true});
+    const hint = await hintOf(ctrl);
+    assert.ok(width(hint) <= 79, 'English hint is ' + width(hint) + ' columns: ' + hint);
+    assert.match(hint, /^ {2}space toggle/, 'the English hint is a single line from its start: ' + hint);
+    assert.match(hint, /esc close$/, 'the English hint ends on the same line: ' + hint);
+    assert.match(hint, /pick 1\+/, 'the English unchecked hint says a selection is needed');
+    assert.ok(hint.includes('tab question'), 'the English several-question hint keeps the tab part');
+  } finally { i18n.setLang('ja', {save: false}); }
+});
+
+test('ctrl+shift+v and a right-click paste from the clipboard; other clicks are swallowed', async () => {
+  const {ctrl} = await questionCtrl();
+  let fromClipboard = 0; ctrl.pasteFromClipboard = () => { fromClipboard++; };
+  ctrl.key('V', {ctrl: true, shift: true});
+  assert.equal(fromClipboard, 1, 'ctrl+shift+v goes to the clipboard paste');
+  ctrl.key('\x1b[<2;10;5M', {});
+  assert.equal(fromClipboard, 2, 'right-button press pastes');
+  ctrl.key('\x1b[<0;10;5M', {});
+  ctrl.key('\x1b[<2;10;5m', {}); // release
+  assert.equal(fromClipboard, 2, 'left clicks and releases do nothing');
+  assert.equal(ctrl.get().text, '', 'mouse sequences never reach the composer');
+});
+
+test('ctrl+shift+v and right-click insert clipboard text through paste() (sanitised)', async () => {
+  const clip = require('../src/clipboard');
+  const origImages = clip.clipboardImages, origText = clip.clipboardText;
+  let textReads = 0;
+  clip.clipboardImages = async () => ({files: [], error: null});
+  clip.clipboardText = async () => { textReads++; return 'hello\x1b[31m world\r\nnext'; };
+  try {
+    const {ctrl} = await questionCtrl();
+    ctrl.key('V', {ctrl: true, shift: true});
+    for (let i = 0; i < 20 && !ctrl.get().text; i++) await tick();
+    assert.equal(ctrl.get().text, 'hello world\nnext', 'ctrl+shift+v text went through paste(): escapes stripped, CRLF normalised');
+    assert.equal(textReads, 1);
+    ctrl.setText('');
+    ctrl.key('\x1b[<2;10;5M', {});
+    for (let i = 0; i < 20 && !ctrl.get().text; i++) await tick();
+    assert.equal(ctrl.get().text, 'hello world\nnext', 'a right-click pastes the same way');
+    assert.equal(textReads, 2);
+  } finally { clip.clipboardImages = origImages; clip.clipboardText = origText; }
 });

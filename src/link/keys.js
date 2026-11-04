@@ -4,6 +4,8 @@
 // entry of the DPAPI secure-store (src/secure-store.js), as JSON with base64 fields;
 // the private keys never touch a plain file.
 const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const store = require('../secure-store');
 
 const FILE = 'link.enc';
@@ -94,9 +96,57 @@ function loadOrCreateLinkKeys({file = FILE, store: s = store} = {}) {
   // and orphan every pairing.
   const saved = s.load(file);
   if (saved !== null && saved !== undefined) return readSaved(saved);
+  return withCreateLock(s, file, () => createLinkKeys(file, s));
+}
+
+function createLinkKeys(file, s) {
+  // Re-check under the lock: another process may have created the entry
+  // while this one waited, and then its identity is the one to use.
+  const now = s.load(file);
+  if (now !== null && now !== undefined) return readSaved(now);
   const keys = {noise: rawPair('x25519'), relay: rawPair('ed25519')};
   s.save(file, {noise: encodePair(keys.noise), relay: encodePair(keys.relay)});
-  return {keys, pcId: pcIdFor(keys.relay.publicKey)};
+  const mine = {keys, pcId: pcIdFor(keys.relay.publicKey)};
+  // Verify what actually landed (audit c30 #3): if a racing first-run process
+  // saved after us — one that could not take the lock, e.g. a store with no
+  // file path — the stored entry is what every later process will load, so
+  // adopt it instead of running for this process's lifetime on an identity
+  // that is not on disk (a phone pairing to it would be orphaned on restart).
+  let stored;
+  try { stored = s.load(file); } catch { stored = undefined; }
+  if (stored !== null && stored !== undefined) {
+    const winner = readSaved(stored);
+    if (winner.pcId !== mine.pcId) return winner;
+  }
+  return mine;
+}
+
+// Inter-process lock around first creation (same shape as config.withLock):
+// two muser processes started for the first time at once both saw "no entry",
+// generated different permanent identities, and the loser's pairings were
+// orphaned when only the winner's save survived (audit c30 #3). The lock
+// file carries an ownership token and only its owner unlinks it; a lock older
+// than 5 s is taken to be left by a crashed process. A store that cannot name
+// a file (the test fakes) skips the lock — createLinkKeys' re-read is the
+// safety net there. The critical section is one DPAPI save (~0.4 s), so a
+// 10 s wait is generous; past it, creation proceeds unlocked rather than
+// never starting.
+function withCreateLock(s, file, fn) {
+  let lock = null;
+  try { if (typeof s.file === 'function') lock = s.file(file) + '.create.lock'; } catch { lock = null; }
+  if (!lock) return fn();
+  const token = crypto.randomBytes(16).toString('hex'), until = Date.now() + 10000;
+  try { fs.mkdirSync(path.dirname(lock), {recursive: true}); } catch {}
+  for (;;) {
+    try { const fd = fs.openSync(lock, 'wx'); try { fs.writeSync(fd, token); } finally { fs.closeSync(fd); } break; }
+    catch (e) {
+      if (!['EEXIST', 'EPERM', 'EBUSY', 'EACCES'].includes(e.code)) return fn();
+      if (Date.now() > until) return fn();
+      try { if (Date.now() - fs.statSync(lock).mtimeMs > 5000) { fs.unlinkSync(lock); continue; } } catch { /* lock vanished mid-check: retry */ }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  }
+  try { return fn(); } finally { try { if (fs.readFileSync(lock, 'utf8') === token) fs.unlinkSync(lock); } catch {} }
 }
 
 module.exports = {FILE, loadOrCreateLinkKeys, loadLinkKeys, signRelay, verifyRelay, pcIdFor, ed25519PrivateKey, ed25519PublicKey};

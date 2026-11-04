@@ -30,11 +30,11 @@ class MuseSteps {
     if (agentId) turn.muse.agentId = agentId;
     if (messageId) turn.muse.messageId = messageId;
     this.turns.add(turn); this.start();
-    clearTimeout(this.soon); this.soon = setTimeout(() => void this.read(), 150);
+    clearTimeout(this.soon); this.soon = setTimeout(() => void this.read().catch(() => {}), 150); // c15 #8: a timer-path read must never surface as an unhandled rejection
   }
   start() {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.read(), POLL_MS); this.timer.unref?.();
+    this.timer = setInterval(() => void this.read().catch(() => {}), POLL_MS); this.timer.unref?.(); // c15 #8: as above
   }
   // At the end of a turn: one last read, then whatever was not shown yet. The reply is already on
   // screen by then, so more than one late step becomes a single "+N steps" line (all of them still
@@ -64,7 +64,13 @@ class MuseSteps {
     // few minutes) push the turn's own item out of the newest ten, and its steps then only showed
     // up, all at once, after the reply.
     try { feed = await this.client.request('GET', '/activity', {limit: 30, capabilities: CAPS}); } catch { return; }
-    const items = (feed?.days || []).flatMap(d => d.activities || []);
+    // c15 #8: one malformed feed item (a null day / activity / action, a details
+    // of the wrong shape) used to throw out of the whole fetch — every turn lost
+    // its steps on every poll while that item stayed in the feed. Non-object
+    // entries are dropped at each level, and each turn is processed in its own
+    // try so a bad turn (or a throwing onStep) cannot stop the others.
+    const obj = x => x && typeof x === 'object' ? x : null;
+    const items = (Array.isArray(feed?.days) ? feed.days : []).flatMap(d => Array.isArray(obj(d)?.activities) ? d.activities : []).filter(x => obj(x) && obj(x.details));
     // Group the feed by agent id once, instead of filtering the whole feed per turn.
     const byAgent = new Map();
     for (const x of items) {
@@ -74,14 +80,16 @@ class MuseSteps {
       byAgent.get(aid).push(x);
     }
     for (const t of turns) {
+      try {
       const actions = (byAgent.get(t.muse.agentId) || [])
-        .flatMap(x => x.details.goal_actions || []).filter(a => String(a.id || '').includes(t.muse.messageId))
+        .flatMap(x => Array.isArray(x.details.goal_actions) ? x.details.goal_actions : []).filter(a => a && typeof a === 'object' && String(a.id || '').includes(t.muse.messageId))
         .sort((a, b) => (a.action_index ?? 0) - (b.action_index ?? 0));
       t.muse.pending = actions.filter(a => !t.muse.shown.has(a.id));
       const running = t.muse.pending.find(a => !TERMINAL.has(String(a.status).toUpperCase()));
       t.muse.running = running ? clean(running.title).replace(/^Running:\s*/i, '') : '';
       if (!t.muse.finishing) for (const a of t.muse.pending) if (TERMINAL.has(String(a.status).toUpperCase())) this.show(t, t.worker, a, false);
       this.onStep({worker: t.worker, running: t.muse.running});
+      } catch { /* this turn only: the next poll retries it, the others already ran */ }
     }
   }
   show(turn, worker, a, unfinished) {

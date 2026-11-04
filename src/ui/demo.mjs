@@ -23,22 +23,41 @@ class DemoAgent extends EventEmitter {
     this.client = {status: 'demo'}; this.device = {connected: true};
     this.approver = async () => ({allow: true});
   }
+  // The stop check lives here, not only inside stream(): an interrupt during the
+  // tool sequence (or while an approval is open) must end the turn before the next
+  // approval dialog opens or the next tool runs (deep audit c18 #2).
+  checkStopped() { if (this.stopped) throw Object.assign(new Error(t('中断しました')), {name: 'AbortError'}); }
   async stream(id, text) {
     let shown = '';
-    for (const ch of text) { if (this.stopped) throw Object.assign(new Error(t('中断しました')), {name: 'AbortError'}); shown += ch; this.emit('text', {id, text: shown}); await sleep(18); }
+    for (const ch of text) { this.checkStopped(); shown += ch; this.emit('text', {id, text: shown}); await sleep(18); }
     this.emit('message-done', {id, text});
   }
   async tool(command, params, view, {ask, ms = 600} = {}) {
+    this.checkStopped();
     const call = {id: String(Math.random()), command, params, kind: ask ? (command === 'system.run' ? 'exec' : 'edit') : 'read', summary: params.path || params.command || params.pattern || ''};
     if (ask) {
       this.emit('tool-start', call);
       const answer = await this.approver({...call, demoPreview: view});
+      this.checkStopped();
       if (!answer.allow) { this.emit('tool-end', {...call, ok: false, declined: true, error: 'The user declined this' + (answer.reason ? ': ' + answer.reason : '.')}); return false; }
     } else this.emit('tool-start', call);
-    if (command === 'system.run') for (const l of view.tail) { await sleep(250); this.emit('tool-output', {id: call.id, chunk: l + '\n'}); }
+    if (command === 'system.run') for (const l of view.tail) { this.checkStopped(); await sleep(250); this.emit('tool-output', {id: call.id, chunk: l + '\n'}); }
     await sleep(ms);
+    this.checkStopped();
     this.emit('tool-end', {...call, ok: true, view, output: (view.tail || []).join('\n')});
     return true;
+  }
+  // An approval was declined: the scripted success story must not play out — the
+  // edit did not happen and the tests did not run, so neither may be claimed
+  // (deep audit c18 #1). The unfinished todo goes back to pending and the turn
+  // ends with a plain cancellation instead of the "fixed, tests passed" reply.
+  async declined(todos, start) {
+    for (const td of todos) if (td.status === 'in_progress') td.status = 'pending';
+    this.emit('todos', [...todos]);
+    const text = t('中止しました。');
+    await this.stream('m2', text + '\n');
+    this.emit('turn-end', {ok: true, ms: Date.now() - start});
+    return {text};
   }
   async send() {
     this.stopped = false; const start = Date.now();
@@ -52,9 +71,11 @@ class DemoAgent extends EventEmitter {
       await this.tool('code.grep', {pattern: 'Math\\.floor'}, {count: 3});
       todos[0].status = 'completed'; todos[1].status = 'in_progress'; this.emit('todos', [...todos]);
       const diff = lineDiff('export const add = (a, b) => a + b;\nexport const div = (a, b) => Math.floor(a / b);\n', 'export const add = (a, b) => a + b;\nexport const div = (a, b) => b === 0 ? null : Math.round(a / b);\n');
-      await this.tool('code.edit', {path: 'src/math.js'}, {diff}, {ask: true});
+      const edited = await this.tool('code.edit', {path: 'src/math.js'}, {diff}, {ask: true});
+      if (!edited) return await this.declined(todos, start);
       todos[1].status = 'completed'; todos[2].status = 'in_progress'; this.emit('todos', [...todos]);
-      await this.tool('system.run', {command: 'npm test'}, {exit: 0, tail: ['> demo@1.0.0 test', '> node --test', '✔ div rounds (1.2ms)', '✔ div by zero (0.4ms)', 'ℹ pass 2  ℹ fail 0']}, {ask: true, ms: 300});
+      const tested = await this.tool('system.run', {command: 'npm test'}, {exit: 0, tail: ['> demo@1.0.0 test', '> node --test', '✔ div rounds (1.2ms)', '✔ div by zero (0.4ms)', 'ℹ pass 2  ℹ fail 0']}, {ask: true, ms: 300});
+      if (!tested) return await this.declined(todos, start);
       todos[2].status = 'completed'; this.emit('todos', [...todos]);
       await this.stream('m2', reply2());
       this.emit('turn-end', {ok: true, ms: Date.now() - start});

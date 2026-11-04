@@ -35,7 +35,34 @@ function pidAlive(pid) {
 // kept processing it — inviting a duplicate send. Plain requests get a
 // generous default (longer when a body is uploaded); only the probe below
 // passes a short timeout explicitly.
-async function request(info, method, p, body, timeoutMs) {
+// c21 #10: response bodies are capped. The old `await res.text()` buffered the whole
+// body with only the timeout as a limit, so a wrong/abnormal responder on loopback
+// (fast enough to push hundreds of MB inside it) could inflate the client until it
+// died — and for the probe, the pid check only happens after that full read. The
+// probe's cap is small (it only needs the server-info JSON); plain requests get a
+// generous one (a /api/state snapshot is legitimately large, but not unbounded).
+const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const PROBE_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+async function readBodyCapped(res, maxBytes) {
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = []; let total = 0;
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) { try { await reader.cancel(); } catch {} const e = new Error('response too large (over ' + maxBytes + ' bytes)'); e.code = 'RESPONSE_TOO_LARGE'; throw e; }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks.map(c => Buffer.from(c))).toString('utf8');
+  }
+  const text = await res.text();
+  if (text.length > maxBytes) { const e = new Error('response too large (over ' + maxBytes + ' bytes)'); e.code = 'RESPONSE_TOO_LARGE'; throw e; }
+  return text;
+}
+
+async function request(info, method, p, body, timeoutMs, maxBytes = MAX_RESPONSE_BYTES) {
   if (timeoutMs === undefined) timeoutMs = body !== undefined ? 120000 : 30000;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -46,7 +73,7 @@ async function request(info, method, p, body, timeoutMs) {
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: ctrl.signal,
     });
-    const text = await res.text();
+    const text = await readBodyCapped(res, maxBytes);
     let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
     return {status: res.status, json};
   } finally { clearTimeout(timer); }
@@ -62,26 +89,48 @@ async function probeServer(info) {
   if (!info || !pidAlive(info.pid)) return null;
   for (const timeoutMs of [2000, 3000, 5000]) {
     let r;
-    try { r = await request(info, 'GET', '/api/server', undefined, timeoutMs); }
+    try { r = await request(info, 'GET', '/api/server', undefined, timeoutMs, PROBE_MAX_RESPONSE_BYTES); }
     catch { continue; } // a timeout or a refused moment: retry before calling it dead
     if (r.status !== 200) return null; // it answered and refused us: not our server
-    if (r.json && typeof r.json.pid === 'number' && r.json.pid !== info.pid) return null;
-    return r.json;
+    // c21 #9: the pid check used to fire only when the answer carried a NUMERIC pid,
+    // so a different process answering 200 with no pid / a string pid was accepted as
+    // this server — and attachSession then presented the Bearer token (and cwd) to it.
+    // The real GuiServer's /api/server always carries its numeric pid (serverInfo()),
+    // so identity is now required, not optional: a numeric mismatch is final, and a
+    // 200 without a usable pid (empty / non-JSON body included) is retried like a
+    // slow answer and then reported as no server, never accepted on faith.
+    if (r.json && typeof r.json.pid === 'number') return r.json.pid === info.pid ? r.json : null;
+    continue;
   }
   return null;
 }
 
 // Open a conversation on the running server: an existing session by id when one is
 // named, otherwise a new conversation in the given folder.
-async function attachSession(info, {cwd, account, mode, sessionId} = {}) {
+async function attachSession(info, {cwd, account, mode, sessionId, maxAgents, maxAgentsTotal, focusEnabled, noFocus, agentLimits} = {}) {
+  // First audit #32 (discovery part): the attach used to carry only cwd/account/mode,
+  // so a client's agent limits (--max-agents / --max-agents-total) and Focus on/off
+  // (--no-focus) silently did nothing for a conversation created on the resident
+  // server. They are forwarded now, when the caller supplies them (undefined fields
+  // are omitted, so older callers see the exact old body). Whether the server
+  // honours them is the gui-server / sessions-host side of the same finding.
+  const extra = {};
+  const effMax = maxAgents ?? agentLimits?.maxAgents;
+  const effTotal = maxAgentsTotal ?? agentLimits?.maxAgentsTotal;
+  if (effMax !== undefined) extra.maxAgents = effMax;
+  if (effTotal !== undefined) extra.maxAgentsTotal = effTotal;
+  if (focusEnabled !== undefined) extra.focusEnabled = focusEnabled;
+  // bin/muser.js passes the flag in its own shape ({noFocus: o.noFocus}): forward it
+  // as given AND as focusEnabled, so the server side can take either spelling.
+  if (noFocus !== undefined) { extra.noFocus = noFocus; if (extra.focusEnabled === undefined) extra.focusEnabled = !noFocus; }
   if (sessionId) {
-    const r = await request(info, 'POST', '/api/sessions/' + encodeURIComponent(sessionId) + '/open', {});
+    const r = await request(info, 'POST', '/api/sessions/' + encodeURIComponent(sessionId) + '/open', extra);
     if (r.status !== 200) throw new Error(r.json?.error || ('server answered ' + r.status));
     return r.json;
   }
-  const r = await request(info, 'POST', '/api/sessions', {cwd, account, mode});
+  const r = await request(info, 'POST', '/api/sessions', {cwd, account, mode, ...extra});
   if (r.status !== 201) throw new Error(r.json?.error || ('server answered ' + r.status));
   return r.json;
 }
 
-module.exports = {serverFile, readServer, guiFile, readGui, pidAlive, probeServer, attachSession, request};
+module.exports = {serverFile, readServer, guiFile, readGui, pidAlive, probeServer, attachSession, request, MAX_RESPONSE_BYTES, PROBE_MAX_RESPONSE_BYTES};

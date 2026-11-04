@@ -43,26 +43,38 @@ test('a run that ends without its result still says so (process exit)', () => {
   assert.equal(v.exit, 3);
 });
 
-test('the state file is written while a reader has it open', async () => {
+test('the state file is written while a reader has it open', {timeout: 30000}, async () => {
   const {spawn} = require('node:child_process');
   const f = path.join(tmp(), 'st.json');
   const s = new ExecStatus({file: f, prompt: 'x'}).start();
   const holder = spawn(process.execPath, ['-e', "const fs=require('fs');const fd=fs.openSync(process.argv[1],'r');console.log('open');setTimeout(()=>fs.closeSync(fd),300);", f]);
-  await new Promise(r => holder.stdout.once('data', r));
-  s.finish({exit: 0, ok: true});
-  await new Promise(r => holder.on('exit', r));
+  // Both waits get a deadline (t3 #10): a holder that never starts or never
+  // exits must fail this test, not hang the whole file.
+  const within = (p, ms, what) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timed out: ' + what)), ms))]);
+  try {
+    await within(new Promise(r => holder.stdout.once('data', r)), 10000, 'the holder to open the file');
+    s.finish({exit: 0, ok: true});
+    await within(new Promise(r => holder.on('exit', r)), 10000, 'the holder to exit');
+  } finally { try { holder.kill(); } catch {} }
   assert.equal(read(f).state, 'done');
 });
 
 test('only the newest default status files are kept', () => {
   fs.mkdirSync(dir(), {recursive: true});
-  for (let i = 0; i < KEEP + 5; i++) fs.writeFileSync(path.join(dir(), '20260101-0000' + String(i).padStart(2, '0') + '-1.json'), '{}');
+  // dir() is the shared default status folder: clean up every file this test
+  // creates (t3 #9) — the survivors used to leak into later tests' prune
+  // windows and couple them to this test's leftovers.
+  const names = [];
+  for (let i = 0; i < KEEP + 5; i++) { const n = '20260101-0000' + String(i).padStart(2, '0') + '-1.json'; names.push(n); fs.writeFileSync(path.join(dir(), n), '{}'); }
+  names.push('mine.json');
   fs.writeFileSync(path.join(dir(), 'mine.json'), '{}'); // not a default name: left alone
-  prune();
-  const left = fs.readdirSync(dir());
-  assert.equal(left.filter(n => /^\d{8}-\d{6}-\d+\.json$/.test(n)).length, KEEP);
-  assert.ok(left.includes('mine.json'));
-  assert.ok(!left.includes('20260101-000000-1.json'), 'the oldest went first');
+  try {
+    prune();
+    const left = fs.readdirSync(dir());
+    assert.equal(left.filter(n => /^\d{8}-\d{6}-\d+\.json$/.test(n)).length, KEEP);
+    assert.ok(left.includes('mine.json'));
+    assert.ok(!left.includes('20260101-000000-1.json'), 'the oldest went first');
+  } finally { for (const n of names) fs.rmSync(path.join(dir(), n), {force: true}); }
 });
 
 test('what the terminal shows is kept as shown, with todos, progress, Muse steps and the tool log as data', () => {

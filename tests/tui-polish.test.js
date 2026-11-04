@@ -39,6 +39,23 @@ test('table lines inside a code fence stay code', async () => {
   assert.equal(strip(rows[1].text), '| a | b |');
 });
 
+test('a narrow terminal with long cells: the table still sets as a whole, nothing dropped', async () => {
+  // t8 #15: the width-80 table test says nothing about narrow widths or long
+  // cells. Today's design decision is that md sets a table at its natural
+  // width (the view layer owns the terminal fit), so what must hold at ANY
+  // width is the whole-table invariant: borders aligned, every row the same
+  // width, and no cell content silently cut by the markdown layer.
+  const {createMd} = await import('../src/ui/md.mjs');
+  const LONG = ['| コマンド | 説明 |', '|:---|:---|', '| `npm run build:production` | とても長い説明文ですこれはテストです |', '| `x` | 短い |'];
+  const rows = createMd(40).rows(LONG).map(r => r.text);
+  assert.equal(rows.length, 4);
+  const at = borders(rows[0]);
+  for (const r of rows) assert.deepEqual(borders(r), at, 'column borders line up at width 40: ' + strip(r));
+  assert.equal(new Set(rows.map(r => width(r))).size, 1, 'every row is as wide at width 40');
+  assert.ok(strip(rows[2]).includes('npm run build:production'), 'the long command cell survives whole');
+  assert.ok(strip(rows[2]).includes('とても長い説明文ですこれはテストです'), 'the long description cell survives whole');
+});
+
 test('a streamed table is held in the live area until it ends, then printed aligned', async () => {
   const {ctrl} = await setup();
   const reply = 'まえ\n' + TABLE.join('\n') + '\nあと';
@@ -68,7 +85,11 @@ test('on a 50-column terminal the footer is one row and the wordmark keeps its t
   const live = show(h(Live, {s: ctrl.get(), ctrl, W: 49}), 50).split('\n');
   const foot = live.filter(l => l.trim()).pop();
   assert.match(foot, /毎回確認.*● muser CLI/, 'mode and status lane on the one last row: ' + foot);
+  // Every rendered line is measured, not just the footer's shape (t8 #15):
+  // nothing in the live area may exceed the 50-column terminal.
+  for (const l of live) assert.ok(width(l) <= 50, 'live line fits 50 columns (' + width(l) + '): ' + l);
   const banner = show(h(Entry, {e: {id: 1, type: 'banner'}, ctrl, W: 49}), 50).split('\n');
+  for (const l of banner) assert.ok(width(l) <= 50, 'banner line fits 50 columns (' + width(l) + '): ' + l);
   const top = banner.findIndex(l => l.includes('█▀▄▀█'));
   assert.match(banner[top + 1], /█ ▀ █/, 'the second row of the wordmark is right under the first');
 });

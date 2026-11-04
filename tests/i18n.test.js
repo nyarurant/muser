@@ -27,7 +27,7 @@ test('every t(\'…\') string in bin/ and src/ has an English entry with the sam
 // Strings passed to t() through a variable (help lines, command tables, mode labels) escape the
 // literal scan above: t(l) in bin/muser.js, t(d) / t(MODE_HELP[m]) / t(LABELS[m]) in the UI.
 // They are checked here by reading the tables themselves.
-test('variable-passed strings (HELP_LINES, COMMANDS, MODE_HELP, policy LABELS) have English entries', async () => {
+test('variable-passed strings (HELP_LINES, COMMANDS, MODE_HELP, policy LABELS, agent-types, onboard steps) have English entries', async () => {
   const root = path.join(__dirname, '..'), missing = [], badVars = [];
   const vars = s => [...s.matchAll(/\{(\w+)\}/g)].map(x => x[1]).sort().join(',');
   const check = (where, ja) => {
@@ -48,6 +48,15 @@ test('variable-passed strings (HELP_LINES, COMMANDS, MODE_HELP, policy LABELS) h
   for (const m of modeBlock.matchAll(/:\s*'((?:[^'\\]|\\.)*)'/g)) check('MODE_HELP', unquote(m[1]));
   // policy LABELS are plain data: require them directly.
   for (const label of Object.values(require('../src/policy').LABELS)) check('LABELS', label);
+  // t5 #9 (deep audit): two more variable-passed tables the four above missed —
+  // agent-type descriptions reach t() as t(v.description) in controller.mjs
+  // (the table itself is agent-types' BUILTIN), and onboard step labels reach
+  // it as t(s.label) (the table is stepsFor's return). A new builtin type or
+  // onboard step added without an English entry used to pass every scan.
+  for (const [name, def] of Object.entries(require('../src/agent-types').BUILTIN)) check('agent-types ' + name, def.description);
+  const {stepsFor} = require('../src/tui/onboard');
+  for (const needLogin of [true, false]) for (const deviceNeeded of [true, false])
+    for (const s of stepsFor(needLogin, deviceNeeded)) check('onboard step ' + s.key, s.label);
   assert.deepEqual(missing, [], 'add these to src/i18n/en.js');
   assert.deepEqual(badVars, [], 'placeholders differ between Japanese and English');
 });

@@ -1,6 +1,8 @@
 'use strict';
 // The muser wordmark: a two-row block font with a violet -> pink gradient across it.
-const on = process.stdout.isTTY && require('../settings').switchValue('color');
+// Same condition as term.js (fix2 c26 #10): under `muser serve` there is no TTY but
+// MUSER_SGR=1 turns SGR on for the GUI, and the wordmark used to stay colourless there.
+const on = (process.stdout.isTTY || process.env.MUSER_SGR === '1') && require('../settings').switchValue('color');
 const GLYPHS = {
   m: ['█▀▄▀█', '█ ▀ █'], u: ['█ █', '█▄█'], s: ['█▀▀', '▄▄█'], e: ['█▀▀', '██▄'], r: ['█▀█', '█▀▄'],
 };

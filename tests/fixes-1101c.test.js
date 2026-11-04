@@ -6,6 +6,17 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {execFileSync} = require('node:child_process');
+
+// Data-folder isolation, the same header agent.test.js / turn-usage.test.js carry
+// (audit #29): this file builds real Agents and Controllers and runs real turns,
+// which read and write sessions / transcripts / config / permissions / history.
+// `npm test` isolates via tests/setup.mjs, but a bare `node --test
+// tests/fixes-1101c.test.js` skips that file and would otherwise touch the
+// user's real data — so point every folder at a throwaway one BEFORE loading
+// any src module.
+process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fixes-1101c-test-data-'));
+process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fixes-1101c-test-home-'));
+
 const {TOOLS} = require('../src/tools');
 const BS = String.fromCharCode(92);
 
@@ -52,7 +63,14 @@ test('an unknown short option before the prompt is an error; -v is the version; 
   const run = (...args) => { try { return execFileSync(process.execPath, [bin, ...args], {encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, env: {...process.env, MUSER_LANG: 'en', MUSER_CLIENT: ''}}); } catch (e) { return String(e.stdout) + String(e.stderr); } };
   assert.match(run('-v'), /^\d+\.\d+\.\d+/);
   assert.match(run('-x'), /Unknown option: -x/);
-  assert.doesNotMatch(run('fix', 'the', '-x', 'flag'), /Unknown option/);
+  // t7 #14 (deep audit): doesNotMatch alone was vacuous — run() swallows
+  // every failure (crash, 30 s timeout), so a bin that died for an unrelated
+  // reason passed too. Require the positive evidence that the words were
+  // taken as a PROMPT: startup proceeds to interactive mode and refuses
+  // only because stdin is not a terminal.
+  const asPrompt = run('fix', 'the', '-x', 'flag');
+  assert.doesNotMatch(asPrompt, /Unknown option/);
+  assert.match(asPrompt, /Interactive mode needs a terminal/, 'the words after the first were treated as a prompt, not options: ' + asPrompt.slice(0, 200));
 });
 
 test('paths in quotes and ~ paths resolve as a shell would take them', t => {
@@ -262,7 +280,7 @@ test('--mode takes --mode=value and the same spellings as /mode', () => {
 
 test('a broken permissions.json is moved aside, not overwritten with one folder', t => {
   const dir = tmp(t), f = path.join(dir, 'permissions.json');
-  const was = process.env.MUSER_PERMISSIONS_FILE; process.env.MUSER_PERMISSIONS_FILE = f; t.after(() => { process.env.MUSER_PERMISSIONS_FILE = was; });
+  const was = process.env.MUSER_PERMISSIONS_FILE; process.env.MUSER_PERMISSIONS_FILE = f; t.after(() => { if (was === undefined) delete process.env.MUSER_PERMISSIONS_FILE; else process.env.MUSER_PERMISSIONS_FILE = was; }); // t7 #13: assigning undefined would store the STRING 'undefined' and point later tests at a file literally named that
   const broken = '{"version":1,"folders":{"c:\\a":{"mode":"bypass","allow":["edit"]},}}';
   fs.writeFileSync(f, broken);
   const permissions = require('../src/permissions');
@@ -297,7 +315,10 @@ test('a !command\'s whole output can be read with /output', async t => {
 test('a !command during a turn keeps its own row; Muse\'s running call keeps its row', async t => {
   const {ctrl, a} = await controller(t);
   const done = ctrl.bang('Start-Sleep -Milliseconds 1500; "bang done"');
-  await new Promise(r => setTimeout(r, 100));
+  // t7 #15 (deep audit): a fixed 100 ms wait for PowerShell to start flaked
+  // under load; poll for the bangRunning state itself (5 s cap).
+  for (let i = 0; i < 200 && !ctrl.s.bangRunning; i++) await new Promise(r => setTimeout(r, 25));
+  assert.ok(ctrl.s.bangRunning, 'the !command is running');
   a.emit('tool-start', {id: 'c1', command: 'code.grep', summary: 'TODO'});
   assert.equal(ctrl.s.bangRunning.call.user, true, 'the user\'s command is still on screen');
   await done;
@@ -308,7 +329,10 @@ test('a !command during a turn keeps its own row; Muse\'s running call keeps its
 test('esc stops a running !command', async t => {
   const {ctrl} = await controller(t);
   const t0 = Date.now(), done = ctrl.bang('Start-Sleep -Seconds 30');
-  await new Promise(r => setTimeout(r, 300));
+  // t7 #15: poll until the command is actually running before pressing esc
+  // (was a fixed 300 ms, which a slow PowerShell start outran).
+  for (let i = 0; i < 200 && !ctrl.s.bangRunning; i++) await new Promise(r => setTimeout(r, 25));
+  assert.ok(ctrl.s.bangRunning, 'the !command is running before esc');
   ctrl.key('', {escape: true});
   await done;
   assert.ok(Date.now() - t0 < 10000, 'stopped, not waited out: ' + (Date.now() - t0) + ' ms');

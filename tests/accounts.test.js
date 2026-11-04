@@ -26,36 +26,44 @@ test('accounts: the default account is always there, on the historic flat files'
 });
 
 test('accounts: add / resolve / remove, with per-account file layout', () => {
+  // The registry is shared by every test in this file: a failed assert midway
+  // must not leave the account (or the active selection) behind (t8 #2).
   const a = accounts.add('Second Account');
-  assert.equal(a.id, 'second-account');
-  const files = accounts.filesFor(a.id);
-  assert.equal(files.web, 'accounts/second-account/web.enc');
-  assert.equal(files.device, 'accounts/second-account/device.enc');
-  assert.equal(accounts.resolve('Second Account').id, a.id);
-  assert.equal(accounts.resolve('second').id, a.id);
-  assert.throws(() => accounts.add('second account'), /既にあります/);
-  // Login presence is per account: a file for this one says nothing about the default.
-  fs.mkdirSync(path.dirname(store.file(files.web)), {recursive: true});
-  fs.writeFileSync(store.file(files.web), 'x');
-  assert.equal(accounts.hasLogin(a.id), true);
-  accounts.setActive(a.id);
-  assert.equal(accounts.activeId(), a.id);
-  assert.throws(() => accounts.remove('default'), /削除できません/);
-  accounts.remove(a.id);
-  assert.equal(accounts.get(a.id), null);
-  assert.equal(accounts.hasLogin(a.id), false);
-  assert.equal(accounts.activeId(), 'default');
+  try {
+    assert.equal(a.id, 'second-account');
+    const files = accounts.filesFor(a.id);
+    assert.equal(files.web, 'accounts/second-account/web.enc');
+    assert.equal(files.device, 'accounts/second-account/device.enc');
+    assert.equal(accounts.resolve('Second Account').id, a.id);
+    assert.equal(accounts.resolve('second').id, a.id);
+    assert.throws(() => accounts.add('second account'), /既にあります/);
+    // Login presence is per account: a file for this one says nothing about the default.
+    fs.mkdirSync(path.dirname(store.file(files.web)), {recursive: true});
+    fs.writeFileSync(store.file(files.web), 'x');
+    assert.equal(accounts.hasLogin(a.id), true);
+    accounts.setActive(a.id);
+    assert.equal(accounts.activeId(), a.id);
+    assert.throws(() => accounts.remove('default'), /削除できません/);
+    accounts.remove(a.id);
+    assert.equal(accounts.get(a.id), null);
+    assert.equal(accounts.hasLogin(a.id), false);
+    assert.equal(accounts.activeId(), 'default');
+  } finally {
+    try { if (accounts.get(a.id)) accounts.remove(a.id); } catch {}
+    try { accounts.setActive('default'); } catch {}
+  }
 });
 
 test('accounts: saved jars stay apart per account', () => {
   const web = require('../src/web');
   const a = accounts.add('Jar Account');
-  const files = accounts.filesFor(a.id);
-  const jar = [{name: 's', value: 'v', domain: '.muse.ai', path: '/', expires: -1, secure: true}];
-  web.saveJar(jar, files.web);
-  assert.deepEqual(web.loadJar(files.web), jar);
-  assert.deepEqual(web.loadJar(), [], 'the default account jar is untouched');
-  accounts.remove(a.id);
+  try {
+    const files = accounts.filesFor(a.id);
+    const jar = [{name: 's', value: 'v', domain: '.muse.ai', path: '/', expires: -1, secure: true}];
+    web.saveJar(jar, files.web);
+    assert.deepEqual(web.loadJar(files.web), jar);
+    assert.deepEqual(web.loadJar(), [], 'the default account jar is untouched');
+  } finally { try { accounts.remove(a.id); } catch {} }
 });
 
 // ---- the selection policy ----
@@ -456,14 +464,20 @@ test('accounts: registry changes from several processes at once are not lost', a
 
 test('accounts: the Muse name is remembered per account; the old single name is the first account\'s', () => {
   const f = store.file('identity.json');
-  fs.mkdirSync(path.dirname(f), {recursive: true});
-  fs.writeFileSync(f, JSON.stringify({name: 'Kaguya'}));
-  assert.equal(accounts.museName('default'), 'Kaguya');
-  assert.equal(accounts.museName('second-account'), 'Muse', 'another account never shows the first one\'s Muse');
-  accounts.rememberMuseName('second-account', 'Mizuki');
-  assert.equal(accounts.museName('second-account'), 'Mizuki');
-  assert.equal(accounts.museName('default'), 'Kaguya');
-  fs.unlinkSync(f);
+  // Restore whatever was there before (or its absence) even when an assert
+  // fails: the identity file is shared by every test in this file (t8 #2).
+  const prior = fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : null;
+  try {
+    fs.mkdirSync(path.dirname(f), {recursive: true});
+    fs.writeFileSync(f, JSON.stringify({name: 'Kaguya'}));
+    assert.equal(accounts.museName('default'), 'Kaguya');
+    assert.equal(accounts.museName('second-account'), 'Muse', 'another account never shows the first one\'s Muse');
+    accounts.rememberMuseName('second-account', 'Mizuki');
+    assert.equal(accounts.museName('second-account'), 'Mizuki');
+    assert.equal(accounts.museName('default'), 'Kaguya');
+  } finally {
+    try { if (prior === null) fs.unlinkSync(f); else fs.writeFileSync(f, prior); } catch {}
+  }
 });
 
 test('pool: sameMuse finds another account logged in to the same Muse', async () => {
@@ -613,10 +627,19 @@ test('choose: at a fresh start, all-unknown usage keeps the current account (aud
 test('accounts: concurrent adds of one label register it exactly once (audit #37)', async () => {
   const {spawn} = require('node:child_process');
   const script = "const a=require(process.argv[1]);const fs=require('fs');try{a.add('Same Race Label');fs.writeFileSync(process.argv[3],'ok');}catch(e){fs.writeFileSync(process.argv[3],'err');}";
+  // Same hardening as the #256 race above (t8 #1): captured output, a bounded
+  // wait, and the child named in every failure — stdio:'ignore' with no timeout
+  // left a dead or hung child undiagnosable.
   const run = tag => new Promise((res, rej) => {
     const out = path.join(os.tmpdir(), 'muser-add-race-' + tag + '-' + Date.now() + '.txt');
-    const p = spawn(process.execPath, ['-e', script, path.join(__dirname, '..', 'src', 'accounts.js'), tag, out], {env: {...process.env}, stdio: 'ignore'});
-    p.on('exit', c => c === 0 ? res(out) : rej(new Error('child exit ' + c)));
+    const p = spawn(process.execPath, ['-e', script, path.join(__dirname, '..', 'src', 'accounts.js'), tag, out], {env: {...process.env}});
+    let log = '';
+    p.stdout.on('data', d => { log += d; });
+    p.stderr.on('data', d => { log += d; });
+    const timer = setTimeout(() => { try { p.kill(); } catch {} rej(new Error('add-race child ' + tag + ' did not exit within 120 s; output: ' + log.slice(-500))); }, 120000);
+    timer.unref?.();
+    p.on('error', e => { clearTimeout(timer); rej(new Error('add-race child ' + tag + ' failed to start: ' + e.message)); });
+    p.on('exit', c => { clearTimeout(timer); c === 0 ? res(out) : rej(new Error('add-race child ' + tag + ' exit ' + c + '; output: ' + log.slice(-500))); });
   });
   const outs = await Promise.all(['w', 'x', 'y', 'z'].map(run));
   try {
@@ -693,8 +716,14 @@ test('accounts: Muse names remembered from several processes at once are not los
   const {spawn} = require('node:child_process');
   const script = "const a=require(process.argv[1]);for(let i=0;i<15;i++)a.rememberMuseName('conc-'+process.argv[2],'Name-'+process.argv[2]);";
   const run = tag => new Promise((res, rej) => {
-    const p = spawn(process.execPath, ['-e', script, path.join(__dirname, '..', 'src', 'accounts.js'), tag], {env: {...process.env}, stdio: 'ignore'});
-    p.on('exit', c => c === 0 ? res() : rej(new Error('child exit ' + c)));
+    const p = spawn(process.execPath, ['-e', script, path.join(__dirname, '..', 'src', 'accounts.js'), tag], {env: {...process.env}});
+    let log = '';
+    p.stdout.on('data', d => { log += d; });
+    p.stderr.on('data', d => { log += d; });
+    const timer = setTimeout(() => { try { p.kill(); } catch {} rej(new Error('name-race child ' + tag + ' did not exit within 120 s; output: ' + log.slice(-500))); }, 120000);
+    timer.unref?.();
+    p.on('error', e => { clearTimeout(timer); rej(new Error('name-race child ' + tag + ' failed to start: ' + e.message)); });
+    p.on('exit', c => { clearTimeout(timer); c === 0 ? res() : rej(new Error('name-race child ' + tag + ' exit ' + c + '; output: ' + log.slice(-500))); });
   });
   await Promise.all(['0', '1', '2', '3'].map(run));
   try { for (const i of ['0', '1', '2', '3']) assert.equal(accounts.museName('conc-' + i), 'Name-' + i); }

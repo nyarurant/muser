@@ -57,4 +57,7 @@ test('long Japanese command output arrives without broken characters (one-shot a
     await new Promise(res => setTimeout(res, 100));
   }
   assert.equal((s.out.match(BROKEN) || []).length, 0);
+  // t4 #17: the background shell's output completeness was never asserted —
+  // only the one-shot's length was. Same command, same floor.
+  assert.ok(s.out.length >= 160000, 'the background shell delivered the whole output: ' + s.out.length);
 });

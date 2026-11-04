@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test');
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -67,7 +67,7 @@ test('recovery: rgb/bg quantize on non-truecolor terminals (child with a fake TT
     "console.log(t.truecolor ? 'TC' : 'C256');" +
     "console.log(JSON.stringify(t.rgb(255, 0, 0)('x')));" +
     "console.log(JSON.stringify(t.c.addBg('x')));";
-  const env = {...process.env}; delete env.COLORTERM;
+  const env = {...process.env}; delete env.COLORTERM; delete env.NO_COLOR; // the child imports term.js directly (no setup.mjs): an inherited NO_COLOR would disable the colour asserted below
   const out = execFileSync(process.execPath, ['-e', script], {cwd: require('node:path').join(__dirname, '..'), env, encoding: 'utf8', timeout: 60000});
   const [mode, fg, bgLine] = out.trim().split('\n');
   if (mode === 'TC') { assert.match(fg, /38;2;255;0;0/); assert.match(bgLine, /48;2;/); }
@@ -79,6 +79,15 @@ test('clipboard: success and failure are distinct ({files, error})', async () =>
   const r = await clip.clipboardImages();
   assert.ok(Array.isArray(r.files), 'files is an array');
   assert.ok(r.error === null || typeof r.error === 'string', 'error is null on success, a message on failure');
+  // Invariants whichever side of success this machine lands on (t8 #11): files
+  // and an error never come together, and every entry is a usable attachment.
+  assert.ok(!(r.files.length && r.error), 'files and error are never both set');
+  for (const f of r.files) {
+    assert.equal(typeof f.path, 'string', 'entry path is a string');
+    assert.ok(f.path.length > 0, 'entry path is not empty');
+    assert.equal(typeof f.temporary, 'boolean', 'entry temporary flag is a boolean');
+    assert.equal(clip.isImage(f.path), true, 'every entry is an image path: ' + f.path);
+  }
 });
 
 test('menus: two-digit numbers pick options 10+ (buffered first digit)', async () => {
@@ -90,6 +99,15 @@ test('menus: two-digit numbers pick options 10+ (buffered first digit)', async (
   assert.equal(picked, null, 'a lone 1 waits: it could become 10-15');
   ctrl.key('2', {});
   assert.equal(picked, 11, '1 then 2 picks the 12th option');
+  // The timer path (t8 #10): a lone first digit that never grows is picked by
+  // the 400 ms menu timer, not left buffered forever.
+  let timed = null;
+  ctrl.openMenu({title: 'x', options: Array.from({length: 15}, (_, i) => ({value: i, label: 'o' + i})), pick: v => { timed = v; }});
+  ctrl.key('1', {});
+  assert.equal(timed, null, 'still waiting right after the key');
+  const until = Date.now() + 5000;
+  while (timed === null && Date.now() < until) await new Promise(r => setTimeout(r, 25));
+  assert.equal(timed, 0, 'the timer picks option 1 after the wait');
   // A digit that cannot grow picks at once.
   let picked2 = null;
   ctrl.openMenu({title: 'x', options: Array.from({length: 5}, (_, i) => ({value: i, label: 'o' + i})), pick: v => { picked2 = v; }});
@@ -183,4 +201,10 @@ test('READMEs: background is a trailing &, and the slash list matches COMMANDS',
   assert.match(ja, /末尾に ` &`/);
   const {COMMANDS} = await import('../src/ui/controller.mjs');
   for (const [name] of COMMANDS) { assert.ok(en.includes('`' + name + '`'), 'README.md lists ' + name); assert.ok(ja.includes('`' + name + '`'), 'README.ja.md lists ' + name); }
+  // Reverse direction (t8 #12): a `/command` the READMEs list but the app does
+  // not have is a stale doc, and the one-directional loop above cannot see it.
+  const known = new Set(COMMANDS.map(([name]) => name));
+  for (const [file, text] of [['README.md', en], ['README.ja.md', ja]]) {
+    for (const m of text.matchAll(/`(\/[a-z][a-z0-9-]*)`/g)) assert.ok(known.has(m[1]), file + ' lists ' + m[1] + ' but COMMANDS has no such command');
+  }
 });

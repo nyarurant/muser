@@ -33,6 +33,12 @@ function bundle(account) {
   return {account, files, web, auth, client};
 }
 
+// The scratch store file a throwaway web may save refreshed cookies into (audit #44):
+// unique per call, removed by the caller's finally, and never the account's real web.enc.
+function probeFileFor(webFile) {
+  return webFile + '.probe-' + process.pid + '-' + Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36);
+}
+
 // Status per account for the policy and for /account listings. Reading a plan is one
 // muse.ai server action per account; failures read as percentUsed: null (unknown),
 // never as zero or as exhausted.
@@ -52,7 +58,7 @@ async function statuses({plans = true} = {}) {
     // snapshot back over the live window's newer jar and a healthy login rolled back to
     // "logged out". The webs below work on a copy whose refreshed cookies land in a scratch
     // store file that is removed afterwards; the account's own web owns persistence.
-    const probeFile = files.web + '.probe-' + process.pid + '-' + Date.now().toString(36) + Math.floor(Math.random() * 1e9).toString(36);
+    const probeFile = probeFileFor(files.web);
     try {
       let device = false;
       try { device = require('./pc-login').createAuth(createWeb([...jar], {file: probeFile}), {file: files.device}).snapshot().phase === 'authenticated'; } catch {}
@@ -95,6 +101,17 @@ function makePool(opts = {}) {
   const connectFn = opts.connectFn || (b => b.client.connect());
   // Warm-standby cache: account id -> bundle whose gateway client is already connected.
   const warmed = new Map();
+  // Pool generation (deep audit c24 #2): drop() bumps it, and a warm() that started in an
+  // older generation must not cache its bundle when its connect finally lands — drop()
+  // has already run (an Agent close, an account switch) and nobody would ever disconnect
+  // a bundle resurrected into a dropped pool; next() could even hand it out as "fresh".
+  let epoch = 0;
+  function disconnectBundle(b) {
+    try {
+      const r = b && b.client ? b.client.disconnect(false) : null;
+      if (r && typeof r.catch === 'function') r.catch(() => {});
+    } catch {}
+  }
   // In-flight warm()s by account id, so concurrent warms share one connect (audit #45).
   const warming = new Map();
   // One statuses read serves a whole peek -> warm -> next sequence (audit #46): each used
@@ -154,8 +171,10 @@ function makePool(opts = {}) {
       return picked ? picked.status : null;
     },
     async warm(excludeIds) {
+      const myEpoch = epoch;
       const picked = await pickStatus(excludeIds);
       if (!picked || !picked.status) return null;
+      if (myEpoch !== epoch) return null; // dropped while picking: build nothing
       const status = picked.status;
       if (warmed.has(status.id)) return status;
       // Concurrent warms for the same pick share one build+connect (audit #45): both used
@@ -171,6 +190,10 @@ function makePool(opts = {}) {
         const account = accounts.get(status.id) || status;
         const b = bundleFn(account);
         try { await connectFn(b); } catch { settle(false); return null; }
+        // Dropped while connecting (c24 #2): the pool this bundle was warmed for is gone.
+        // Disconnect what was just connected — leaving it cached leaks the connection,
+        // and leaving it connected but uncached leaks it just the same.
+        if (myEpoch !== epoch) { disconnectBundle(b); settle(false); return null; }
         b.reason = picked.reason;
         warmed.set(status.id, b);
         settle(true);
@@ -185,12 +208,8 @@ function makePool(opts = {}) {
       return null;
     },
     drop() {
-      for (const b of warmed.values()) {
-        try {
-          const r = b && b.client ? b.client.disconnect(false) : null;
-          if (r && typeof r.catch === 'function') r.catch(() => {});
-        } catch {}
-      }
+      epoch++; // in-flight warm()s of this generation cache nothing when they land (c24 #2)
+      for (const b of warmed.values()) disconnectBundle(b);
       warmed.clear();
     },
     async next(excludeIds, opts) {
@@ -236,7 +255,15 @@ async function sameMuse(id, {vmOf} = {}) {
     const {createWeb, loadJar} = require('./web');
     const jar = loadJar(files.web);
     if (!jar.length) return null;
-    return (await createWeb(jar, {file: files.web}).fetchJson('/api/session'))?.vm_id || null;
+    // Deep audit c24 #1: this default vmOf was the one reader statuses() left behind when
+    // it moved to a probe file for audit #44 — its web was bound to the account's REAL
+    // web.enc, so a Set-Cookie absorbed by the /api/session read saved this call's stale
+    // jar snapshot back over a live window's newer jar and rolled a healthy login back to
+    // "logged out". Same shape as statuses(): a copy of the jar, a scratch probe file,
+    // removed afterwards; the account's own web owns persistence.
+    const probeFile = probeFileFor(files.web);
+    try { return (await createWeb([...jar], {file: probeFile}).fetchJson('/api/session'))?.vm_id || null; }
+    finally { try { store.remove(probeFile); } catch {} }
   };
   const me = accounts.get(id);
   if (!me) return null;

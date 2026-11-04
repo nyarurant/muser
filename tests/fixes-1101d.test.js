@@ -10,6 +10,18 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {EventEmitter} = require('node:events');
+// t6 #6 (deep audit): this file had NO data-folder isolation, yet the SEC9
+// tests save into the real secure-store and A9b writes a real transcript —
+// under `npm test` tests/setup.mjs isolates, but a bare
+// `node --test tests/fixes-1101d.test.js` used the developer's real
+// %LOCALAPPDATA%\muser. Point both roots at temp folders BEFORE any src
+// module reads them (secure-store/sessions compute their DIR at load).
+const isoData = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fixd-data-'));
+const isoHome = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fixd-home-'));
+process.env.LOCALAPPDATA = isoData;
+process.env.USERPROFILE = isoHome;
+process.env.HOME = isoHome;
+test.after(() => { fs.rmSync(isoData, {recursive: true, force: true}); fs.rmSync(isoHome, {recursive: true, force: true}); });
 const {readOnlyCommand, decide} = require('../src/policy');
 const {TOOLS, isSensitivePath, dropSensitiveLines} = require('../src/tools');
 const {Agent, routeFor, projectInstructions, preamble, localToday} = require('../src/agent');
@@ -163,6 +175,9 @@ test('A9a: a worker whose turn has not been assigned yet still counts toward the
 
 test('A9b: when subscribeAgent fails after the send, the turn is cancelled on Muse\'s side and recorded', async t => {
   const a = makeAgent(t);
+  // t6 #6: the transcript this writes lives under the isolated data folder
+  // (header above); still remove it explicitly so nothing test-shaped stays.
+  t.after(() => { try { fs.rmSync(require('../src/sessions').transcriptFile(a.session.id), {force: true}); } catch {} });
   a.session.turns = 2;
   a.device = {connected: true, send: async () => ({message_id: 'm1'})};
   const cancelled = [];
@@ -229,14 +244,21 @@ test('SEC8: reading a skill whose folder really lives in ~/.ssh is refused', t =
   const linkParent = path.join(proj, '.muser', 'skills'); fs.mkdirSync(linkParent, {recursive: true});
   fs.symlinkSync(real, path.join(linkParent, 'evil'), 'junction');
   const skills = require('../src/skills');
-  assert.throws(() => skills.read(proj, {name: 'evil'}), /sensitive|inside the skill folder/);
+  // Phase-2 coordination (skills c17 #5): a project-source skill folder that
+  // is a link out of its root is now refused at LOAD time, so the junctioned
+  // ~/.ssh skill never becomes a skill at all — read() then reports it as
+  // unknown instead of reaching the sensitive-path guard. The security claim
+  // is unchanged and stronger: the skill is neither listed nor readable.
+  assert.ok(!skills.load(proj).some(s => s.name === 'evil'), 'the junctioned skill is not listed');
+  assert.throws(() => skills.read(proj, {name: 'evil'}), /No skill named/, 'and cannot be read');
 });
 
 // ---------- SEC9: secure-store caches only the bytes it decrypted ----------
 
-test('SEC9: a file replaced while load() decrypts is not cached under the new stamp', () => {
+test('SEC9: a file replaced while load() decrypts is not cached under the new stamp', t => {
   const ss = require('../src/secure-store');
   const name = 'race-' + process.pid + '.enc', target = ss.file(name);
+  t.after(() => ss.remove(name)); // t6 #6: cleanup also when an assert above fails (was success-path only)
   ss.save(name, {v: 1}); const ct1 = fs.readFileSync(target);
   ss.save(name, {v: 2}); const ct2 = fs.readFileSync(target);
   fs.writeFileSync(target, ct1); // back to v1 under a fresh stamp: the cached v2 misses
@@ -253,9 +275,10 @@ test('SEC9: a file replaced while load() decrypts is not cached under the new st
   ss.remove(name);
 });
 
-test('SEC9: an unchanged file is still served from the cache on the second load', () => {
+test('SEC9: an unchanged file is still served from the cache on the second load', t => {
   const ss = require('../src/secure-store');
   const name = 'plain-' + process.pid + '.enc';
+  t.after(() => ss.remove(name)); // t6 #6: cleanup also on failure
   ss.save(name, {ok: true});
   assert.deepEqual(ss.load(name), {ok: true});
   assert.deepEqual(ss.load(name), {ok: true});

@@ -74,6 +74,12 @@ test('a one-shot command that reads stdin gets EOF instead of waiting out the ti
   const r = await runOnce('git shortlog -sn', {cwd: process.cwd(), timeout: 20000, maxOut: 1e6, clip: s => s});
   assert.equal(r.killed, '');
   assert.ok(Date.now() - t0 < 10000);
+  // t4 #10: EOF alone used to pass even if the command had failed — assert
+  // the run's result too. shortlog with no revision reads its log from
+  // stdin: the EOF is exactly why the output is empty (defaulting to HEAD
+  // would list this repo's authors instead).
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, '', 'stdin was at EOF, so shortlog had nothing to summarise');
 });
 
 test("/new and /resume start the next chat with an empty todo list (not the old chat's)", async () => {

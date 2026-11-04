@@ -34,10 +34,16 @@ function fileFor(pid = process.pid) { return path.join(dir(), pid + '.json'); }
 function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
 
 // What the window is doing, most urgent first: an approval outranks everything, then any other
-// question on screen (a menu, a reason or number prompt, an account-add question), then work.
+// question on screen (a menu, a reason or number prompt, an account-add question, the
+// selectable-question picker), then work. The picker matters here in particular: it opens
+// after the turn ended on needs_input, so busy is already false and without `question` the
+// window read as plain idle in `muser status` while it waited for an answer (fifth c1-1).
+// Only the classification reads `question` — the picker's contents (checked options, typed
+// custom answers and notes) are what the user is composing, so they are never written to disk,
+// like the composer text above.
 function activityOf(s) {
   if (s.approval) return 'approval';
-  if (s.menu || s.promptFor || s.reasonFor || s.limitInput) return 'input';
+  if (s.menu || s.promptFor || s.reasonFor || s.limitInput || s.question) return 'input';
   if (s.busy) return 'working';
   return 'idle';
 }
@@ -81,19 +87,23 @@ class WindowStatus {
   write() {
     if (this.stopped) return false;
     this.lastWrite = Date.now();
-    const s = this.ctrl.get();
-    const key = s.running?.call ? s.running.call.id || s.running.call.command + s.running.call.summary : null;
-    if (key !== this.runningKey) { this.runningKey = key; this.runningSince = key ? Date.now() : null; }
-    const asking = s.approval?.call || null;
-    if (asking !== this.approvalKey) { this.approvalKey = asking; this.approvalSince = asking ? Date.now() : null; }
-    const data = snapshot({s, agent: this.agent, startedAt: this.startedAt, runningSince: this.runningSince, approvalSince: this.approvalSince, toolLog: this.toolLog, progress: this.progress, lastTurn: this.lastTurn});
-    const temp = this.file + '.tmp-' + process.pid + '-' + Date.now();
+    // The whole body is inside the guard, not just the file write: ctrl.get() or snapshot()
+    // throwing (a state getter, a non-finite startedAt reaching toISOString) used to escape
+    // through the schedule()/heartbeat timers and kill the window this file exists to watch.
+    let temp = null;
     try {
+      const s = this.ctrl.get();
+      const key = s.running?.call ? s.running.call.id || s.running.call.command + s.running.call.summary : null;
+      if (key !== this.runningKey) { this.runningKey = key; this.runningSince = key ? Date.now() : null; }
+      const asking = s.approval?.call || null;
+      if (asking !== this.approvalKey) { this.approvalKey = asking; this.approvalSince = asking ? Date.now() : null; }
+      const data = snapshot({s, agent: this.agent, startedAt: this.startedAt, runningSince: this.runningSince, approvalSince: this.approvalSince, toolLog: this.toolLog, progress: this.progress, lastTurn: this.lastTurn});
+      temp = this.file + '.tmp-' + process.pid + '-' + Date.now();
       fs.mkdirSync(path.dirname(this.file), {recursive: true});
       fs.writeFileSync(temp, JSON.stringify(data));
       renameRetry(temp, this.file);
       return true;
-    } catch { try { fs.unlinkSync(temp); } catch {} return false; } // never breaks the window
+    } catch { if (temp) { try { fs.unlinkSync(temp); } catch {} } return false; } // never breaks the window
   }
   // A change on screen: written now if the last write is a second old, else once that second is up.
   schedule() {
@@ -148,14 +158,31 @@ function readAll({folder = dir(), ...opts} = {}) {
   return out.sort((x, y) => String(x.startedAt).localeCompare(String(y.startedAt)));
 }
 // Files left by windows that died (crash, killed terminal). Readers already skip them.
-function prune({folder = dir(), ...opts} = {}) {
+// Pruning is only cleanup, so it is more conservative than live(): a file that cannot be
+// READ (a scanner or another window holding it for a moment) is not proof its window died,
+// and a live pid's file is removed only after a long heartbeat silence — a clock step or a
+// suspended laptop makes a live window look stale for a while, and deleting its file hid a
+// window that was still open. Before unlinking, the file is re-read: if its content changed
+// since the judgement (the owner heartbeated in between), it is left for the next prune.
+const PRUNE_LIVE_GRACE = 10; // × the reader staleness window
+function prune({folder = dir(), readFile, ...opts} = {}) {
+  const read = readFile || (f => fs.readFileSync(f, 'utf8'));
   let names = [];
   try { names = fs.readdirSync(folder).filter(n => /^\d+\.json$/.test(n)); } catch { return; }
+  const isAlive = opts.isAlive || alive, staleMs = opts.staleMs ?? STALE_MS, now = opts.now ?? Date.now();
   for (const n of names) {
     const file = path.join(folder, n);
-    let v = null; try { v = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+    let raw; try { raw = read(file); } catch { continue; } // unreadable is not dead: leave it
+    let v = null; try { v = JSON.parse(raw); } catch {}
     if (v && v.pid === process.pid) continue;
-    if (!live(v, opts)) { try { fs.unlinkSync(file); } catch {} }
+    if (live(v, opts)) continue;
+    if (v && Number.isInteger(v.pid) && isAlive(v.pid)) {
+      const updated = Date.parse(v.updatedAt);
+      if (!Number.isFinite(updated) || now - updated < staleMs * PRUNE_LIVE_GRACE) continue;
+    }
+    let raw2; try { raw2 = read(file); } catch { continue; }
+    if (raw2 !== raw) continue; // rewritten since the judgement: a live window, leave it
+    try { fs.unlinkSync(file); } catch {}
   }
 }
 

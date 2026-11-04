@@ -408,6 +408,21 @@ test('the Focus time limit does not bite while task agents are still running', a
   assert.equal(answer.focus.status, 'complete', 'the round spent waiting on the agent did not consume the time limit');
 });
 
+test('a task that spends its time budget on its own work stops at the time limit (t3 #3)', async t => {
+  // The firing path of the timeoutMs check: above, agent-waiting is excluded
+  // and never fires it; here the round's own work (no worker to wait on)
+  // consumes the budget, so the loop must stop with status 'limit'.
+  const fixture = await harness(t, async a => {
+    await a.execute('focus.plan', {agent: 'main', criteria: JSON.stringify(plan)});
+    await a.execute('focus.checkpoint', {agent: 'main', checks: JSON.stringify(check('unmet'))});
+    await new Promise(r => setTimeout(r, 30));
+  });
+  const answer = await fixture.agent.sendFocused('Long task', {maxRounds: 5, timeoutMs: 5});
+  assert.equal(answer.focus.status, 'limit');
+  assert.match(answer.focus.reason, /Focus time limit/);
+  assert.equal(fixture.sends.length, 1, 'no continuation round was sent after the limit');
+});
+
 test('Esc (interrupt) still stops the task agents — it is the explicit stop', async t => {
   const stopped = [];
   const fixture = await harness(t, async a => {
@@ -418,4 +433,45 @@ test('Esc (interrupt) still stops the task agents — it is the explicit stop', 
   });
   await assert.rejects(fixture.agent.send('Work until done'), e => e.name === 'AbortError');
   assert.deepEqual(stopped, ['aTest'], 'interrupt stops the agents it owns');
+});
+
+test('askUser with options: normalised into the snapshot, survives endRound as needs_input', () => {
+  const focus = new Focus('Pick a cat'); focus.beginRound(); focus.plan(plan);
+  const snap = focus.askUser('Which cat?', {options: [{label: '黒猫', description: '定番', preview: '/_/\n( o.o )'}, {label: '三毛猫'}]});
+  assert.equal(snap.ask.questions.length, 1);
+  const q = snap.ask.questions[0];
+  assert.equal(q.question, 'Which cat?');
+  assert.equal(q.multi, false);
+  assert.equal(q.header, 'Which cat?');
+  assert.deepEqual(q.options[0], {label: '黒猫', description: '定番', preview: '/_/\n( o.o )'});
+  assert.deepEqual(q.options[1], {label: '三毛猫', description: null, preview: null});
+  const stop = focus.endRound();
+  assert.equal(stop.status, 'needs_input');
+  const after = focus.snapshot();
+  assert.equal(after.ask.questions[0].options.length, 2, 'the picker data is still there after the round ends');
+  focus.resumeLeg('Black');
+  assert.equal(focus.snapshot().ask, null, 'a resumed leg drops the answered question');
+});
+
+test('askUser: questions form (JSON string) wins, multi is honoured, bad shapes throw', () => {
+  const focus = new Focus('Two questions'); focus.beginRound(); focus.plan(plan);
+  const snap = focus.askUser('ignored?', {questions: JSON.stringify([
+    {header: '色', question: '色は？', options: [{label: '青'}, {label: '緑'}]},
+    {header: '付け合わせ', question: '付け合わせは？', multi: true, options: [{label: 'A'}, {label: 'B'}, {label: 'C'}]},
+  ])});
+  assert.equal(snap.ask.questions.length, 2);
+  assert.equal(snap.ask.questions[0].header, '色');
+  assert.equal(snap.ask.questions[1].multi, true);
+  assert.throws(() => focus.askUser('x', {options: [{label: 'only one'}]}), /2 to 6 options/);
+  assert.throws(() => focus.askUser('x', {options: [{label: ''}, {label: 'b'}]}), /label/);
+  // t3 #2: a failed askUser must not clobber the question already recorded,
+  // and the second question's options survive normalisation.
+  assert.deepEqual(focus.snapshot().ask.questions.map(q => q.header), ['色', '付け合わせ'], 'the failed calls left the recorded questions untouched');
+  assert.deepEqual(snap.ask.questions[1].options.map(o => o.label), ['A', 'B', 'C']);
+  // Header fallback: no header given, the tab label is the question's first 16 chars.
+  const fb = new Focus('Fallback'); fb.beginRound(); fb.plan(plan);
+  const longQ = '1234567890abcdefGHIJ and more';
+  assert.equal(fb.askUser(longQ, {options: [{label: 'a'}, {label: 'b'}]}).ask.questions[0].header, longQ.slice(0, 16));
+  const plain = new Focus('Plain'); plain.beginRound(); plain.plan(plan);
+  assert.equal(plain.askUser('Free text?').ask, null, 'no options: the plain question, as before');
 });

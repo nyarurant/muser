@@ -24,9 +24,27 @@ class HostError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// Third H3: the explicit "new conversation" sentinel openNew passes to the
+// factory, in place of the `session: undefined` it used to send. undefined
+// means "not specified" to bin/muser.js prepare() (which then falls back to
+// the startup --session/-c flags); 'new' means "explicitly new, do NOT
+// resume anything". A stored session object means re-open that session.
+const NEW_SESSION = 'new';
+
 function busyOf(entry) {
   const s = entry.controller?.s ?? entry.controller?.get?.();
-  return !!(s?.busy ?? entry.agent?.busy);
+  // Deep H12: `s?.busy ?? agent.busy` never reached the agent when the
+  // snapshot said false (false is not nullish) — yet agent.busy is the
+  // authoritative check (it sees every worker's turn/starting, src/agent.js).
+  // Busy is the OR of all three views: the snapshot, the agent (whose getter
+  // already covers its workers), and the snapshot's own worker list.
+  let workersBusy = false;
+  try {
+    const list = typeof entry.agent?.agents === 'function' ? entry.agent.agents() : null;
+    if (Array.isArray(list)) workersBusy = list.some(a => a?.state === 'working' || a?.state === 'starting');
+  } catch {}
+  const snapshotWorkersBusy = Array.isArray(s?.agents) && s.agents.some(a => a?.state === 'working' || a?.state === 'starting');
+  return !!(s?.busy || entry.agent?.busy || workersBusy || snapshotWorkersBusy);
 }
 function approvalOf(entry) {
   const s = entry.controller?.s ?? entry.controller?.get?.();
@@ -39,15 +57,23 @@ function approvalOf(entry) {
 function activeOf(entry) {
   const s = entry.controller?.s ?? entry.controller?.get?.();
   if (!s) return busyOf(entry);
-  return !!(busyOf(entry) || s.approval || s.menu || s.reasonFor || s.promptFor || s.limitInput || s.addFlow
+  // Deep H12: the agents check used to read a.running / a.status, fields the
+  // worker snapshot (src/agent.js snapshot()) does not have — the live field
+  // is `state`, 'working' while a worker runs ('starting' before its turn).
+  // And s.question (the selectable-question picker, whose checks/drafts live
+  // only in the controller state) was missing from this list entirely,
+  // although the #60 rule above says anything lost on close counts as active.
+  return !!(busyOf(entry) || s.approval || s.menu || s.reasonFor || s.promptFor || s.limitInput || s.addFlow || s.question
     || s.running || s.bangRunning || (Array.isArray(s.queue) && s.queue.length)
     || (Array.isArray(s.shells) && s.shells.some(sh => sh?.running))
-    || (Array.isArray(s.agents) && s.agents.some(a => a?.running || a?.status === 'running')));
+    || (Array.isArray(s.agents) && s.agents.some(a => a?.state === 'working' || a?.state === 'starting')));
 }
 
 class SessionsHost extends EventEmitter {
   // {create}: async ({cwd, account, mode, session}) => {agent, controller, museName}
-  // — session is a stored session object when re-opening one, undefined for a new one.
+  // — session is a stored session object when re-opening one, NEW_SESSION
+  // ('new') for a brand-new one (Third H3: never undefined — undefined means
+  // "not specified" to the factory and used to inherit startup resume flags).
   // {findSession}: (ref) => stored session | null | undefined (default src/sessions.find).
   constructor({create, findSession, maxOpen = MAX_OPEN, idleMs = IDLE_MS, sweepMs = SWEEP_MS} = {}) {
     super();
@@ -60,6 +86,9 @@ class SessionsHost extends EventEmitter {
     this.sweepTimer = null;
     this._opening = new Map(); // #57: session id (or ref) -> in-flight open promise
     this._pendingOpens = 0; // creations past enforceCap's check but not yet registered
+    this._inflight = new Set(); // c27 #5: every in-flight creation (openNew too), so closeAll can wait for / cancel them
+    this._cancelledOpens = new Set(); // c27 #5: opening keys a close() arrived for while the creation was in flight
+    this._shuttingDown = false; // c27 #5: set by closeAll(); a creation completing afterwards is closed, never registered
     if (idleMs > 0 && sweepMs > 0) {
       this.sweepTimer = setInterval(() => { try { this.closeIdle(); } catch {} }, sweepMs);
       this.sweepTimer.unref?.();
@@ -69,7 +98,29 @@ class SessionsHost extends EventEmitter {
   get size() { return this.entries.size; }
   get(id) { return this.entries.get(id) || null; }
   defaultEntry() { return (this.defaultId && this.entries.get(this.defaultId)) || null; }
-  touch(id) { const e = this.entries.get(id); if (e) e.lastUsedAt = Date.now(); }
+  // Deep H13: when the default conversation is closed while others remain,
+  // the most recently used remaining conversation becomes the default —
+  // otherwise defaultId stayed null forever and every unprefixed GUI route
+  // (the routes the existing GUI actually uses) answered 404 until a server
+  // restart. This deliberately supersedes the #59 "never promote" rule for
+  // the close path: #59's silent-rerouting concern is outweighed by the
+  // unprefixed API being permanently dead; promotion is visible in
+  // list()/serverInfo (isDefault) and announced by the close itself.
+  promoteDefault() {
+    if (!this.entries.size) { this.defaultId = null; return null; }
+    const chosen = [...this.entries.values()].sort((a, b) => b.lastUsedAt - a.lastUsedAt)[0];
+    this.defaultId = chosen.id;
+    for (const e of this.entries.values()) e.isDefault = e.id === chosen.id;
+    return chosen;
+  }
+  // NOTE (merge, fix1): an earlier H13 draft also made openNew/openExisting
+  // adopt the opened conversation as default when none existed. That broke
+  // the #59 rule the audit did not ask to change (a later unrelated open must
+  // NOT silently become the unprefixed target — tests/server.test.js gui #59)
+  // and the cap/sweep exemptions. H13's actual scenario — the default is
+  // closed while OTHER conversations remain — is fully covered by
+  // promoteDefault() at close time, so opens keep the #59 behaviour.
+  touch(id) { const e = this.entries.get(id); if (e) { e.lastUsedAt = Date.now(); e._usedWall = e.lastUsedAt; e._usedMono = performance.now(); } }
 
   emitEvent(event) { this.emit('event', event); }
 
@@ -83,11 +134,19 @@ class SessionsHost extends EventEmitter {
     const wasDefault = this.defaultId === id;
     if (this.entries.has(id)) this.closeSync(id, 'replaced');
     const entry = {id, agent, controller, museName: museName ?? controller?.museName ?? null, createdAt: Date.now(), lastUsedAt: Date.now(), isDefault: !!(isDefault || wasDefault), _unsubscribe: null, _prevBusy: false, _prevApproval: false};
+    // f3-4: the idle age is measured on the monotonic clock (see closeIdle);
+    // _usedWall records which wall time _usedMono belongs to, so a lastUsedAt
+    // set from outside (tests, a caller's own bookkeeping) falls back to the
+    // wall-clock age instead of being paired with a stale monotonic stamp.
+    entry._usedWall = entry.lastUsedAt; entry._usedMono = performance.now();
     this.entries.set(id, entry);
     // #59: only an explicit default (or the replacement of the same default)
-    // becomes the default. The old "or no default yet" clause silently promoted
+    // becomes the default HERE. The old "or no default yet" clause silently promoted
     // the next unrelated conversation opened after the default was closed,
-    // rerouting every unprefixed GUI call to it.
+    // rerouting every unprefixed GUI call to it. Deep H13 supersedes that
+    // outcome only at the close level (promoteDefault on closing the default
+    // while others remain), because leaving defaultId null forever killed
+    // every unprefixed route; opens and bare registrations keep #59.
     if (isDefault || wasDefault) this.defaultId = id;
     entry._prevBusy = busyOf(entry); entry._prevApproval = approvalOf(entry);
     if (typeof controller?.subscribe === 'function') {
@@ -143,18 +202,69 @@ class SessionsHost extends EventEmitter {
       this.closeSync(candidates[0].id, 'cap');
     }
   }
+  // c27 #4: enforceCap used to run BEFORE the factory, so a creation that
+  // then failed (unknown account, not logged in, onboarding aborted) had
+  // already destroyed an unrelated conversation for nothing. The open paths
+  // now only CHECK here that room could be made (409 up front when every
+  // conversation is busy), create first, and evict in _finishOpen once the
+  // new conversation actually exists.
+  assertCapRoom() {
+    if (this.entries.size + this._pendingOpens < this.maxOpen) return;
+    const anyClosable = [...this.entries.values()].some(e => e.id !== this.defaultId && !activeOf(e));
+    if (!anyClosable) throw new HostError(409, 'too many conversations open and all are busy');
+  }
+  // Register a freshly built conversation, evicting for the cap only now.
+  // If the eviction candidate turned active while the factory ran, the NEW
+  // conversation is closed again instead of an active one being forced out.
+  _finishOpen(built) {
+    try { this.enforceCap(); } catch (e) { try { built?.agent?.close?.(); } catch {} throw e; }
+    return this.addPrepared(built);
+  }
+  // c27 #5: a creation that completes after closeAll() (or after a close()
+  // for its id arrived mid-open) must not resurrect a conversation on a
+  // stopped host: close the just-built agent and fail the open instead.
+  _checkOpenLive(built, keys = []) {
+    if (!this._shuttingDown && !keys.some(k => this._cancelledOpens.has(k))) return;
+    try { built?.agent?.close?.(); } catch {}
+    throw new HostError(503, 'session host is shutting down');
+  }
+  _trackOpen(promise) {
+    this._inflight.add(promise);
+    const done = () => this._inflight.delete(promise);
+    promise.then(done, done);
+    return promise;
+  }
 
   async openNew({cwd, account, mode} = {}) {
     if (typeof cwd !== 'string' || !cwd) throw new HostError(400, 'cwd is required');
     let dir = false; try { dir = fs.statSync(cwd).isDirectory(); } catch {}
     if (!dir) throw new HostError(400, 'cwd is not an existing folder: ' + cwd);
+    // c27 #3: the mode was passed to the factory unchecked, so a typo'd
+    // 'Plan' / 'plan ' became agent.mode verbatim and policy.decide — which
+    // matches 'plan' exactly — fell through to the default 'ask' behaviour:
+    // a conversation meant to be read-only could edit after one approval.
+    // /api/mode already rejects non-MODES values with 400; do the same here
+    // (undefined/null still means "the factory decides", as before).
+    if (mode !== undefined && mode !== null && !require('../policy').MODES.includes(mode))
+      throw new HostError(400, 'mode must be one of: ' + require('../policy').MODES.join(', '));
     if (!this.create) throw new HostError(501, 'session hosting is not enabled');
-    this.enforceCap();
+    if (this._shuttingDown) throw new HostError(503, 'session host is shutting down');
+    this.assertCapRoom();
     this._pendingOpens++;
-    try {
-      const built = await this.create({cwd, account, mode, session: undefined});
-      return this.addPrepared(built);
-    } finally { this._pendingOpens--; }
+    let counted = true; // _pendingOpens is released exactly once, before _finishOpen's cap check
+    const opening = (async () => {
+      try {
+        // Third H3: pass the explicit NEW_SESSION sentinel, not undefined —
+        // prepare() reads undefined as "not specified" and falls back to the
+        // server process's startup resume flags, so a "new" conversation used
+        // to silently continue the startup session (and replace the default).
+        const built = await this.create({cwd, account, mode, session: NEW_SESSION});
+        this._checkOpenLive(built);
+        counted = false; this._pendingOpens--;
+        return this._finishOpen(built);
+      } finally { if (counted) { counted = false; this._pendingOpens--; } }
+    })();
+    return this._trackOpen(opening);
   }
 
   async openExisting(ref) {
@@ -169,17 +279,25 @@ class SessionsHost extends EventEmitter {
     if (already) { this.touch(session.id); return already; }
     if (this._opening.has(session.id)) return this._opening.get(session.id);
     if (!this.create) throw new HostError(501, 'session hosting is not enabled');
-    this.enforceCap();
+    if (this._shuttingDown) throw new HostError(503, 'session host is shutting down');
+    this.assertCapRoom();
     this._pendingOpens++;
+    let counted = true;
     const opening = (async () => {
       try {
         const built = await this.create({cwd: session.cwd, account: session.account, mode: undefined, session});
-        return this.addPrepared(built);
-      } finally { this._pendingOpens--; this._opening.delete(ref); this._opening.delete(session.id); }
+        this._checkOpenLive(built, [ref, session.id]);
+        counted = false; this._pendingOpens--;
+        return this._finishOpen(built);
+      } finally {
+        if (counted) { counted = false; this._pendingOpens--; }
+        this._opening.delete(ref); this._opening.delete(session.id);
+        this._cancelledOpens.delete(ref); this._cancelledOpens.delete(session.id);
+      }
     })();
     this._opening.set(ref, opening);
     this._opening.set(session.id, opening);
-    return opening;
+    return this._trackOpen(opening);
   }
 
   // Close one conversation: refuses (409) while it is active (working, waiting
@@ -187,6 +305,9 @@ class SessionsHost extends EventEmitter {
   // The Agent's close() releases its node slot and device link.
   close(id, {force = false, reason = 'closed'} = {}) {
     const entry = this.entries.get(id);
+    // c27 #5: an in-flight open has no entry yet; remember the close so the
+    // creation is cancelled on completion instead of registering afterwards.
+    if (!entry && this._opening.has(id)) this._cancelledOpens.add(id);
     if (!entry) throw new HostError(404, 'session not open: ' + id);
     if (!force && activeOf(entry)) throw new HostError(409, 'session is busy');
     this.closeSync(id, reason);
@@ -195,8 +316,14 @@ class SessionsHost extends EventEmitter {
   closeSync(id, reason = 'closed') {
     const entry = this.entries.get(id);
     if (!entry) return;
+    const wasDefault = this.defaultId === id;
     this.entries.delete(id);
-    if (this.defaultId === id) this.defaultId = null;
+    if (wasDefault) {
+      this.defaultId = null;
+      entry.isDefault = false;
+      // Deep H13: promote the most recently used survivor, if any remain.
+      if (this.entries.size) this.promoteDefault();
+    }
     if (entry._unsubscribe) { try { entry._unsubscribe(); } catch {} entry._unsubscribe = null; }
     try { entry.agent?.close?.(); } catch {}
     this.emitEvent({type: 'session-closed', sessionId: id, reason, at: Date.now()});
@@ -208,19 +335,31 @@ class SessionsHost extends EventEmitter {
     const closed = [];
     for (const entry of [...this.entries.values()]) {
       if (entry.id === this.defaultId || activeOf(entry)) continue;
-      if (now - entry.lastUsedAt >= this.idleMs) { this.closeSync(entry.id, 'idle'); closed.push(entry.id); }
+      // Fifth f3-4: a wall-clock age is inflated by a clock step forward
+      // (NTP / manual change), closing just-used conversations. When the
+      // monotonic stamp still belongs to this lastUsedAt (addPrepared/touch
+      // set both together), use the monotonic age; a lastUsedAt assigned
+      // from outside keeps the wall-clock reading.
+      const age = entry._usedMono != null && entry._usedWall === entry.lastUsedAt ? performance.now() - entry._usedMono : now - entry.lastUsedAt;
+      if (age >= this.idleMs) { this.closeSync(entry.id, 'idle'); closed.push(entry.id); }
     }
     return closed;
   }
 
   async closeAll() {
+    // c27 #5: mark shutdown FIRST and wait out in-flight creations below:
+    // one completing afterwards sees the flag, closes its just-built agent
+    // and rejects, instead of registering on a host nobody sweeps again.
+    this._shuttingDown = true;
     if (this.sweepTimer) { clearInterval(this.sweepTimer); this.sweepTimer = null; }
     for (const id of [...this.entries.keys()]) {
       const entry = this.entries.get(id);
       try { if (entry?.agent?.busy && entry.agent.cancelAll) await entry.agent.cancelAll().catch(() => {}); } catch {}
       this.closeSync(id, 'shutdown');
     }
+    if (this._inflight.size) await Promise.allSettled([...this._inflight]);
+    for (const id of [...this.entries.keys()]) this.closeSync(id, 'shutdown');
   }
 }
 
-module.exports = {SessionsHost, HostError, MAX_OPEN, IDLE_MS, busyOf, approvalOf, activeOf};
+module.exports = {SessionsHost, HostError, MAX_OPEN, IDLE_MS, NEW_SESSION, busyOf, approvalOf, activeOf};

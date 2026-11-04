@@ -39,7 +39,11 @@ function createRemoteStore(storeFile) {
     let v;
     try { v = JSON.parse(text); } catch { throw new Error(`remote-store: ${target()} is corrupt (not valid JSON); refusing to treat it as an empty device list`); }
     if (!v || !Array.isArray(v.devices)) throw new Error(`remote-store: ${target()} is corrupt (no devices list); refusing to treat it as an empty device list`);
-    return v.devices.filter(d => d && typeof d.id === 'string' && typeof d.staticPub === 'string');
+    // c27 #10: a malformed ENTRY (numeric id, missing staticPub) used to be
+    // filtered out silently here, and the next update() wrote the filtered
+    // list back, making the loss permanent. Refuse it like #106 above.
+    for (let i = 0; i < v.devices.length; i++) { const d = v.devices[i]; if (!d || typeof d.id !== 'string' || typeof d.staticPub !== 'string') throw new Error('remote-store: ' + target() + ' is corrupt (device entry ' + i + ' has no string id/staticPub); refusing to drop it silently'); }
+    return v.devices;
   }
   function writeAll(devices) {
     const f = target();
@@ -48,7 +52,8 @@ function createRemoteStore(storeFile) {
     try { fs.writeFileSync(temp, JSON.stringify({devices}, null, 2)); config.renameRetry(temp, f); }
     catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
   }
-  function update(fn) { return config.withLock(target(), () => { const devices = readAll(); const out = fn(devices); writeAll(devices); return out; }); }
+  // c27 #10 (write side): a no-op fn (remove of a missing/ambiguous name, touch of an unknown id) used to rewrite the whole file anyway — a write failure then surfaced as an error for an operation that changed nothing. Skip the write when the list is unchanged.
+  function update(fn) { return config.withLock(target(), () => { const devices = readAll(); const before = JSON.stringify(devices); const out = fn(devices); if (JSON.stringify(devices) !== before) writeAll(devices); return out; }); }
 
   function list() { return readAll().map(d => ({...d})); }
   function findByStatic(staticPub) {

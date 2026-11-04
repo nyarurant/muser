@@ -11,6 +11,8 @@ const {EventEmitter} = require('node:events');
 
 process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-turn-usage-test-data-'));
 process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-turn-usage-test-home-'));
+// t7 #4 (deep audit): these two temp roots were never cleaned up.
+test.after(() => { fs.rmSync(process.env.LOCALAPPDATA, {recursive: true, force: true}); fs.rmSync(process.env.USERPROFILE, {recursive: true, force: true}); });
 
 const {parse, strip, formatTokens, usageFromTranscript} = require('../src/turn-usage');
 
@@ -33,6 +35,23 @@ test('formatTokens: under 1000 as-is, thousands with one decimal and no trailing
   assert.equal(formatTokens(2000), '2k');
   assert.equal(formatTokens(130841), '130.8k');
   assert.equal(formatTokens(1050), '1.1k');
+});
+
+test('formatTokens: from a million, M with one decimal ("6274.9k" was hard to read)', () => {
+  assert.equal(formatTokens(999949), '999.9k');
+  assert.equal(formatTokens(999960), '1M', 'what would round to 1000k is 1M');
+  assert.equal(formatTokens(1000000), '1M');
+  assert.equal(formatTokens(6274947), '6.3M');
+  assert.equal(formatTokens(12345678), '12.3M');
+  assert.equal(formatTokens(999960000), '1B', 'what would round to 1000M is 1B');
+  assert.equal(formatTokens(1234567890), '1.2B');
+});
+
+test('usageText: a stored record is formatted again from its numbers', () => {
+  const {usageText} = require('../src/turn-usage');
+  assert.equal(usageText({inputTokens: 6274947, outputTokens: 48479, formatted: '6274.9k in / 48.5k out'}), '6.3M in / 48.5k out', 'an old record reads in today\'s units');
+  assert.equal(usageText({formatted: '1k in / 2 out'}), '1k in / 2 out', 'no numbers: the stored text');
+  assert.equal(usageText(null), '');
 });
 
 test('parse: fallbacks skip 0 and unavailable, estimates win over plain keys', () => {
@@ -93,7 +112,11 @@ test('a fake completion event through the agent puts usage on turn-end and in th
   client.status = 'connected'; client.ws = {readyState: 1};
   // Before the send, history is empty (the baseline); after it, the reply is
   // there — without any usage line, as the real history API behaves.
-  client.history = async () => replyReady ? {chat_events: [{role: 'assistant', message_id: 'r1', display_text: 'done', seq: 1, occurred_at_ms: Date.now()}]} : {chat_events: []};
+  // Phase-2 coordination (agent-reply): the reply wait now only accepts a
+  // history message that answers the sent message (reply_to_message_id) or
+  // whose completion was signalled — the real history carries the reply_to
+  // link, so the fixture does too (its 'r1' is the reply to the sent 'm1').
+  client.history = async () => replyReady ? {chat_events: [{role: 'assistant', message_id: 'r1', reply_to_message_id: 'm1', display_text: 'done', seq: 1, occurred_at_ms: Date.now()}]} : {chat_events: []};
   client.request = async () => ({session: {status: 'idle'}});
   client.subscribeAgent = async () => {};
   client.closeAgentSubscription = () => {};
@@ -101,9 +124,10 @@ test('a fake completion event through the agent puts usage on turn-end and in th
   client.disconnect = () => {};
   const a = new Agent({client, auth: {saved: {}, vm: async () => { throw new Error('no vm in tests'); }}, cwd,
     session: {id: 'main-session', cwd, title: '', created: 0, updated: 0, turns: 0}, focusEnabled: false});
+  t.after(() => a.close()); // t7 #4: every other agent test in this file closes its Agent; this one leaked its timers/subscriptions
   a.subscribed = true;
   a.ensureConnected = async () => {};
-  a.device = {connected: true, send: async () => { replyReady = true; return {message_id: 'm1'}; }};
+  a.device = {connected: true, disconnect() {}, send: async () => { replyReady = true; return {message_id: 'm1'}; }}; // disconnect: Agent.close() calls it (t7 #4's close)
   const turnEnd = new Promise(r => a.once('turn-end', r));
   const sent = new Promise(r => a.once('sent', r));
   const turnP = a.send('hello');
@@ -158,7 +182,7 @@ test('a 2-round Focus run sums both rounds on turn-end and tallies each reply on
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-turn-usage-focus-'));
   t.after(() => fs.rmSync(cwd, {recursive: true, force: true}));
   fs.writeFileSync(path.join(cwd, 'probe.txt'), 'probe');
-  process.env.MUSER_USAGE_FILE = path.join(cwd, 'usage.json');
+  const prevUsageFile = process.env.MUSER_USAGE_FILE; process.env.MUSER_USAGE_FILE = path.join(cwd, 'usage.json'); t.after(() => { if (prevUsageFile === undefined) delete process.env.MUSER_USAGE_FILE; else process.env.MUSER_USAGE_FILE = prevUsageFile; }); // t7 #4: was left pointing at a deleted temp file for later tests
   const plan = [{text: 'Source satisfies the requested behavior', kind: 'inspection'}];
   const check = (status, evidence = []) => [{id: 'c1', status, evidence, reason: status}];
   const client = new EventEmitter(), events = [], sends = [];
@@ -219,11 +243,11 @@ test('a parallel agent reply is tallied via turn-usage, with no turn-end', async
   const usage = require('../src/usage');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-turn-usage-parallel-'));
   t.after(() => fs.rmSync(cwd, {recursive: true, force: true}));
-  process.env.MUSER_USAGE_FILE = path.join(cwd, 'usage.json');
+  const prevUsageFile = process.env.MUSER_USAGE_FILE; process.env.MUSER_USAGE_FILE = path.join(cwd, 'usage.json'); t.after(() => { if (prevUsageFile === undefined) delete process.env.MUSER_USAGE_FILE; else process.env.MUSER_USAGE_FILE = prevUsageFile; }); // t7 #4: was left pointing at a deleted temp file for later tests
   let replyReady = false, workerSession = null;
   const client = new EventEmitter();
   client.status = 'connected'; client.ws = {readyState: 1};
-  client.history = async () => replyReady ? {chat_events: [{role: 'assistant', message_id: 'pr1', display_text: 'parallel done', seq: 1, occurred_at_ms: Date.now()}]} : {chat_events: []};
+  client.history = async () => replyReady ? {chat_events: [{role: 'assistant', message_id: 'pr1', reply_to_message_id: 'pw1', display_text: 'parallel done', seq: 1, occurred_at_ms: Date.now()}]} : {chat_events: []}; // reply_to: same agent-reply gate as the main-turn fixture above
   client.request = async () => ({session: {status: 'idle'}});
   client.subscribeAgent = async () => {};
   client.closeAgentSubscription = () => {};
@@ -269,7 +293,7 @@ test('a parallel reply during a user turn pools into the turn-end total', async 
   const usage = require('../src/usage');
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-turn-usage-pool-'));
   t.after(() => fs.rmSync(cwd, {recursive: true, force: true}));
-  process.env.MUSER_USAGE_FILE = path.join(cwd, 'usage.json');
+  const prevUsageFile = process.env.MUSER_USAGE_FILE; process.env.MUSER_USAGE_FILE = path.join(cwd, 'usage.json'); t.after(() => { if (prevUsageFile === undefined) delete process.env.MUSER_USAGE_FILE; else process.env.MUSER_USAGE_FILE = prevUsageFile; }); // t7 #4: was left pointing at a deleted temp file for later tests
   const histories = new Map(), sends = [];
   const client = new EventEmitter();
   client.status = 'connected'; client.ws = {readyState: 1};

@@ -37,7 +37,7 @@ function parse(file) {
     throw new Error(t('frontmatter が閉じていません（終わりの --- がありません）'));
   const meta = {};
   if (m) for (const line of m[1].split('\n')) { const kv = /^(\w+)\s*:\s*(.*)$/.exec(line.trim()); if (kv) meta[kv[1].toLowerCase()] = kv[2].trim(); }
-  const name = String(meta.name || path.basename(file, '.md')).toLowerCase().replace(/[^a-z0-9_-]/g, '');
+  const name = String(meta.name || path.basename(file).replace(/\.md$/i, '')).toLowerCase().replace(/[^a-z0-9_-]/g, '');
   const tools = meta.tools ? meta.tools.split(',').map(s => s.trim()).filter(Boolean) : null;
   return {name, def: {description: meta.description || name, readOnly: /^(true|yes|1)$/i.test(meta.readonly || ''), tools, prompt: (m ? m[2] : text).trim(), file}};
 }
@@ -60,8 +60,11 @@ function warnOnce(key, text) { if (warned.has(key)) return; warned.add(key); con
 function load(cwd) {
   const types = Object.fromEntries(Object.entries(BUILTIN).map(([k, v]) => [k, {...v, builtin: true}]));
   const userDir = path.join(os.homedir(), '.muser', 'agents'), projectDir = path.join(cwd, '.muser', 'agents');
+  const userNames = new Set();
   for (const dir of [userDir, projectDir]) {
-    let files = []; try { files = fs.readdirSync(dir).filter(f => f.endsWith('.md')); } catch {}
+    // Case-insensitive: NTFS does not distinguish Review.MD from review.md, and a
+    // definition saved with an upper-case extension was silently never loaded (c11 #8).
+    let files = []; try { files = fs.readdirSync(dir).filter(f => f.toLowerCase().endsWith('.md')); } catch {}
     // A project's types come with the repository: one may replace a type's prompt, but a type that
     // was read-only stays read-only, with no tools beyond the ones it had (a repo's review.md turned
     // the read-only built-in reviewer into one that writes).
@@ -90,7 +93,13 @@ function load(cwd) {
       }
       if (Object.prototype.hasOwnProperty.call(BUILTIN, name))
         warnOnce('shadow:' + file, t('muser: 組み込みエージェント {name} は {file} で上書きされます', {name, file}));
+      // A project file replacing the USER's own type was silent, unlike the builtin
+      // case above (c11 #7): the repo's prompt/tools silently took over a type the
+      // user believed was theirs. Warn the same way; the replacement still happens.
+      else if (fromProject && userNames.has(name))
+        warnOnce('shadow-user:' + file, t('muser: ユーザーのエージェント {name} は {file} で上書きされます', {name, file}));
       types[name] = def;
+      if (!fromProject && path.resolve(dir) === path.resolve(userDir)) userNames.add(name);
     }
   }
   return types;

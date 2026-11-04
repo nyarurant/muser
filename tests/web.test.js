@@ -61,7 +61,9 @@ test('#200 web: a caller signal is passed to fetch and its abort is not relabell
   stubFetch(t, (url, opts) => { fetchSignal = opts.signal; return new Promise((resolve, reject) => { opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), {name: 'AbortError'}))); }); });
   const ctrl = new AbortController();
   const p = web.createWeb([]).nativeRequest('device', '/fetch_vms', undefined, 'bearer', ctrl.signal);
-  await new Promise(r => setTimeout(r, 10));
+  // t7 #17 (deep audit): was a fixed 10 ms sleep — under load fetch had not
+  // been reached yet on correct code. Wait for the fetch call itself.
+  for (let i = 0; i < 200 && !fetchSignal; i++) await new Promise(r => setTimeout(r, 25));
   assert.ok(fetchSignal, 'fetch received a signal');
   ctrl.abort();
   await assert.rejects(p, e => e.name === 'AbortError' && e.network === undefined && e.timeout === undefined);

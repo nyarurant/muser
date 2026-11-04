@@ -15,6 +15,18 @@ const crash = require('../src/crash');
 const {Relay} = require('../src/relay');
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
+// t7 #16 (deep audit): connect to a named pipe with retries until it is
+// actually listening (5 s cap), instead of sleeping a fixed 100 ms after
+// start() and hoping the listener won the race on a loaded box.
+async function connectRetry(pipe, ms = 5000) {
+  const net = require('node:net');
+  const t0 = Date.now();
+  for (;;) {
+    const sock = net.connect(pipe);
+    try { await new Promise((res, rej) => { sock.once('connect', res); sock.once('error', rej); }); return sock; }
+    catch (e) { sock.destroy(); if (Date.now() - t0 > ms) throw new Error('pipe ' + pipe + ' never started listening: ' + e.message); await wait(25); }
+  }
+}
 function tmp(t, prefix) { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); t.after(() => fs.rmSync(d, {recursive: true, force: true})); return d; }
 function captureErrors(fn) { const lines = [], orig = console.error; console.error = (...a) => lines.push(a.map(String).join(' ')); try { return fn(); } finally { console.error = orig; } }
 
@@ -172,13 +184,12 @@ test('relay server: an over-long unfinished line and an idle socket are destroye
   const dir = tmp(t, 'muser-relay-cap-');
   const relay = new Relay({dir, takes: () => false, run: async () => ({}), idleTimeoutMs: 150, maxLineBytes: 1024}).start();
   t.after(() => relay.stop());
-  await wait(100);
   const closed = sock => new Promise((resolve, reject) => { const to = setTimeout(() => reject(new Error('socket not closed')), 3000); sock.on('close', () => { clearTimeout(to); resolve(); }); sock.on('error', () => {}); });
-  const big = net.connect(relay.pipe); await new Promise(r => big.on('connect', r));
+  const big = await connectRetry(relay.pipe);
   const bigClosed = closed(big);
   big.write(Buffer.alloc(4096, 'a')); // no newline, over the cap
   await bigClosed;
-  const idleSock = net.connect(relay.pipe); await new Promise(r => idleSock.on('connect', r));
+  const idleSock = await connectRetry(relay.pipe);
   await closed(idleSock); // sends nothing: the idle timeout destroys it
 });
 
@@ -195,7 +206,7 @@ test('relay request: an oversized response is rejected instead of buffered forev
       if (msg.type === 'takes') sock.end('{"takes":true}\n'); else sock.write(Buffer.alloc(4096, 'x')); });
   }).listen(pipe);
   t.after(() => { for (const s of socks) s.destroy(); server.close(); });
-  await wait(100);
+  await new Promise(r => server.once('listening', r)); // t7 #16: was a fixed wait(100) for the listener
   fs.writeFileSync(path.join(dir, 'muser-cap.json'), JSON.stringify({pid: process.pid, pipe}));
   const relay = new Relay({dir, takes: () => false, run: async () => ({}), maxLineBytes: 1024}).start();
   t.after(() => relay.stop());

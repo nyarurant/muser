@@ -85,6 +85,18 @@ test('a SKILL.md saved with a BOM keeps its description', t => {
   assert.equal(s.description, 'Saved by Notepad');
 });
 
+test('a SKILL.md with CRLF endings — and BOM+CRLF — parses the same (t4 #8)', t => {
+  const {proj, put} = sandbox(t);
+  const {frontmatter} = require('../src/skills');
+  const crlf = frontmatter('---\r\nname: crlf\r\ndescription: windows lines\r\n---\r\nBody\r\n');
+  assert.equal(crlf.meta.name, 'crlf');
+  assert.equal(crlf.meta.description, 'windows lines');
+  assert.match(crlf.body, /^Body/);
+  put(path.join(proj, '.muser', 'skills'), 'crlfbom', String.fromCharCode(0xfeff) + '---\r\nname: crlfbom\r\ndescription: Saved by Notepad on Windows\r\n---\r\nbody');
+  const s = require('../src/skills').load(proj).find(x => x.name === 'crlfbom');
+  assert.equal(s.description, 'Saved by Notepad on Windows');
+});
+
 test('skill.read does not follow a link out of the skill or read a secret', t => {
   const {home, proj, put} = sandbox(t);
   const ssh = path.join(home, '.ssh'); fs.mkdirSync(ssh); fs.writeFileSync(path.join(ssh, 'mykey'), 'PRIVATE');

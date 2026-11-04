@@ -134,19 +134,28 @@ test('7: a credentials save failure is swallowed by the session listener', t => 
   t.after(() => { store.save = saved; });
   const {createChat} = require('../src/session');
   const client = createChat({fetchJson: async () => {}});
-  store.save = () => { throw new Error('DPAPI unavailable'); };
+  const calls = [];
+  store.save = (f, c) => { calls.push([f, c]); throw new Error('DPAPI unavailable'); };
   assert.doesNotThrow(() => client.emit('credentials', {token: 'x'}));
+  // t4 #1: prove the listener actually ran — before, a listener that was
+  // never registered (or registered on the wrong event) passed this test.
+  assert.equal(calls.length, 1, 'the credentials listener tried to save');
+  assert.equal(calls[0][0], 'session.enc', 'to the default credentials file');
+  assert.deepEqual(calls[0][1], {token: 'x'}, 'with the emitted credentials');
 });
 
-// 8. sessions all(): only ENOENT means an empty index; other read errors surface.
-test('8: a sessions index that cannot be read for another reason is an error, not an empty list', t => {
+// 8. sessions index read errors: read-only paths degrade to the last good index
+// (deep audit c15 #5, phase 2), but write paths still surface the error instead
+// of overwriting the index with a guessed-empty list (the original #8 hazard).
+test('8: a sessions index that cannot be read for another reason degrades reads, but writes still error', t => {
   const sessions = require('../src/sessions');
   const file = sessions.FILE, backup = file + '.bak-e';
   let had = false;
   try { fs.renameSync(file, backup); had = true; } catch {}
   t.after(() => { try { fs.rmSync(file, {recursive: true, force: true}); } catch {} if (had) try { fs.renameSync(backup, file); } catch {} });
   fs.mkdirSync(file, {recursive: true}); // reading a directory fails with a non-ENOENT code
-  assert.throws(() => sessions.recent(), e => e.code !== 'ENOENT');
+  assert.doesNotThrow(() => sessions.recent(), 'recent() degrades to the last good index (c15 #5)');
+  assert.throws(() => sessions.save({id: 'e8-probe', cwd: process.cwd(), turns: 0}), e => e.code !== 'ENOENT', 'save() must not silently treat the unreadable index as empty');
 });
 
 // 9. sessions locked(): only the lock owner unlinks the lock file.
@@ -230,12 +239,17 @@ test('14: config.update locks, and does not remove a lock it does not own', asyn
   config.update(cfg => { cfg.lang = 'en'; });
   assert.equal(config.read().lang, 'en');
   assert.equal(fs.existsSync(f + '.lock'), false, 'its own lock was released');
-  fs.writeFileSync(f + '.lock', 'other-window');
+  // Phase 2 (first audit #19): an update that cannot take the lock within its
+  // budget now THROWS instead of running unlocked, and a live holder's lock is
+  // never stolen (the lock carries the holder pid; a pid-less legacy lock older
+  // than the stale age may still be taken over, as sessions.locked allows).
+  const foreign = 'other-window:' + process.pid;
+  fs.writeFileSync(f + '.lock', foreign);
   const t0 = Date.now();
-  config.update(cfg => { cfg.lang = 'ja'; });
-  assert.ok(Date.now() - t0 >= 1500, 'it waited on the foreign lock before proceeding');
-  assert.equal(fs.readFileSync(f + '.lock', 'utf8'), 'other-window', "the other window's lock was not unlinked");
-  assert.equal(config.read().lang, 'ja', 'the update still landed');
+  assert.throws(() => config.update(cfg => { cfg.lang = 'ja'; }), /locked by another muser window/, 'it refused to run unlocked');
+  assert.ok(Date.now() - t0 >= 1500, 'it waited on the foreign lock before giving up');
+  assert.equal(fs.readFileSync(f + '.lock', 'utf8'), foreign, "the other window's lock was not unlinked");
+  assert.equal(config.read().lang, 'en', 'the refused update did not land');
 });
 
 // 15. usage record(): load+save run under a lock; a foreign lock is left alone.
@@ -358,7 +372,12 @@ test('22: shell kill reports killed only when taskkill actually killed something
   assert.deepEqual(shells.kill('bgx'), {id: 'bgx', killed: false}, 'a running flag alone is not a kill');
   const s = shells.start('Start-Sleep -Seconds 20', {cwd: process.cwd()});
   assert.deepEqual(shells.kill(s.id), {id: s.id, killed: true});
-  await wait(300);
+  // t4 #2: verify the shell actually died instead of sleeping a dead 300 ms:
+  // poll until the entry reports not running and an exit was recorded.
+  const until = Date.now() + 5000;
+  while (shells.list.get(s.id)?.running && Date.now() < until) await wait(25);
+  assert.equal(shells.list.get(s.id).running, false, 'the killed shell stopped');
+  assert.notEqual(shells.list.get(s.id).exit, null, 'its exit was recorded');
 });
 
 // 23. shells: finished shells beyond the keep count are evicted, buffers dropped.

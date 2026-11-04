@@ -121,7 +121,10 @@ test('@ expand: folder listings count toward MAX_TOTAL', () => {
   for (const n of ['a', 'b', 'c', 'd']) fs.writeFileSync(path.join(dir, n + '.txt'), 'y'.repeat(39900));
   const ex = m.expand('@many @a.txt @b.txt @c.txt @d.txt', dir, new Set());
   assert.deepEqual(ex.files.map(f => f.kind), ['dir', 'file', 'file', 'file', 'file']);
-  assert.ok(ex.block.length <= 155000, 'the whole block stays within the 150k budget (was ~178k when listings were free): ' + ex.block.length);
+  // Tightened from 155000 (t1 #13): measured 150041 with the current build —
+  // the 150,000 content budget plus 41 chars of framing. The old bound hid
+  // ~5k of slack, so a counting regression could pass unnoticed.
+  assert.ok(ex.block.length <= 150250, 'the whole block stays within the 150k budget (was ~178k when listings were free): ' + ex.block.length);
 });
 
 // Audit #241: after an rg timeout resolves with the partial list, the killed child's

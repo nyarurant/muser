@@ -4,6 +4,17 @@ const test = require('node:test');
 const assert = require('node:assert');
 const {EventEmitter} = require('node:events');
 
+// Self-isolation (t1 #11): this file used to depend entirely on
+// tests/setup.mjs being imported for the pinned language and the scratch
+// LOCALAPPDATA / home folders; run standalone it read the real user's
+// ~/.muser. Set them here too (setup.mjs values win when already present).
+{
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  process.env.MUSER_LANG = 'ja';
+  if (!/muser-test/.test(process.env.LOCALAPPDATA || '')) process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-test-data-'));
+  if (!/muser-test/.test(process.env.USERPROFILE || '')) process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-test-home-'));
+}
+
 function fakeOut() {
   const s = new EventEmitter(); s.columns = 100; s.rows = 40; s.isTTY = false; s.out = '';
   s.write = d => { s.out += d; return true; };

@@ -28,6 +28,10 @@ const {Focus, INSTRUCTION: FOCUS_INSTRUCTION, DEFINITIONS: FOCUS_TOOLS} = requir
 
 const DEVICE_NAME = os.hostname() + ' CLI (muser)';
 const INVOKE_GRACE_MS = 30000; // the device link's watchdog margin over Muse's timeout
+// A parallel agent is started again once when Muse ends its chat with one of these within this
+// window and before any tool ran (runWorker). Not cancelled/stopped: those are someone's choice.
+const RETRYABLE_MUSE_STATUS = new Set(['error', 'errored', 'failed']);
+const WORKER_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const INSTRUCTION_FILES = ['AGENTS.md', 'CLAUDE.md', 'MUSE.md', '.muser/instructions.md'];
 const MAX_AGENTS = 4;
 // Muse names its own spinner word (the terminal falls back to a word of its own until it does).
@@ -64,6 +68,21 @@ const PROJECT_INSTRUCTION_TRUNCATION_NOTE = '（プロジェクト指示が長�
 // levels and never reaches a project outside the home folder).
 function userInstructionsFile() { return path.join(os.homedir(), '.muser', 'AGENTS.md'); }
 
+// Only the first 12,000 chars of an instruction file are ever used, so only
+// enough bytes for them are read: 4 bytes per char is past the worst case
+// (a 3-byte BMP char per UTF-16 unit), and a file bigger than that is read
+// through a bounded read instead of being loaded whole just to be cut
+// (deep c2 #2: a several-hundred-MB AGENTS.md froze every turn start).
+const INSTRUCTION_READ_BYTES = 12000 * 4;
+function instructionText(file, size) {
+  let raw, more = false;
+  if (size <= INSTRUCTION_READ_BYTES) raw = fs.readFileSync(file, 'utf8');
+  else {
+    const fd = fs.openSync(file, 'r');
+    try { const buf = Buffer.alloc(INSTRUCTION_READ_BYTES); const n = fs.readSync(fd, buf, 0, buf.length, 0); raw = buf.toString('utf8', 0, n); more = true; } finally { fs.closeSync(fd); }
+  }
+  return (more || raw.length > 12000) ? raw.slice(0, 12000 - PROJECT_INSTRUCTION_TRUNCATION_NOTE.length - 1) + '\n' + PROJECT_INSTRUCTION_TRUNCATION_NOTE : raw;
+}
 function projectInstructions(cwd) {
   // Each file is capped at 12,000 chars; a longer file carries the truncation
   // note inside that budget, so a cut file never looks complete.
@@ -71,14 +90,14 @@ function projectInstructions(cwd) {
   for (let dir = cwd, depth = 0; depth < 6; depth++) {
     for (const name of INSTRUCTION_FILES) {
       const file = path.join(dir, name);
-      try { if (fs.statSync(file).isFile()) { const raw = fs.readFileSync(file, 'utf8'); found.push({file, text: raw.length > 12000 ? raw.slice(0, 12000 - PROJECT_INSTRUCTION_TRUNCATION_NOTE.length - 1) + '\n' + PROJECT_INSTRUCTION_TRUNCATION_NOTE : raw}); } } catch {}
+      try { const st = fs.statSync(file); if (st.isFile()) found.push({file, text: instructionText(file, st.size)}); } catch {}
     }
     const up = path.dirname(dir); if (up === dir) break; dir = up;
   }
   // Last in the budget (the project's own files are more specific), first in the listing.
   const userFile = userInstructionsFile();
   if (!found.some(x => path.resolve(x.file).toLowerCase() === userFile.toLowerCase())) {
-    try { if (fs.statSync(userFile).isFile()) { const raw = fs.readFileSync(userFile, 'utf8'); found.push({file: userFile, user: true, text: raw.length > 12000 ? raw.slice(0, 12000 - PROJECT_INSTRUCTION_TRUNCATION_NOTE.length - 1) + '\n' + PROJECT_INSTRUCTION_TRUNCATION_NOTE : raw}); } } catch {}
+    try { const st = fs.statSync(userFile); if (st.isFile()) found.push({file: userFile, user: true, text: instructionText(userFile, st.size)}); } catch {}
   }
   // Cap the TOTAL across all files: a stack of ancestor instruction files must not eat the whole
   // context. The budget goes to the nearest files first (the project's own are the most specific;
@@ -145,10 +164,51 @@ const AGENT_TOOLS = {
     required: {}, optional: {tags: {type: 'string', description: 'Comma-separated tags; default all.'}, timeout_s: {type: 'integer', description: 'Seconds to wait, max 120.'}}, timeout_ms: 125000},
 };
 
+// A parallel worker whose type restricts it: a read-only flag (explore/plan/review run
+// under plan rules, modeFor) or a tool allowlist the execute() gate enforces. Main's own
+// worker has no type, so it is never restricted.
+function isRestrictedWorker(w) {
+  if (!w || w.tag === 'main' || w.main || !w.turn || !w.type) return false;
+  return !!(w.type.readOnly || (Array.isArray(w.type.tools) && w.type.tools.length));
+}
+// Could this command change files or state if it ran with main's (unrestricted)
+// privileges? Pure reads and the display-only calls stay attributable to main even
+// while a restricted agent runs: they gain nothing from main's privileges. MCP calls
+// are decided in execute() instead, where the effective (trust-aware) kind is known.
+function commandMayWrite(command) {
+  if (typeof command !== 'string' || !command) return false;
+  if (command === 'spinner.set' || command === 'progress.report') return false;
+  const tool = TOOLS[command];
+  if (tool) return tool.kind !== 'read';
+  if (command.startsWith('mcp.')) return false;
+  return true; // agent.*, focus.* and unknown commands are not provably read-only
+}
+// First audit #9: an untagged invoke cannot be told apart from main's own call (main is
+// told to omit the tag). When it would land on main while a restricted parallel agent
+// is also in a turn, it may just as well be that agent having forgotten its tag — and
+// running it as main would bypass the agent's read-only / allowlist limits entirely.
+// Such a write/exec call is therefore unattributable and must be refused (execute()
+// explains), never silently granted main's privileges. Returns {main, restricted}
+// for that case, else null. With no restricted worker active, or when the command is
+// not known (omitted, e.g. the relay's takes check), nothing changes.
+function untaggedRestrictedConflict(workers, params, command) {
+  const tag = typeof params?.agent === 'string' ? params.agent.trim() : '';
+  if (tag || !commandMayWrite(command)) return null;
+  const list = workers instanceof Map ? [...workers.values()] : [...workers];
+  const main = list.find(w => w.tag === 'main');
+  if (!main?.turn) return null;
+  const restricted = list.filter(isRestrictedWorker);
+  return restricted.length ? {main, restricted} : null;
+}
+function untaggedRestrictedError(command, restricted) {
+  const who = restricted.map(x => x.tag + (x.typeName && x.typeName !== x.tag ? ' (' + x.typeName + ')' : '')).join(', ');
+  return 'Refused: this ' + command + ' call has no agent tag, and restricted agent(s) ' + who + ' are running alongside main. An untagged call cannot be told apart from main\'s own, so running it as main could bypass a read-only agent\'s limits if it forgot its tag. Write/exec calls are refused while a restricted agent is active; a parallel agent must pass its own tag as agent. Read-only calls are unaffected.';
+}
+
 // Which worker a device invoke belongs to. An explicit agent tag is authoritative:
 // a tagged call for an unknown worker, or for a worker with no active turn, is refused
 // (null) instead of silently landing on main or on another worker's turn.
-function routeFor(workers, params) {
+function routeFor(workers, params, command) {
   const list = workers instanceof Map ? [...workers.values()] : [...workers];
   const tag = typeof params?.agent === 'string' ? params.agent.trim() : '';
   if (tag) { const w = list.find(x => x.tag === tag); return w?.turn ? w : null; }
@@ -160,7 +220,11 @@ function routeFor(workers, params) {
   const active = list.filter(w => w.turn);
   if (active.length === 1) return active[0];
   const main = list.find(w => w.tag === 'main');
-  return main?.turn ? main : null;
+  if (!main?.turn) return null;
+  // #9 (above): a known write/exec command is not attributed to main while a
+  // restricted agent is concurrently active — it cannot be told from that agent's.
+  if (untaggedRestrictedConflict(list, params, command)) return null;
+  return main;
 }
 
 // Per-turn tool budget. The counter lives on the turn object (created in runTurn), so
@@ -262,6 +326,13 @@ class Agent extends EventEmitter {
     client.on('stream-end', s => { if (this.client === client) this.onStreamClosed(s); }); client.on('stream-error', s => { if (this.client === client) this.onStreamClosed(s); });
   }
   get main() { return this.workers.get('main'); }
+  // The account id other windows and the relay's account filter see: the default
+  // account's real id is 'default' (src/accounts.js DEFAULT_ID), not null — a null
+  // account() reads as "did not say" to src/relay.js and disabled its same-account
+  // filter for the commonest (default-account) window entirely (deep audit H8).
+  // Read live, so a switch (switchAccount sets this.accountId, rollback restores it)
+  // is reflected in the effective value at once.
+  effectiveAccountId() { return this.accountId || 'default'; }
   get session() { return this.main.session; }
   // A chat started here (/new, /clear) belongs to this window's account: untagged, a later
   // resume could not tell which account's Muse holds it and started it on whichever the pool
@@ -280,7 +351,7 @@ class Agent extends EventEmitter {
     const vm = await this.auth.vm();
     if (this.closed) throw new Error('closed');
     // Other muser windows on this PC hand over calls that Muse sent here but belong to their turns.
-    if (!this.relay && !this.closed) this.relay = new Relay({takes: p => !!this.route(p), account: () => this.accountId, run: (c, p, t, id) => this.execute(c, p, t, id, {forwarded: true})}).start();
+    if (!this.relay && !this.closed) this.relay = new Relay({takes: p => !!this.route(p), account: () => this.effectiveAccountId(), run: (c, p, t, id) => this.execute(c, p, t, id, {forwarded: true})}).start();
     const old = this.device;
     // This window's own node id, kept across reconnects (taken again only when the login's changed).
     const base = this.auth.saved.nodeId;
@@ -351,6 +422,13 @@ class Agent extends EventEmitter {
       // The device side too (its registration must match the target's VM): checked here, it
       // fails while this window still works.
       await next.auth.vm();
+      // Deep c2 #3: the busy check at the top ran BEFORE these awaits, and a
+      // turn could start while the target was still connecting (send() did
+      // not look at _switching) — the teardown below then pulled the links
+      // from under the turn that had just begun on the old account. Check
+      // again now, while nothing has been torn down yet: a turn that got in
+      // during preparation refuses the switch instead of being destroyed.
+      if (this.busy || this.focusRun) throw new Error(t('作業中はアカウントを切り替えられません'));
       const from = this.accountId;
       const old = {client: this.client, steps: this.steps, web: this.web, auth: this.auth, accountFiles: this.accountFiles, accountId: this.accountId, accountLabel: this.accountLabel, session: this.session};
       // #8: what the teardown below drops, kept for the rollback: idle workers are
@@ -495,6 +573,7 @@ class Agent extends EventEmitter {
       const count = now - (prev.at || 0) < 30000 ? (prev.count || 0) + 1 : 0;
       clearTimeout(prev.timer);
       const timer = setTimeout(() => {
+        if (this.closed) return; // deep c2 #6: close() also clears these timers; never resubscribe a closed agent
         this.scopeResubs?.delete(scope);
         for (const w of this.workers.values()) if (w.turn?.owner === scope) { this.client.subscribeAgent(w.session.id, scope).catch(() => {}); w.turn.waiting?.refresh(); }
       }, Math.min(60000, 1000 * 2 ** count));
@@ -513,18 +592,24 @@ class Agent extends EventEmitter {
 
   // Which chat a device invoke belongs to: its agent tag, else the only one working.
   // Outside any running turn, or with several running and no tag, nothing is done:
-  // the call may come from another chat, and the user is not watching.
-  route(params) { return routeFor(this.workers, params); }
+  // the call may come from another chat, and the user is not watching. When the
+  // command is known, a write/exec call is also refused attribution to main while a
+  // restricted agent is concurrently active (see untaggedRestrictedConflict).
+  route(params, command) { return routeFor(this.workers, params, command); }
 
   async execute(command, rawParams, timeoutMs, id, {forwarded = false} = {}) {
     const {agent: _tag, ...params} = rawParams || {};
-    const w = this.route(rawParams);
+    const w = this.route(rawParams, command);
     if (!w) {
       // Muse may have sent this to the wrong muser window on this PC (src/relay.js).
       const r = !forwarded && this.relay ? await this.relay.forward(command, rawParams, timeoutMs, id).catch(() => null) : null;
       if (r?.result) return r.result;
       if (r?.error) return {ok: false, error: 'This call went to another muser window on this PC, the one whose task it belongs to, and its answer did not come back (' + r.error + '). It may have run there; check before trying it again.'};
       if (r?.takers > 1) return {ok: false, error: 'Several muser windows on this PC are working at once, and this call could not be matched to its window. Try the call again; if it keeps failing, tell the user to run one muser task at a time.'};
+      // #9: not a routing miss but a refusal — an untagged write/exec call while a
+      // restricted agent runs alongside main cannot be attributed safely (above).
+      const conflict = untaggedRestrictedConflict(this.workers, rawParams, command);
+      if (conflict) return {ok: false, error: untaggedRestrictedError(command, conflict.restricted)};
       // Work is running here, so "idle" would be wrong: say what did not match.
       const running = [...this.workers.values()].filter(x => x.turn).map(x => x.tag);
       const tag = typeof rawParams?.agent === 'string' ? rawParams.agent.trim() : '';
@@ -541,6 +626,13 @@ class Agent extends EventEmitter {
     }
     if (command === 'progress.report') return this.reportProgress(w, params, id);
     if (command === 'spinner.set') return this.setSpinner(w, params, id);
+    // #9, MCP side: routeFor cannot judge an MCP call (its kind depends on the
+    // trust-aware effective kind), so an untagged one that may change things is
+    // refused here under the same rule instead of running with main's privileges.
+    if (command.startsWith('mcp.') && this.mcp?.commands.has(command) && w.main && !(typeof _tag === 'string' && _tag.trim())) {
+      const restricted = [...this.workers.values()].filter(isRestrictedWorker);
+      if (restricted.length && mcpEffectiveKind(this.mcp, this.mcp.commands.get(command)) !== 'read') return {ok: false, error: untaggedRestrictedError(command, restricted)};
+    }
     if (command.startsWith('mcp.') && this.mcp?.commands.has(command)) return this.executeMcp(w, command, params, id, timeoutMs);
     const tool = TOOLS[command];
     if (!tool) { // #13: an unknown command used to cost no budget, so the 250/turn runaway guard never bit on a loop of them
@@ -581,7 +673,7 @@ class Agent extends EventEmitter {
     }
     if (consumeToolCall(w.turn, this.maxToolCallsPerTurn)) return {ok: false, error: toolLimitMessage(this.maxToolCallsPerTurn)};
     try {
-      const state = command === 'focus.plan' ? focus.plan(params.criteria, {newTask: params.new_task === true || params.new_task === 'true'}) : command === 'focus.checkpoint' ? focus.checkpoint(params.checks) : command === 'focus.ask_user' ? focus.askUser(params.question) : focus.snapshot();
+      const state = command === 'focus.plan' ? focus.plan(params.criteria, {newTask: params.new_task === true || params.new_task === 'true'}) : command === 'focus.checkpoint' ? focus.checkpoint(params.checks) : command === 'focus.ask_user' ? focus.askUser(params.question, params) : focus.snapshot();
       this.emit('focus', state);
       return {ok: true, payload: focus.modelState()};
     } catch (e) { return {ok: false, error: e.message}; }
@@ -644,7 +736,10 @@ class Agent extends EventEmitter {
     }
     pruneCollectedWorkers(this.workers);
     this.toolStart(w, call);
-    const tags = String(params.tags || '').split(',').map(s => s.trim()).filter(Boolean);
+    // Deep c2 #4: the same tag twice ("a1,a1") put the same worker in the
+    // list twice, and the delivery loop below advanced its resultOffset
+    // once per entry — the middle 8,000 chars were never handed out.
+    const tags = [...new Set(String(params.tags || '').split(',').map(s => s.trim()).filter(Boolean))];
     // #5: a tag naming main used to put main itself in the wait list, so main waited
     // on its own turn until the timeout. Main is never a waitable parallel agent.
     const list = (tags.length ? tags.map(t => this.workers.get(t)).filter(x => x && !x.main) : [...this.workers.values()].filter(x => !x.main));
@@ -728,6 +823,12 @@ class Agent extends EventEmitter {
     const w = [...this.workers.values()].find(x => x.turn && x.session.id === sid);
     if (!w) return;
     const t = w.turn, name = e.event || '';
+    // First #12: a replayed delta of a message already in the baseline (a
+    // reconnect / resubscribe re-sends old completions) contributes NOTHING
+    // to this turn — its usage included. The usage ingestion used to run
+    // before the baseline check below, so an old turn's counts overwrote
+    // this turn's (and were tallied a second time at turn-end).
+    if (name.startsWith('delta.') && typeof p.message_id === 'string' && t.baseline.has(p.message_id)) return;
     // The turn's real usage lives only in a live event's transcript.messages
     // (never in display_text or history): attach it to the turn — and to the
     // worker, so a parallel agent's snapshot carries it — as soon as it arrives.
@@ -739,15 +840,23 @@ class Agent extends EventEmitter {
       if (p.seq && Number(p.seq) <= m.seq) return;
       m.seq = Number(p.seq) || m.seq;
       let changed = false;
-      if (name === 'delta.text_append' && typeof p.text === 'string') { m.text = stripTurnUsage(m.text + p.text); changed = true; }
-      else if (name === 'delta.presentation' && typeof p.display_text === 'string') { m.text = stripTurnUsage(p.display_text); changed = true; }
+      // First #13: the streamed text is kept WHOLE in m.rawText and only the
+      // displayed m.text is stripped. Stripping the cumulative text itself
+      // deleted a QUOTED [usage] line forever whenever a chunk happened to
+      // end on it (at that moment it looks exactly like the real trailing
+      // usage line); with the raw text kept, the line comes back as soon as
+      // more text follows it, and at message_done the strip judges the
+      // complete text, where only a truly trailing line counts.
+      if (name === 'delta.text_append' && typeof p.text === 'string') { m.rawText = (m.rawText ?? m.text) + p.text; m.text = stripTurnUsage(m.rawText); changed = true; }
+      else if (name === 'delta.presentation' && typeof p.display_text === 'string') { m.rawText = p.display_text; m.text = stripTurnUsage(p.display_text); changed = true; }
       else if (name === 'delta.message_done') {
         for (const c of citations(p.resources)) t.sources.set(c.uri, c);
         const tr = p.transcript, rawFinal = tr?.display_text ?? tr?.content ?? tr?.text;
         const parsedFinal = typeof rawFinal === 'string' ? parseTurnUsage(rawFinal) : null;
         if (parsedFinal?.usage) { t.usage = parsedFinal.usage; w.usage = parsedFinal.usage; }
         const final = parsedFinal ? parsedFinal.body : (typeof rawFinal === 'string' ? stripTurnUsage(rawFinal) : rawFinal);
-        if (typeof final === 'string' && final !== m.text) { m.text = final; changed = true; }
+        if (typeof final === 'string') { m.rawText = final; if (final !== m.text) { m.text = final; changed = true; } }
+        else if (typeof m.rawText === 'string') { const f = stripTurnUsage(m.rawText); if (f !== m.text) { m.text = f; changed = true; } }
       }
       t.messages.set(p.message_id, m);
       if (w.main) {
@@ -775,7 +884,19 @@ class Agent extends EventEmitter {
   }
 
   // One turn of one worker's chat.
-  async runTurn(w, text, {attachments = [], display, focus, signal, turnStart = true} = {}) {
+  // A parallel agent's task: one retry in a fresh chat when Muse ends the first one with an
+  // error before any tool ran (see runTurn's catch). The worker keeps its tag, so agent.wait
+  // and the agent cards follow it through the retry.
+  async runWorker(w, task, opts = {}) {
+    try { return await this.runTurn(w, task, {...opts, retryOnce: true}); }
+    catch (e) {
+      if (!e.retryWorker) throw e;
+      w.session = {...sessions.create(this.cwd), parent: w.session.parent || this.session.id};
+      w.retried = (w.retried || 0) + 1;
+      return this.runTurn(w, task, opts);
+    }
+  }
+  async runTurn(w, text, {attachments = [], display, focus, signal, turnStart = true, retryOnce = false} = {}) {
     display ??= text;
     if (w.turn || w.starting) throw new Error(t('Muse が作業中です。'));
     // Mark the worker as starting NOW, synchronously: w.turn is only assigned
@@ -853,15 +974,24 @@ class Agent extends EventEmitter {
         // failed history fetch on a non-first turn aborts the turn instead of guessing;
         // on a first turn there is nothing local to protect, so it proceeds empty.
         try {
-          let before;
+          let before, complete = false;
           for (let page = 0; page < 10; page++) {
             const history = await this.client.history(w.session.id, before);
             const batch = history?.chat_events || [];
             for (const ev of batch) { const m = messageFromEvent(ev); if (m) turn.baseline.add(m.id); }
             const seqs = batch.map(e => e.seq).filter(Number.isFinite);
-            if (!history?.has_more || !seqs.length) break;
+            if (!history?.has_more) { complete = true; break; }
+            // Deep c2 #5: has_more with no usable seq cannot be paged past,
+            // and running out of pages with has_more still set both leave
+            // the baseline short of "every message" — the guarantee the
+            // fetch exists for. That is a failed fetch, not a finished one:
+            // the catch below aborts a non-first turn instead of starting
+            // it on a partial baseline (a first turn still proceeds, as
+            // with any history failure: nothing local to protect).
+            if (!seqs.length) break;
             before = Math.min(...seqs);
           }
+          if (!complete) throw new Error('baseline incomplete: history has more pages than could be fetched');
         } catch (e) { if (!first) throw new Error(t('履歴の取得に失敗したためターンを開始できませんでした。少し待ってからもう一度送信してください。（{error}）', {error: e.message})); }
       }
       waiting = waitForReply({client: this.client, sessionId: w.session.id, baseline: turn.baseline, signal: turn.controller.signal, timeoutMs: 3 * 3600 * 1000});
@@ -892,7 +1022,12 @@ class Agent extends EventEmitter {
         const waited = await waiting.promise;
         turn.ending = true; // #28: postSteer from here on would land as an orphan message, not inside this turn
         await this.steps.finish(turn, w);
-        const focusDecision = focus?.endRound({workersPending: [...this.workers.values()].some(x => !x.main && x.focusTask === focus && (x.turn || x.starting)), pendingUserInput: !!this.focusInputPending});
+        const workersPending = [...this.workers.values()].some(x => !x.main && x.focusTask === focus && (x.turn || x.starting));
+        const rawDecision = focus?.endRound({workersPending, pendingUserInput: !!this.focusInputPending});
+        // Third M29 (agent side): the decision carries WHY it continues, so
+        // sendFocused can actually wait for the workers instead of spinning
+        // straight into the next round (endRound's shape stays Focus's own).
+        const focusDecision = rawDecision && workersPending ? {...rawDecision, workersPending: true} : rawDecision;
         // The reply itself comes from history, which never carries the [usage] line;
         // the usage (if any) arrived on the live event and sits on turn.usage. Strip
         // anyway, so a reply that did carry the line can never reach the screen,
@@ -914,11 +1049,20 @@ class Agent extends EventEmitter {
       } finally { waiting.cancel(); if (owner) this.client.closeAgentSubscription(owner); }
     } catch (e) {
       const aborted = e.name === 'AbortError';
+      // A parallel agent whose chat Muse ended with an error before it used a single tool goes
+      // again once, in a fresh chat (runWorker). 2026-11-04: ten of 36 agents started together
+      // got Muse's "Sorry, I ran into a problem" within the same 45 seconds; each one started
+      // again by hand finished. No agent-done here: main read the failure and started its own
+      // retries while these were still running, two agents in the same files.
+      if (retryOnce && !w.main && !aborted && !w.stopRequested && RETRYABLE_MUSE_STATUS.has(e.museStatus) && !turn.toolCalls && Date.now() - turn.started < WORKER_RETRY_WINDOW_MS) {
+        Object.assign(w, {state: 'working', lastTool: t('Muse 側でエラー。新しい会話でやり直しています'), error: ''}); this.update(w);
+        throw Object.assign(e, {retryWorker: true});
+      }
       if (focus && focus.status === 'running') focus.stop(aborted ? 'stopped' : 'blocked', e.message);
       Object.assign(w, {state: aborted ? 'stopped' : 'failed', error: aborted ? '' : e.message, ended: Date.now()});
       // #25: keep whatever reply had already streamed before the failure/interrupt;
       // recording reply:'' made an hour of streamed work read as an empty reply on /resume.
-      if (w.main && turn.sent) { const partial = stripTurnUsage([...turn.messages.values()].map(m => m.text).filter(Boolean).pop() || ''); this.record(w, turn, display, {reply: partial, error: aborted ? t('中断しました') : e.message, ...(turn.usage ? {usage: turn.usage} : {})}); }
+      if (w.main && turn.sent) { const partial = stripTurnUsage([...turn.messages.values()].map(m => m.rawText ?? m.text).filter(Boolean).pop() || ''); this.record(w, turn, display, {reply: partial, error: aborted ? t('中断しました') : e.message, ...(turn.usage ? {usage: turn.usage} : {})}); }
       if (w.main) { if (!focus) this.emit('turn-end', {ok: false, error: e.message, aborted, ms: Date.now() - turn.started}); } else this.emit('agent-done', w.snapshot());
       throw e;
     } finally { signal?.removeEventListener('abort', abort); this.steps.finish(turn, w, false).catch(() => {}); if (w.turn === turn) w.turn = null; w.starting = false; }
@@ -949,7 +1093,9 @@ class Agent extends EventEmitter {
   beginUserTurn() { this.userTurnSeq++; this.usagePool = null; }
   poolUsage(w, usage) { if (w.userTurn === this.userTurnSeq) this.usagePool = mergeTotals(this.usagePool, usage); }
   send(text, opts = {}) {
-    if (this.focusRun || this.main.turn || this.main.starting) return Promise.reject(new Error(t('Muse が作業中です。')));
+    // Deep c2 #3: no new turn while an account switch is being prepared —
+    // it would start on the old account and be torn down mid-flight.
+    if (this.focusRun || this.main.turn || this.main.starting || this._switching) return Promise.reject(new Error(t('Muse が作業中です。')));
     this.spawnedThisTurn = 0; // #10: once per USER turn — automatic legs below must not reset it (they used to multiply the per-turn spawn cap by the leg count)
     this.beginUserTurn();
     if (this.focusEnabled) {
@@ -974,10 +1120,10 @@ class Agent extends EventEmitter {
     if (!this.accountPool || this.busy || this.closed || this.client?.status === 'connected') return;
     try { await this.ensureConnected(); } catch {}
   }
-  async sendFocused(text, {display = text, attachments = [], automatic = false, continuation = false, turnEnd = true, maxRounds = require('./settings').numberValue('focusRounds'), timeoutMs = require('./settings').numberValue('focusMinutes') * 60 * 1000} = {}) {
-    if (this.focusRun || this.main.turn || this.main.starting) throw new Error(t('Muse が作業中です。'));
+  async sendFocused(text, {display = text, attachments = [], automatic = false, continuation = false, turnEnd = true, resume = true, maxRounds = require('./settings').numberValue('focusRounds'), timeoutMs = require('./settings').numberValue('focusMinutes') * 60 * 1000} = {}) {
+    if (this.focusRun || this.main.turn || this.main.starting || this._switching) throw new Error(t('Muse が作業中です。'));
     await this.failoverBeforeTurn();
-    if (this.focusRun || this.main.turn || this.main.starting) throw new Error(t('Muse が作業中です。'));
+    if (this.focusRun || this.main.turn || this.main.starting || this._switching) throw new Error(t('Muse が作業中です。'));
     if (!continuation) { this.spawnedThisTurn = 0; this.beginUserTurn(); } // #10: a direct sendFocused is a user turn; an automatic leg (continuation) is the same turn continuing
     // A task that stopped for the user's own interjection — or unfinished at its round
     // limit — belongs to the message that comes next: resume that Focus (same goal,
@@ -987,32 +1133,71 @@ class Agent extends EventEmitter {
     // #33/#36: a resumed leg started by an automatic continuation carries NO user
     // message: it must not satisfy a manual criterion or replace the task via
     // new_task. Only a leg a real user send started may do either (fromUser).
-    if (this.resumeFocus && this.resumeFocus.sessionId === this.session.id) { focus = this.resumeFocus.focus; focus.resumeLeg(display, {fromUser: !continuation}); }
-    this.resumeFocus = null;
+    // First #11 (agent side): the leg also hands over WHAT the user actually
+    // wrote (userText = the send's display text), not just the boolean — a
+    // manual criterion's confirmation lives in those words, and a checkpoint
+    // can only judge it against the message itself.
+    // Third M26: a caller starting a leg for something else (afterGoal's
+    // standing-goal leg, whose task is the goal itself) passes resume:false:
+    // the stash then stays parked for the next user message instead of the
+    // goal leg silently becoming a resumption of the old, unrelated task
+    // (resumeLeg never changes the goal, so the goal leg never ran).
+    if (resume && this.resumeFocus) {
+      if (this.resumeFocus.sessionId === this.session.id) { focus = this.resumeFocus.focus; focus.resumeLeg(display, {fromUser: !continuation, userText: display}); }
+      this.resumeFocus = null;
+    }
     focus ||= new Focus(display, {automatic, maxRounds});
+    // Third M27: workers that outlived a previous leg were stamped with THAT
+    // leg's Focus instance, so a new leg (a fresh instance, e.g. a /goal leg)
+    // never saw them as its own: it did not wait for them and their edits
+    // expired none of its evidence. Still-running task workers are adopted
+    // by the leg that starts while they work — one Focus run at a time owns
+    // the session's surviving workers.
+    for (const x of this.workers.values()) if (!x.main && x.focusTask && x.focusTask !== focus && (x.turn || x.starting)) x.focusTask = focus;
     const run = {focus, controller: new AbortController()}, started = Date.now();
     this.focusRun = run;
     let reply, input = text, waitedMs = 0; // time spent waiting on this task's agents: not counted toward the time limit
+    let pendingSince = null; // when task agents were first seen still running at a round end, continuously since (fifth f3-1 bound)
     let totalUsage = null; // the main worker's replies this leg, summed (a leg is one sendFocused call; afterFocus/afterGoal merge leg totals)
     const sources = new Map();
     try {
       for (;;) {
         run.controller.signal.throwIfAborted(); focus.beginRound();
-        const roundStarted = Date.now();
         reply = await this.runTurn(this.main, input, {display: focus.round === 1 ? display : t('Focus 続行（ラウンド {n}）', {n: focus.round}), attachments: focus.round === 1 ? attachments : [], focus, signal: run.controller.signal, turnStart: !continuation && focus.round === 1});
         totalUsage = mergeTotals(totalUsage, reply.usage);
         for (const source of reply.sources || []) sources.set(source.uri, source);
         if (focus.active) { this.lastFocus = focus.snapshot(); this.emit('focus', this.lastFocus); }
         if (!reply.focusDecision.continue) break;
+        // Third M29 (agent side): a round that ended only because task
+        // workers are still running is a WAIT, not a reason to start the
+        // next round at once — spinning rounds burned the round budget and
+        // re-prompted main while the workers it waited for were unchanged.
+        // Wait for them here (bounded, abort-aware); the wait is what
+        // waitedMs now measures.
+        if (reply.focusDecision.workersPending) {
+          const waitStarted = Date.now();
+          while (!run.controller.signal.aborted && Date.now() - waitStarted < 10000 && [...this.workers.values()].some(x => !x.main && x.focusTask === focus && (x.turn || x.starting))) await new Promise(r => setTimeout(r, 200));
+          waitedMs += Date.now() - waitStarted;
+        }
         // The time limit caps automatic continuation, as /settings names it ("Focus の自動続行の
         // 時間"): no new round once it has passed. It used to be a timer that aborted whatever
         // was running — the user's own request too, even a plain answer with Focus inactive.
-        // A round that ends with task agents still running was spent waiting on them,
-        // not on the task's own work: its span goes to waitedMs (subtracted from the
-        // elapsed total), and the limit does not bite while they run.
+        // A round that ends with task agents still running does not consume
+        // the limit: the task is blocked on its agents, not on its own work.
+        // Fifth f3-1: that exemption used to credit the WHOLE round to
+        // waitedMs, so a worker alive at every round end postponed the
+        // limit forever and main's own round work was never charged. The
+        // pending state is therefore bounded by the limit itself: once
+        // workers have been pending continuously for a full limit span,
+        // the limit bites even while they run.
         const workersRunning = [...this.workers.values()].some(x => !x.main && x.focusTask === focus && (x.turn || x.starting));
-        if (workersRunning) waitedMs += Date.now() - roundStarted;
-        else if (Date.now() - started - waitedMs >= timeoutMs) { focus.stop('limit', 'The Focus time limit was reached.'); this.lastFocus = focus.snapshot(); this.emit('focus', this.lastFocus); break; }
+        if (workersRunning) {
+          if (pendingSince == null) pendingSince = Date.now();
+          else if (Date.now() - pendingSince >= timeoutMs) { focus.stop('limit', 'The Focus time limit was reached.'); this.lastFocus = focus.snapshot(); this.emit('focus', this.lastFocus); break; }
+        } else {
+          pendingSince = null;
+          if (Date.now() - started - waitedMs >= timeoutMs) { focus.stop('limit', 'The Focus time limit was reached.'); this.lastFocus = focus.snapshot(); this.emit('focus', this.lastFocus); break; }
+        }
         this.emit('progress', {agent: 'main', message: t('Focus: 未完了の条件を確認して続行します（{n}/{max}）。', {n: focus.round + 1, max: focus.maxRounds}), at: Date.now()});
         input = focus.prompt();
       }
@@ -1112,7 +1297,11 @@ class Agent extends EventEmitter {
     this.emit('goal', {goal: this.standingGoal(), leg: this.session.goal.legs});
     this.emit('progress', {agent: 'main', message: t('Goal: 常設ゴールに向けて自動で続行します（leg {n}）。', {n: this.session.goal.legs}), at: Date.now()});
     const body = '[muser: automatic /goal continuation]\nStanding goal: ' + g.text + '\nThe previous task ended before this goal was met. Plan this leg with focus.plan — criteria that together mean the goal is achieved — and keep working until every criterion is met. If the goal is already achieved, say so briefly and finish with every criterion met.';
-    const next = await this.sendFocused(body, {display: g.text, automatic: true, continuation: true});
+    // Third M26: this leg's task is the GOAL, so a stashed Focus is resumed
+    // only when it IS the goal's task (same goal text). A parked unrelated
+    // task stays parked for the next user message; resuming it here made
+    // the leg work on the old task while the goal itself never got a leg.
+    const next = await this.sendFocused(body, {display: g.text, automatic: true, continuation: true, resume: f.goal === g.text});
     // Same merge as afterFocus: the goal leg's replies join the user turn's total.
     const merged = mergeTotals(reply.usage, next.usage);
     return this.afterGoal({...next, ...(merged ? {usage: merged} : {})});
@@ -1140,6 +1329,7 @@ class Agent extends EventEmitter {
   types() { return agentTypes.load(this.cwd); }
   spawn(task, {title, by = 'user', type = 'general'} = {}) {
     pruneCollectedWorkers(this.workers);
+    if (this._switching) throw new Error(t('Muse が作業中です。')); // deep c2 #3: no new worker mid-switch either
     if (!task.trim()) throw new Error(t('タスクが空です'));
     const types = this.types(), typeName = String(type || 'general').toLowerCase();
     if (!types[typeName]) throw new Error(t('知らないエージェントの型: {type}（{types}）', {type: typeName, types: Object.keys(types).join(' / ')}));
@@ -1157,9 +1347,13 @@ class Agent extends EventEmitter {
     const w = new Worker({tag, session, ctx, title: (title || task).replace(/\s+/g, ' ').slice(0, 60), by, typeName, type: types[typeName]});
     w.spawnedIn = by === 'muse' ? this.main.turn : null; // stopped with that task on esc (interrupt)
     w.userTurn = this.userTurnSeq; // the user turn it belongs to: its usage pools into that turn's total
-    w.focusTask = by === 'muse' ? this.main.turn?.focus : null;
+    // Third M28: a worker started while a Focus run is live belongs to that
+    // task whoever started it — the user via /agent included. Without the
+    // stamp the leg neither waited for it nor let its edits expire the
+    // task's evidence, though it worked in the same files at the same time.
+    w.focusTask = this.focusRun?.focus || (by === 'muse' ? this.main.turn?.focus : null);
     this.workers.set(tag, w);
-    this.runTurn(w, task, {signal: w.focusTask ? this.focusRun?.controller.signal : undefined}).catch(() => {});
+    this.runWorker(w, task, {signal: w.focusTask ? this.focusRun?.controller.signal : undefined}).catch(() => {});
     return w;
   }
   async stopAgent(tag) {
@@ -1172,14 +1366,22 @@ class Agent extends EventEmitter {
   }
 
   async interrupt() {
+    const run = this.focusRun;
     this.focusRun?.controller.abort();
     const t = this.main.turn;
-    // #3: no main turn is not "nothing to stop": agents Muse spawned for a task
-    // (spawnedIn set) can still be running, and they used to be left working.
+    // #3: no main turn is not "nothing to stop": while a Focus run is between
+    // rounds its task agents can still be running, and they used to be left
+    // working — the focusTask condition below covers that case.
     if (t) t.controller.abort();
-    // The agents Muse started for this task stop with it: after esc they went on editing files
+    // The agents Muse started for THIS task stop with it: after esc they went on editing files
     // and running commands under a screen that said "interrupted". /agent ones are the user's own.
-    for (const w of this.workers.values()) if ((w.turn || w.starting) && (w.spawnedIn != null || (t && w.spawnedIn === t) || (this.focusRun && w.focusTask === this.focusRun.focus))) this.stopAgent(w.tag);
+    // First #10: spawnedIn is the turn OBJECT that spawned the worker, and a
+    // worker that outlived its turn (by design — a later leg collects it) kept
+    // a non-null spawnedIn forever, so any later turn's Esc killed it too.
+    // Only this turn's own workers (spawnedIn === t) and this Focus run's
+    // workers stop; survivors of finished tasks are stopped by cancelAll /
+    // close, or collected by the next leg, not by another task's Esc.
+    for (const w of this.workers.values()) if ((w.turn || w.starting) && ((t && w.spawnedIn === t) || (run && w.focusTask === run.focus))) this.stopAgent(w.tag);
     if (t) await this.client.cancel(this.session.id).catch(() => {});
   }
 
@@ -1192,7 +1394,7 @@ class Agent extends EventEmitter {
     if (jobs.length) await Promise.race([Promise.allSettled(jobs), new Promise(r => setTimeout(r, waitMs))]);
     return jobs.length;
   }
-  close() { this.focusRun?.controller.abort(); this.closed = true; clearTimeout(this.retryTimer); clearTimeout(this.resubTimer); this.relay?.stop(); this.nodeSlot?.release(); this.shells.killAll(); this.device?.disconnect(); this.client.disconnect(false); try { this.accountPool?.drop?.(); } catch {} this.mcp?.close(); }
+  close() { this.focusRun?.controller.abort(); this.closed = true; clearTimeout(this.retryTimer); clearTimeout(this.resubTimer); if (this.scopeResubs) { for (const e of this.scopeResubs.values()) clearTimeout(e.timer); this.scopeResubs.clear(); } this.relay?.stop(); this.nodeSlot?.release(); this.shells.killAll(); this.device?.disconnect(); this.client.disconnect(false); try { this.accountPool?.drop?.(); } catch {} this.mcp?.close(); }
 }
 
 // Automatic /goal legs per standing goal before the run parks for the user: a guard
@@ -1216,4 +1418,4 @@ function outputText(result) {
 }
 
 Agent.DEVICE = DEVICE_NAME;
-module.exports = {Agent, DEVICE_NAME, preamble, projectInstructions, routeFor, consumeToolCall, toolLimitMessage, resolveMaxToolCallsPerTurn, resolveAgentLimits, mcpEffectiveKind, pruneCollectedWorkers, MAX_PROJECT_INSTRUCTION_CHARS, localToday, GOAL_MAX_LEGS, FOCUS_MAX_LEGS};
+module.exports = {Agent, DEVICE_NAME, preamble, projectInstructions, routeFor, consumeToolCall, toolLimitMessage, resolveMaxToolCallsPerTurn, resolveAgentLimits, mcpEffectiveKind, pruneCollectedWorkers, untaggedRestrictedConflict, MAX_PROJECT_INSTRUCTION_CHARS, localToday, GOAL_MAX_LEGS, FOCUS_MAX_LEGS};

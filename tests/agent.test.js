@@ -36,6 +36,7 @@ function stubClient() {
   c.subscribeAgent = async () => {};
   c.closeAgentSubscription = () => {};
   c.cancel = async () => {};
+  c.disconnect = () => {}; // so Agent.close() (registered by makeAgent) runs to completion
   return c;
 }
 function makeAgent(t, agentOpts = {}) {
@@ -49,6 +50,10 @@ function makeAgent(t, agentOpts = {}) {
     ...agentOpts,
   });
   a.subscribed = true; // as bin/muser.js marks it once its startup subscribe is done
+  // t7 #11 (deep audit): no test closed its Agent, so timers/subscriptions
+  // outlived the test and a spawned worker's turn could still be touching
+  // its cwd when t.after removed it. Close every made agent with the test.
+  if (t) t.after(() => { try { a.close(); } catch {} });
   return a;
 }
 function startTurn(a) {
@@ -72,12 +77,19 @@ test('projectInstructions caps the TOTAL characters across all files', (t) => {
   const total = found.reduce((n, e) => n + e.text.length, 0);
   // Ancestor files above the temp dir may add entries, but the cap is over the total.
   assert.ok(total <= MAX_PROJECT_INSTRUCTION_CHARS, 'total ' + total + ' exceeds cap ' + MAX_PROJECT_INSTRUCTION_CHARS);
-  assert.equal(found.filter(e => e.text.includes(NOTE)).length, 1, 'exactly the truncated file carries the note');
+  // t7 #10 (deep audit): the order/note claims below used to read found[0] /
+  // found.at(-1) over the WHOLE result, so they silently depended on which
+  // instruction files happen to live in the temp dir's ancestors (a real
+  // AGENTS.md in %TEMP%'s parents, the user's own ~/.muser/AGENTS.md, …).
+  // Scope them to this test's own three files: the budget reaches the
+  // ancestors only after these, so their allocation is environment-free.
+  const mine = found.filter(e => e.file.startsWith(root));
+  assert.deepEqual(mine.map(e => e.file), [path.join(root, 'AGENTS.md'), path.join(sub, 'AGENTS.md'), path.join(deep, 'AGENTS.md')], 'the three files, listed general before specific');
+  assert.equal(mine.filter(e => e.text.includes(NOTE)).length, 1, 'exactly the truncated file carries the note');
   // The nearest file (the project's own, most specific) is kept whole; an outer one is cut.
   // Before, the budget went outermost-first and cut the project's own file.
-  assert.equal(found[found.length - 1].file, path.join(deep, 'AGENTS.md'), 'listed last: general before specific');
-  assert.equal(found[found.length - 1].text, 'C'.repeat(9000), "the project's own file is whole");
-  assert.ok(found[0].text.includes(NOTE), 'the outermost included file carries the note');
+  assert.equal(mine[mine.length - 1].text, 'C'.repeat(9000), "the project's own file is whole");
+  assert.ok(mine[0].text.includes(NOTE), 'the outermost of the three carries the note');
 });
 
 test('projectInstructions leaves small instruction sets untouched', (t) => {
@@ -308,7 +320,11 @@ test('spawn prunes collected workers and gives the worker its own readFiles set'
   w.ctx.readFiles.add('worker-only');
   assert.ok(!a.ctx.readFiles.has('worker-only'), 'worker reads do not leak back into main');
   assert.equal(w.ctx.shells, a.shells, 'shells stay shared');
-  await new Promise(r => setImmediate(r)); // let the spawned turn fail quietly (no vm in tests)
+  // t7 #11: one setImmediate left the spawned turn running past the test,
+  // racing the t.after cleanup of its cwd/agent. Wait for the turn to
+  // actually settle (it fails fast: no vm in tests) and say so if it does not.
+  for (let i = 0; i < 200 && w.turn; i++) await new Promise(r => setTimeout(r, 25));
+  assert.equal(w.turn, null, 'the spawned turn settled before the test ended');
 });
 
 // ---------- runTurn: history failure & cleanup on setup errors ----------

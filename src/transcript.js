@@ -14,6 +14,15 @@ function userText(content) {
   // The FIRST marker is the real delimiter: the preamble precedes it, and everything
   // after it is the user's words — including a "\nUser:\n" they pasted themselves,
   // which the old lastIndexOf cut away along with everything before it (#21).
+  // Fix2 (c26 #6): the preamble EMBEDS project-instruction / skill text, which can
+  // itself contain a "\nUser:\n" line; the first such line used to cut there and
+  // show the middle of the instructions as the user's words. The real delimiter
+  // is always sent as a blank line followed by the marker (preamble + '\n\nUser:\n'
+  // in agent.js), so a blank-line marker wins; the bare first marker stays as the
+  // fallback for shapes without one. (A marker after a blank line INSIDE embedded
+  // text is indistinguishable from the real one — see the rows file.)
+  const bu = s.indexOf('\n\nUser:\n'), bt = s.indexOf('\n\nTask:\n');
+  if (bu >= 0 || bt >= 0) { const at = bu < 0 ? bt : bt < 0 ? bu : Math.min(bu, bt); return s.slice(at + 8); }
   const u = s.indexOf('\nUser:\n'), t = s.indexOf('\nTask:\n');
   const at = u < 0 ? t : t < 0 ? u : Math.min(u, t);
   return at < 0 ? s : s.slice(at + 7);
@@ -83,16 +92,40 @@ async function forResume(session, client) {
   // bang/shell notes appended, a handoff block inserted). Exact equality missed those,
   // duplicated the turn and grafted the reply onto the wrong one (#18). A substantial
   // prefix/suffix overlap counts as the same turn too.
-  const sameTurn = (l, t) => {
-    const a = String(l.user || '').trim(), b = String(t.user || '').trim();
-    if (!a || !b) return false;
+  // Fix2 (c26 #5 / deep #224, fourth M10): matching used to compare raw text only,
+  // pairwise over every local for every remote (remote x local x text length).
+  // - An attachment-only turn has empty text on BOTH sides and never matched, so
+  //   it duplicated on every fetch; two empty turns now match when their replies
+  //   agree (the reply is the evidence the text cannot give).
+  // - A bare prefix/suffix overlap of as little as 8 chars grafted one turn's
+  //   record onto a different turn that merely starts the same way; a weak
+  //   overlap now needs to be substantial (>= 24 chars and at least half the
+  //   longer text) or corroborated by an identical reply.
+  // - Exact texts go through a map first, so the common case (the same long
+  //   turns on both sides) is linear instead of quadratic; trimmed texts and
+  //   replies are computed once, not per pair.
+  const lText = local.map(l => String(l.user || '').trim());
+  const lReply = local.map(l => String(l.reply || '').trim());
+  const sameTurnAt = (li, t, b) => {
+    const a = lText[li];
+    if (!a || !b) return !a && !b && !!lReply[li] && lReply[li] === String(t.reply || '').trim();
     if (a === b) return true;
-    if (Math.min(a.length, b.length) < 8) return false;
-    return a.startsWith(b) || b.startsWith(a) || a.endsWith(b) || b.endsWith(a);
+    const min = Math.min(a.length, b.length), max = Math.max(a.length, b.length);
+    if (min < 8) return false;
+    if (!(a.startsWith(b) || b.startsWith(a) || a.endsWith(b) || b.endsWith(a))) return false;
+    if (min >= 24 && min * 2 >= max) return true;
+    return !!lReply[li] && lReply[li] === String(t.reply || '').trim();
   };
   const used = new Set(), pairs = []; // [localIndex, remoteIndex], in remote order
+  const byText = new Map(); // exact trimmed text -> queue of local indexes
+  lText.forEach((a, i) => { if (a) { const q = byText.get(a); if (q) q.push(i); else byText.set(a, [i]); } });
+  const byReplyForEmpty = new Map(); // empty-text locals, keyed by their reply
+  lText.forEach((a, i) => { if (!a && lReply[i]) { const q = byReplyForEmpty.get(lReply[i]); if (q) q.push(i); else byReplyForEmpty.set(lReply[i], [i]); } });
+  const takeFrom = q => { while (q && q.length) { const i = q.shift(); if (!used.has(i)) return i; } return -1; };
   const merged = remote.map((t, ri) => {
-    const li = local.findIndex((l, i) => !used.has(i) && sameTurn(l, t));
+    const b = String(t.user || '').trim();
+    let li = b ? takeFrom(byText.get(b)) : takeFrom(byReplyForEmpty.get(String(t.reply || '').trim()));
+    if (li < 0) li = local.findIndex((l, i) => !used.has(i) && sameTurnAt(i, t, b));
     if (li < 0) return t;
     used.add(li); pairs.push([li, ri]);
     return local[li]; // the richer local record stands in for its remote twin
@@ -128,7 +161,35 @@ async function forResume(session, client) {
     for (let i = liFrom; i < local.length; i++) if (!used.has(i)) turns.push(local[i]);
     for (let i = riFrom; i < merged.length; i++) turns.push(merged[i]);
   }
-  if (turns.length >= local.length) { try { sessions.writeTranscript(session.id, turns); } catch {} }
+  // Fix2 (c26 #4, scenario 2): when the fetch stopped at the page cap (more), the
+  // merged result is missing the older side Muse never returned; writing it
+  // back made the local count the gate at the top compares against, so the
+  // missing turns could never be fetched later. A partial merge is shown, not
+  // cached. (Scenario 1 — a chat continued on ANOTHER device never raises this
+  // PC's session.turns, so the gate still cannot see it; that needs a periodic
+  // revalidation policy, recorded as DEFERRED in the rows file.)
+  // Fix2 (third M24, transcript.js part): transcript files have no lock, so a
+  // second window can append a finished turn while this merge runs. Re-read the
+  // file just before writing and keep any turn that arrived after the snapshot
+  // this merge started from, instead of overwriting it away. (The matching lock
+  // in src/sessions.js itself belongs to that file's owner — cross-file note.)
+  if (!more && turns.length >= local.length) {
+    try {
+      const fresh = sessions.transcript(session.id);
+      const keyOf = t => JSON.stringify([t.at || 0, String(t.user || ''), String(t.reply || '')]);
+      const have = new Map();
+      for (const t of turns) have.set(keyOf(t), (have.get(keyOf(t)) || 0) + 1);
+      const extra = [];
+      for (const t of fresh) { const k = keyOf(t); if (have.get(k)) have.set(k, have.get(k) - 1); else extra.push(t); }
+      let out = turns;
+      if (extra.length) {
+        out = [...turns, ...extra];
+        if (out.every(t => Number.isFinite(t.at) && t.at > 0)) out = out.map((t, i) => [t, i]).sort((a, b) => (a[0].at - b[0].at) || (a[1] - b[1])).map(([t]) => t);
+      }
+      sessions.writeTranscript(session.id, out);
+      turns = out;
+    } catch {}
+  }
   return {turns, from: 'muse', partial: more && !keptUnmatched.length};
 }
 

@@ -28,22 +28,26 @@ function fakeClient() {
   return c;
 }
 
-test('a gateway drop during a turn does not end it; the reply is picked up after the reconnect', async () => {
+// A bare `await w.promise` hangs the file when waitForReply regresses to
+// never settling (t3 #15): race every wait against a deadline so it fails.
+const within = (p, ms, what) => Promise.race([p, new Promise((_, rej) => { const tm = setTimeout(() => rej(new Error('timed out after ' + ms + ' ms waiting for ' + what)), ms); tm.unref?.(); })]);
+
+test('a gateway drop during a turn does not end it; the reply is picked up after the reconnect', {timeout: 20000}, async () => {
   const client = fakeClient();
   const w = waitForReply({client, sessionId: 's1', pollMs: 50, settleMs: 0, reconnectGraceMs: 5000});
   client.online = false; client.emit('status', {status: 'disconnected'});
   w.accept('');
   await wait(200);
   client.online = true; client.emit('status', {status: 'connected'});
-  const r = await w.promise;
+  const r = await within(w.promise, 15000, 'the reply after the reconnect');
   assert.equal(r.text, 'done');
 });
 
-test('a gateway that stays down past the grace period ends the turn', async () => {
+test('a gateway that stays down past the grace period ends the turn', {timeout: 20000}, async () => {
   const client = fakeClient();
   const w = waitForReply({client, sessionId: 's1', pollMs: 50, reconnectGraceMs: 100});
   client.online = false; client.emit('status', {status: 'disconnected'}); w.accept('');
-  await assert.rejects(w.promise, /接続が戻らない/);
+  await assert.rejects(within(w.promise, 15000, 'the grace-period rejection'), /接続が戻らない/);
 });
 
 test('an invoke re-sent on the reconnected device is answered from the record, not run again', async () => {

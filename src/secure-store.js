@@ -32,6 +32,29 @@ const cache = new Map();
 function stampOf(target) { try { const st = fs.statSync(target); return {mtimeMs: st.mtimeMs, size: st.size}; } catch { return null; } }
 function fresh(name, st) { const c = cache.get(name); return c && st && c.mtimeMs === st.mtimeMs && c.size === st.size ? c : null; }
 
+// The batch hand-off is positional: line i of PowerShell's output belongs to file i of the
+// input. An empty .enc file (or an empty plaintext) used to vanish from BOTH sides — the
+// PowerShell loop skipped empty input lines and JS dropped empty output lines with
+// filter(Boolean) — so every later file's plaintext was cached under the previous file's
+// name and load() returned another file's secret (deep H14). Empty slots now travel as the
+// '!' failure placeholder, and the JS side maps lines strictly by index.
+function parsePreloadOutput(stdout, count) {
+  const lines = String(stdout ?? '').split(/\r?\n/);
+  if (lines.length && lines[lines.length - 1] === '') lines.pop(); // one trailing newline, not a slot
+  const out = new Array(count).fill(undefined);
+  for (let i = 0; i < count && i < lines.length; i++) out[i] = lines[i];
+  return out;
+}
+function decodePreload(todo, lines) {
+  const decoded = new Map();
+  todo.forEach((t, i) => {
+    const line = lines[i];
+    if (!line || line === '!') return;
+    try { const json = Buffer.from(line, 'base64').toString('utf8'); JSON.parse(json); decoded.set(t.name, json); } catch {}
+  });
+  return decoded;
+}
+
 // Decrypt several files with one PowerShell start (startup needs three).
 function preload(names) {
   const todo = [];
@@ -42,16 +65,13 @@ function preload(names) {
   }
   if (!todo.length) return;
   const script = 'Add-Type -AssemblyName System.Security;' +
-    'foreach($l in [Console]::In.ReadToEnd().Split([char]10)){$l=$l.Trim();if(!$l){continue};' +
-    'try{$o=[Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($l),$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);[Console]::Out.WriteLine([Convert]::ToBase64String($o))}catch{[Console]::Out.WriteLine(\'!\')}}';
+    'foreach($l in [Console]::In.ReadToEnd().Split([char]10)){$l=$l.Trim();if(!$l){[Console]::Out.WriteLine(\'!\');continue};' +
+    'try{$o=[Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($l),$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);if($o.Length -eq 0){[Console]::Out.WriteLine(\'!\')}else{[Console]::Out.WriteLine([Convert]::ToBase64String($o))}}catch{[Console]::Out.WriteLine(\'!\')}}';
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
     {input: todo.map(t => t.data.toString('base64')).join('\n'), encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000});
   if (r.error || r.status !== 0) return; // load() decrypts one by one and reports the real error
-  const out = String(r.stdout).split(/\r?\n/).filter(Boolean);
-  todo.forEach((t, i) => {
-    if (!out[i] || out[i] === '!') return;
-    try { const json = Buffer.from(out[i], 'base64').toString('utf8'); JSON.parse(json); cache.set(t.name, {...t.st, json}); } catch {}
-  });
+  const decoded = decodePreload(todo, parsePreloadOutput(r.stdout, todo.length));
+  for (const t of todo) { const json = decoded.get(t.name); if (json !== undefined) cache.set(t.name, {...t.st, json}); }
 }
 
 function save(name, value) {
@@ -62,14 +82,26 @@ function save(name, value) {
   // A temp name per process: two muser windows saving the same file collided on one '.tmp' and
   // the second rename failed (ENOENT) inside the gateway's credentials event.
   const temp = target + '.tmp-' + process.pid + '-' + Date.now();
-  fs.writeFileSync(temp, dpapi('Protect', Buffer.from(json, 'utf8')));
+  const enc = dpapi('Protect', Buffer.from(json, 'utf8'));
+  fs.writeFileSync(temp, enc);
   // Windows refuses the rename (EPERM / EBUSY / EACCES) while another window or a scanner has the
   // target open for a moment; the failed save then left its temp file behind for good (four of
   // them sat next to web.enc / session.enc on 2026-11-03). Retry briefly, and never leave the temp.
   try { renameRetry(temp, target); }
   catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
   sweepTemps(target);
-  const st = stampOf(target); if (st) cache.set(name, {...st, json});
+  // Cache the saved value only when the file still holds exactly the ciphertext written
+  // here: load() verifies stamp + ciphertext hash for this race, and save() used to pair
+  // its json with whatever stamp a competing window's rename left behind, after which
+  // load() served the stale value as fresh until the file changed again. When the check
+  // fails nothing is cached and the next load() reads the file that is really there.
+  const before = stampOf(target);
+  if (before) {
+    let same = false;
+    try { same = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex') === crypto.createHash('sha256').update(enc).digest('hex'); } catch {}
+    const after = stampOf(target);
+    if (same && after && before.mtimeMs === after.mtimeMs && before.size === after.size) cache.set(name, {...after, json});
+  }
 }
 function renameRetry(from, to) {
   for (let i = 0; ; i++) {
@@ -128,4 +160,4 @@ function load(name) {
 
 function remove(name) { cache.delete(name); try { fs.unlinkSync(file(name)); } catch {} }
 
-module.exports = {DIR, file, save, load, remove, preload, renameRetry};
+module.exports = {DIR, file, save, load, remove, preload, renameRetry, parsePreloadOutput, decodePreload};

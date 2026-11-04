@@ -27,6 +27,12 @@ const MAX_FRAME_CHUNK = MAX_TRANSPORT_PLAINTEXT - 1; // frame = flags byte + chu
 // budget is 32 MiB), and the parts are dropped when the cap trips so the
 // memory is actually released.
 const MAX_ASSEMBLED_PAYLOAD = 32 * 1024 * 1024;
+// Part-count cap, the byte cap's twin (fifth audit s2-1): a non-final frame
+// with a 0-byte chunk grows `parts` (one Buffer object each) without moving
+// `bytes` at all, so the byte cap alone never trips. A legitimate payload
+// needs at most ceil(32 MiB / 65518) = 513 parts; 1024 leaves headroom while
+// keeping the array (and its per-object overhead) bounded.
+const MAX_ASSEMBLED_PARTS = 1024;
 const EMPTY = Buffer.alloc(0);
 
 const PROTOCOL_NAMES = {
@@ -144,15 +150,22 @@ class CipherState {
   decryptWithAd(ad, ciphertext) {
     if (!this.k) return ciphertext;
     if (ciphertext.length < TAGLEN) throw new Error('noise: ciphertext shorter than AEAD tag');
-    const nonce = this.nonceBytes();
+    // Peek at the nonce instead of consuming it: a failed authentication (a
+    // corrupted, duplicated or injected frame) must not desync the stream —
+    // the nonce is only spent once final() has verified the tag, so the next
+    // genuine frame still decrypts (audit c30 #1).
+    if (this.n >= (1n << 64n) - 1n) throw new Error('noise: nonce exhausted');
+    const nonce = Buffer.alloc(12);
+    nonce.writeBigUInt64LE(this.n, 4);
     const decipher = crypto.createDecipheriv('aes-256-gcm', this.k, nonce);
     decipher.setAAD(ad);
     decipher.setAuthTag(ciphertext.subarray(ciphertext.length - TAGLEN));
-    // final() throws on a bad tag; the nonce stays consumed, the state is dead either way.
-    return Buffer.concat([
+    const plaintext = Buffer.concat([
       decipher.update(ciphertext.subarray(0, ciphertext.length - TAGLEN)),
-      decipher.final(),
+      decipher.final(), // throws on a bad tag; this.n is left untouched
     ]);
+    this.n += 1n;
+    return plaintext;
   }
 }
 
@@ -190,6 +203,21 @@ class SymmetricState {
     const plaintext = this.cipher.decryptWithAd(this.h, ciphertext);
     this.mixHash(ciphertext);
     return plaintext;
+  }
+  // Handshake messages are processed token by token, mutating h / ck / the
+  // cipher as they go. NoiseConnection snapshots this state before a message
+  // and restores it when any step throws, so a failed message leaves the
+  // connection exactly as if it had never arrived (audit c30 #1). The buffers
+  // are never mutated in place (every step assigns a fresh one), so sharing
+  // the references is safe.
+  snapshot() {
+    return { h: this.h, ck: this.ck, k: this.cipher.k, n: this.cipher.n };
+  }
+  restore(snap) {
+    this.h = snap.h;
+    this.ck = snap.ck;
+    this.cipher.k = snap.k;
+    this.cipher.n = snap.n;
   }
   split() {
     const [tempK1, tempK2] = hkdfNoise(this.ck, EMPTY, 2);
@@ -280,6 +308,32 @@ class NoiseConnection {
     }
   }
 
+  // A handshake message that fails partway (bad AEAD tag, low-order DH) must
+  // not leave the connection half-advanced: without a rollback the object
+  // looked usable but no correct retransmission could ever succeed again
+  // (audit c30 #1). Snapshot before processing, restore on any throw.
+  snapshotState() {
+    return {
+      sym: this.sym ? this.sym.snapshot() : null,
+      e: this.e, re: this.re, rs: this.rs,
+      messageIndex: this.messageIndex, finished: this.finished,
+      sending: this.sending, receiving: this.receiving,
+    };
+  }
+  restoreState(snap) {
+    if (snap.sym) {
+      if (!this.sym) this.sym = new SymmetricState(PROTOCOL_NAMES[this.pattern]);
+      this.sym.restore(snap.sym);
+    }
+    this.e = snap.e;
+    this.re = snap.re;
+    this.rs = snap.rs;
+    this.messageIndex = snap.messageIndex;
+    this.finished = snap.finished;
+    this.sending = snap.sending;
+    this.receiving = snap.receiving;
+  }
+
   writeMessage(payload) {
     if (this.finished) throw new Error('noise: handshake already finished');
     if (!Buffer.isBuffer(payload)) throw new Error('noise: handshake payload must be a Buffer');
@@ -288,25 +342,31 @@ class NoiseConnection {
     if (payload.length + HANDSHAKE_OVERHEAD[index] > MAX_MESSAGE) {
       throw new Error('noise: handshake message would exceed 65535 bytes');
     }
-    const parts = [];
-    for (const token of this.tokensFor(index)) {
-      if (token === 'e') {
-        this.e = generateStaticKeyPair();
-        parts.push(this.e.publicKey);
-        this.sym.mixHash(this.e.publicKey);
-      } else if (token === 's') {
-        parts.push(this.sym.encryptAndHash(this.s.publicKey));
-      } else if (token === 'psk') {
-        this.sym.mixKeyAndHash(this.psk);
-      } else { // ee / es / se
-        this.applyDhToken(token);
+    const snap = this.snapshotState();
+    try {
+      const parts = [];
+      for (const token of this.tokensFor(index)) {
+        if (token === 'e') {
+          this.e = generateStaticKeyPair();
+          parts.push(this.e.publicKey);
+          this.sym.mixHash(this.e.publicKey);
+        } else if (token === 's') {
+          parts.push(this.sym.encryptAndHash(this.s.publicKey));
+        } else if (token === 'psk') {
+          this.sym.mixKeyAndHash(this.psk);
+        } else { // ee / es / se
+          this.applyDhToken(token);
+        }
       }
+      parts.push(this.sym.encryptAndHash(payload));
+      const message = Buffer.concat(parts);
+      if (message.length > MAX_MESSAGE) throw new Error('noise: handshake message exceeds 65535 bytes');
+      this.advance();
+      return message;
+    } catch (err) {
+      this.restoreState(snap);
+      throw err;
     }
-    parts.push(this.sym.encryptAndHash(payload));
-    const message = Buffer.concat(parts);
-    if (message.length > MAX_MESSAGE) throw new Error('noise: handshake message exceeds 65535 bytes');
-    this.advance();
-    return message;
   }
 
   readMessage(message) {
@@ -322,24 +382,30 @@ class NoiseConnection {
       offset += n;
       return part;
     };
-    for (const token of this.tokensFor(index)) {
-      if (token === 'e') {
-        this.re = Buffer.from(take(32, 'ephemeral key'));
-        this.sym.mixHash(this.re);
-      } else if (token === 's') {
-        const encLen = 32 + (this.sym.cipher.hasKey ? TAGLEN : 0);
-        const rs = this.sym.decryptAndHash(take(encLen, 'static key'));
-        if (rs.length !== 32) throw new Error('noise: decrypted static key is not 32 bytes');
-        this.rs = Buffer.from(rs);
-      } else if (token === 'psk') {
-        this.sym.mixKeyAndHash(this.psk);
-      } else { // ee / es / se
-        this.applyDhToken(token);
+    const snap = this.snapshotState();
+    try {
+      for (const token of this.tokensFor(index)) {
+        if (token === 'e') {
+          this.re = Buffer.from(take(32, 'ephemeral key'));
+          this.sym.mixHash(this.re);
+        } else if (token === 's') {
+          const encLen = 32 + (this.sym.cipher.hasKey ? TAGLEN : 0);
+          const rs = this.sym.decryptAndHash(take(encLen, 'static key'));
+          if (rs.length !== 32) throw new Error('noise: decrypted static key is not 32 bytes');
+          this.rs = Buffer.from(rs);
+        } else if (token === 'psk') {
+          this.sym.mixKeyAndHash(this.psk);
+        } else { // ee / es / se
+          this.applyDhToken(token);
+        }
       }
+      const payload = this.sym.decryptAndHash(message.subarray(offset));
+      this.advance();
+      return payload;
+    } catch (err) {
+      this.restoreState(snap);
+      throw err;
     }
-    const payload = this.sym.decryptAndHash(message.subarray(offset));
-    this.advance();
-    return payload;
   }
 
   writeTransport(plaintext) {
@@ -392,17 +458,30 @@ class FrameDecoder {
   constructor() {
     this.parts = [];
     this.bytes = 0;
+    this.failed = false;
+  }
+  // A cap breach poisons the decoder for good (audit c30 #2): clearing the
+  // buffer and carrying on would let the tail of the oversized payload be
+  // delivered as a complete payload of its own. The caller must drop the
+  // decoder (channel-server closes the channel) and start a new one.
+  fail(error) {
+    this.parts = [];
+    this.bytes = 0;
+    this.failed = true;
+    throw error;
   }
   // Returns the full payload when the final frame arrives, otherwise null.
   push(frame) {
+    if (this.failed) throw new Error('noise: frame decoder already failed (assembled payload cap exceeded); it cannot be reused');
     if (!Buffer.isBuffer(frame) || frame.length < 1) throw new Error('noise: frame must be at least 1 byte');
     const flags = frame[0];
     if (flags & ~0x01) throw new Error(`noise: unknown frame flags 0x${flags.toString(16)}`);
     this.bytes += frame.length - 1;
     if (this.bytes > MAX_ASSEMBLED_PAYLOAD) {
-      this.parts = [];
-      this.bytes = 0;
-      throw new Error(`noise: assembled payload exceeds ${MAX_ASSEMBLED_PAYLOAD} bytes`);
+      this.fail(new Error(`noise: assembled payload exceeds ${MAX_ASSEMBLED_PAYLOAD} bytes`));
+    }
+    if (this.parts.length >= MAX_ASSEMBLED_PARTS) {
+      this.fail(new Error(`noise: assembled payload exceeds ${MAX_ASSEMBLED_PARTS} parts`));
     }
     this.parts.push(Buffer.from(frame.subarray(1)));
     if (!(flags & 0x01)) return null;
@@ -418,14 +497,23 @@ class ChunkReassembler {
   constructor() {
     this.parts = [];
     this.bytes = 0;
+    this.failed = false;
+  }
+  fail(error) {
+    this.parts = [];
+    this.bytes = 0;
+    this.failed = true;
+    throw error;
   }
   push(piece, isLast) {
+    if (this.failed) throw new Error('noise: chunk reassembler already failed (assembled payload cap exceeded); it cannot be reused');
     if (!Buffer.isBuffer(piece)) throw new Error('noise: chunk piece must be a Buffer');
     this.bytes += piece.length;
     if (this.bytes > MAX_ASSEMBLED_PAYLOAD) {
-      this.parts = [];
-      this.bytes = 0;
-      throw new Error(`noise: assembled payload exceeds ${MAX_ASSEMBLED_PAYLOAD} bytes`);
+      this.fail(new Error(`noise: assembled payload exceeds ${MAX_ASSEMBLED_PAYLOAD} bytes`));
+    }
+    if (this.parts.length >= MAX_ASSEMBLED_PARTS) {
+      this.fail(new Error(`noise: assembled payload exceeds ${MAX_ASSEMBLED_PARTS} parts`));
     }
     this.parts.push(Buffer.from(piece));
     if (!isLast) return null;
@@ -447,4 +535,5 @@ module.exports = {
   MAX_MESSAGE,
   MAX_TRANSPORT_PLAINTEXT,
   MAX_ASSEMBLED_PAYLOAD,
+  MAX_ASSEMBLED_PARTS,
 };

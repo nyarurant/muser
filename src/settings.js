@@ -60,7 +60,14 @@ const NUMBERS = {
 // file reads elsewhere, e.g. update.enabled()). A stat per read is cheap; the file is only
 // re-parsed when its stamp actually changed.
 let cache = null, cacheStamp;
-function configStamp() { try { const s = fs.statSync(config.file()); return s.mtimeMs + ':' + s.size; } catch { return null; } }
+// c27 #8: the stamp used to be mtimeMs + size only, so a same-size rewrite
+// landing in the same millisecond (or a timestamp-preserving restore) was
+// read as "unchanged" and the running window kept the old settings until
+// some other change happened to alter the size or mtime. The stamp now
+// also carries the inode and nanosecond mtime/ctime (bigint stat): an
+// in-place rewrite moves ctimeNs, a rename-restore changes the inode, and
+// neither depends on the wall clock's millisecond landing.
+function configStamp() { try { const s = fs.statSync(config.file(), {bigint: true}); return s.ino + ':' + s.size + ':' + s.mtimeNs + ':' + s.ctimeNs; } catch { return null; } }
 function savedSwitches() {
   const stamp = configStamp();
   if (!cache || stamp !== cacheStamp) {
@@ -89,10 +96,20 @@ function switchValue(name) { return envOverride(name) ? SWITCHES[name].envValue 
 // flipped the value in effect, so under MUSER_NO_BELL=1 every press saved "on" and the saved
 // value could never be turned off again.
 function savedValue(name) { return savedSwitches()[name]; }
+// c27 #7: after a save, the setters used to assign their value straight
+// into the cache (`savedSwitches()[name] = ...`). If another window's save
+// landed between this window's config.update and that assignment,
+// savedSwitches() re-read the file (stamp updated to the OTHER window's
+// value) and the assignment then overwrote just this key with the STALE
+// value — with the stamp now matching the file, no re-read ever repaired
+// it, and this window kept returning a value no file holds. After a save
+// the cache is therefore invalidated, never assigned: the next read
+// re-parses the file as it actually stands. A session-only change
+// (save:false) has no file write to race with and still assigns.
 function setSwitch(name, on, {save = true} = {}) {
   if (!SWITCHES[name]) throw new Error('Unknown setting ' + name);
-  if (save) config.update(cfg => { cfg[name] = !!on; });
-  savedSwitches()[name] = !!on;
+  if (save) { config.update(cfg => { cfg[name] = !!on; }); reloadSwitches(); }
+  else savedSwitches()[name] = !!on;
 }
 function reloadSwitches() { cache = null; cacheStamp = undefined; }
 // The env value is clamped to the same range setNumber and the saved-value read enforce:
@@ -103,8 +120,8 @@ function setNumber(name, n, {save = true} = {}) {
   const d = NUMBERS[name];
   if (!d) throw new Error('Unknown setting ' + name);
   if (!Number.isSafeInteger(n) || n < d.min || n > d.max) throw new Error(name + ' must be an integer from ' + d.min + ' to ' + d.max + '.');
-  if (save) config.update(cfg => { cfg[name] = n; });
-  savedSwitches()[name] = n;
+  if (save) { config.update(cfg => { cfg[name] = n; }); reloadSwitches(); } // c27 #7: invalidate, do not assign (see setSwitch)
+  else savedSwitches()[name] = n;
 }
 // What the weekly-limit question (src/ui/controller.mjs askQuotaChoice) does when nobody
 // answers it: auto = go on if extra usage was bought, else hand over; extra = always go on;
@@ -113,20 +130,20 @@ const QUOTA_FALLBACKS = ['auto', 'extra', 'handover', 'ask'];
 // Read from the file each time (the question comes rarely): the cached value missed a change
 // made in another window's /settings until this one restarted.
 function quotaFallback() {
-  try { const v = config.read().quotaFallback; if (QUOTA_FALLBACKS.includes(v)) { savedSwitches().quotaFallback = v; return v; } } catch {}
+  try { const v = config.read().quotaFallback; if (QUOTA_FALLBACKS.includes(v)) return v; } catch {} // c27 #7: no cache assignment here either — a fresher write could land between the read and the assign
   return savedSwitches().quotaFallback;
 }
 function setQuotaFallback(v, {save = true} = {}) {
   if (!QUOTA_FALLBACKS.includes(v)) throw new Error('Unknown quota fallback ' + v);
-  if (save) config.update(cfg => { cfg.quotaFallback = v; });
-  savedSwitches().quotaFallback = v;
+  if (save) { config.update(cfg => { cfg.quotaFallback = v; }); reloadSwitches(); } // c27 #7
+  else savedSwitches().quotaFallback = v;
 }
 // The approval mode for a folder that has none remembered yet.
 function defaultMode() { return savedSwitches().defaultMode; }
 function setDefaultMode(mode, {save = true} = {}) {
   if (!require('./policy').MODES.includes(mode)) throw new Error('Unknown mode ' + mode);
-  if (save) config.update(cfg => { cfg.defaultMode = mode; });
-  savedSwitches().defaultMode = mode;
+  if (save) { config.update(cfg => { cfg.defaultMode = mode; }); reloadSwitches(); } // c27 #7
+  else savedSwitches().defaultMode = mode;
 }
 
 module.exports = {validateAgentLimits, applyAgentLimits, SWITCHES, NUMBERS, switchValue, savedValue, setSwitch, envOverride, reloadSwitches, numberValue, setNumber, defaultMode, setDefaultMode, QUOTA_FALLBACKS, quotaFallback, setQuotaFallback};

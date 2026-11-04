@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {createMd, tableRows} from './md.mjs';
+import {stripControls} from './sanitize.mjs';
 const require = createRequire(import.meta.url);
 const clip = require('../clipboard.js');
 const mention = require('../mentions.js');
@@ -36,6 +37,18 @@ function saveHistory(history) {
   } catch {}
 }
 const deviceName = () => os.hostname() + ' CLI (muser)'; // src/agent.js's DEVICE_NAME formula
+// Grapheme-cluster lengths, the local Controller's helpers (controller.mjs)
+// copied: caret moves and deletes must not split a ZWJ emoji, a flag, a
+// skin-tone modifier or a combining kana (c8 #9). Falls back to code points
+// where Intl.Segmenter is absent.
+const graphemeSegmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+function lastClusterLen(s) { if (!graphemeSegmenter) return [...s].pop()?.length || 0; let n = 0; for (const g of graphemeSegmenter.segment(s)) n = g.segment.length; return n; }
+function firstClusterLen(s) { if (!graphemeSegmenter) return [...s][0]?.length || 0; for (const g of graphemeSegmenter.segment(s)) return g.segment.length; return 0; }
+// A menu's identity, the fingerprint applySnapshot already used for #68:
+// title plus every option's label and value. The menu digit buffer's timer
+// judges by this too (c8 #4), so a re-sent copy of the SAME menu still
+// counts as the same menu while a different one does not.
+const menuFp = x => x ? JSON.stringify([x.title ?? null, (x.options || []).map(o => [o?.label ?? null, JSON.stringify(o?.value ?? null)])]) : null;
 
 export class RemoteController {
   constructor({client, sessionId, version, onExit, onReload}) {
@@ -43,7 +56,7 @@ export class RemoteController {
     this.client = client; this.sessionId = sessionId; this.version = version;
     this.onExit = onExit || (() => {}); this.onReload = onReload;
     this.listeners = new Set();
-    this.outputs = []; // the server owns tool outputs; /output is forwarded like any slash command
+    this.outputs = []; // the server owns tool outputs; ctrl+o fetches them via /outputs (showLatestOutput)
     this.museName = 'Muse'; // until the first snapshot names this conversation's Muse
     // The agent facade the view reads (Banner / Entry / Footer / status): a plain
     // mirror of the server-side agent, refreshed by every snapshot. `constructor`
@@ -75,13 +88,16 @@ export class RemoteController {
     this.linkDownDelayMs = 10000;
     this._closeEvents = null; this._linkTimer = null; this._stopped = false; this._started = false;
     this._allSlash = null; this._slashLoading = null; this.menuBuf = ''; this.menuTimer = null;
+    this._sending = false; // a submit is in flight (c8 #5)
+    this._flashSource = null; // who owns s.flash right now: 'local' | 'server' | null (c8 #7)
+    this._localEntrySeq = 0; // ids for locally appended entries (ctrl+o's note)
   }
   // ---- store (the local Controller's shape, word for word) ----
   subscribe = fn => { this.listeners.add(fn); return () => this.listeners.delete(fn); };
   get = () => this.s;
   set(patch) { this.s = {...this.s, ...patch}; this.trace(Object.keys(patch).join(',')); for (const fn of this.listeners) fn(); }
   trace(what) { (this.trail ||= []).push([Date.now(), what]); if (this.trail.length > 400) this.trail.splice(0, 100); }
-  flash(msg, ms = 2500) { this.set({flash: msg}); clearTimeout(this.flashTimer); this.flashTimer = setTimeout(() => this.set({flash: ''}), ms); this.flashTimer.unref?.(); }
+  flash(msg, ms = 2500) { this._flashSource = 'local'; this.set({flash: msg}); clearTimeout(this.flashTimer); this.flashTimer = setTimeout(() => { this._flashSource = null; this.set({flash: ''}); }, ms); this.flashTimer.unref?.(); }
   setText(text, pos = text.length) { this.set({text, pos}); }
   insert(text) { const {text: cur, pos} = this.s; this.setText(cur.slice(0, pos) + text + cur.slice(pos), pos + text.length); }
 
@@ -131,7 +147,7 @@ export class RemoteController {
     if (this._stopped || this._linkTimer) return;
     this._linkTimer = setTimeout(() => {
       this._linkTimer = null;
-      if (!this._stopped) this.set({linkDown: true, flash: t('接続が切れました。再接続しています…')});
+      if (!this._stopped) { this._flashSource = 'local'; this.set({linkDown: true, flash: t('接続が切れました。再接続しています…')}); }
     }, this.linkDownDelayMs);
     this._linkTimer.unref?.();
   }
@@ -139,11 +155,14 @@ export class RemoteController {
     if (!ev || typeof ev !== 'object') return;
     // Any event after a drop means the stream recovered.
     if (this._linkTimer) { clearTimeout(this._linkTimer); this._linkTimer = null; }
-    if (this.s.linkDown) this.set({linkDown: false, flash: ''});
+    if (this.s.linkDown) { this._flashSource = null; this.set({linkDown: false, flash: ''}); }
     if (ev.kind === 'entry' && ev.entry) return this.set({entries: [...this.s.entries, ev.entry]});
     if (ev.kind === 'entries-reset' && Array.isArray(ev.entries)) {
-      const shrank = ev.entries.length < this.s.entries.length;
-      return this.set({entries: [...ev.entries], ...(shrank ? {clearCount: this.s.clearCount + 1} : {})});
+      // Always clear (deep H3): the server sends a reset for ANY non-append
+      // replacement, whatever its size, and view's <Static> is keyed on
+      // clearCount — clearing only on a shrink left the old conversation
+      // rendered above a same-size-or-larger replacement.
+      return this.set({entries: [...ev.entries], clearCount: this.s.clearCount + 1});
     }
     if (ev.kind === 'state' && ev.state) return this.applySnapshot(ev.state, Array.isArray(ev.state.entries));
     // {kind: 'server'} frames belong to serverEvents(), not a conversation stream.
@@ -166,7 +185,16 @@ export class RemoteController {
     }
     if (snap.busy !== undefined) patch.busy = !!snap.busy; else if (live.busy !== undefined) patch.busy = !!live.busy;
     const spinner = pick('spinnerWord'); if (spinner !== undefined) patch.spinnerWord = spinner;
-    const flash = live.flash; if (flash !== undefined) patch.flash = flash;
+    // Flash is dual-owned (c8 #7): a local notice ("Interrupting…", a
+    // clipboard failure) must survive the state frames that keep arriving
+    // with the server's usual flash:'' until its own timer runs out, and a
+    // server flash that arrives later must not be erased early by that
+    // local timer. Ownership decides whose '' may clear the line.
+    const flash = live.flash;
+    if (flash !== undefined) {
+      if (!flash && this._flashSource === 'local') { /* keep the local notice */ }
+      else { patch.flash = flash; if (flash) { clearTimeout(this.flashTimer); this._flashSource = 'server'; } else if (this._flashSource === 'server') this._flashSource = null; }
+    }
     const device = snap.device || live.device;
     const deviceOk = live.deviceOk !== undefined ? live.deviceOk : device?.connected;
     if (deviceOk !== undefined) patch.deviceOk = !!deviceOk;
@@ -186,8 +214,7 @@ export class RemoteController {
       const m = snap.menu, prev = this.s.menu;
       // #68: title + option count took a different menu for the same one; the
       // options' labels and values are part of the identity now.
-      const fpM = x => x ? JSON.stringify([x.title ?? null, (x.options || []).map(o => [o?.label ?? null, JSON.stringify(o?.value ?? null)])]) : null;
-      const same = !!prev && !!m && fpM(prev) === fpM(m);
+      const same = !!prev && !!m && menuFp(prev) === menuFp(m);
       patch.menu = m ? {...m, options: m.options || [], index: same ? prev.index : (m.index ?? 0)} : null;
     }
     if (snap.limitInput !== undefined) {
@@ -201,6 +228,14 @@ export class RemoteController {
       if (snap[key] !== undefined) patch[key] = snap[key];
     }
     if (snap.account !== undefined) patch.account = snap.account;
+    // c8 #10: these three were constructor nulls that no snapshot ever
+    // wrote, so the account-add screen, the prompt placeholder and the
+    // footer's reserved-account lane could never appear in a remote
+    // window. Map them whenever a snapshot carries them. (Today's
+    // gui-server snapshot does not send them yet — see rows-A12.)
+    if (snap.promptFor !== undefined) patch.promptFor = snap.promptFor || null;
+    if (snap.addFlow !== undefined) patch.addFlow = snap.addFlow || null;
+    if (snap.accountReserved !== undefined) patch.accountReserved = snap.accountReserved ?? null;
     if (snap.mode != null) { patch.mode = snap.mode; this.agent.mode = snap.mode; }
     if (snap.update !== undefined) patch.update = snap.update;
     // The agent facade and Muse's name.
@@ -265,9 +300,16 @@ export class RemoteController {
     if (this.atPick.key !== fragment) this.atPick = {key: fragment, idx: 0};
     return n ? ((this.atPick.idx % n) + n) % n : 0;
   }
+  // $skill completion is skipped here (the skill list lives on the server): the
+  // footer draws no list, and submits still expand $name in the server-side
+  // Controller.submit the /send request lands in.
+  dollarContext() { return null; }
+  dollarIndex(fragment, n) { return 0; }
   atContext(text, pos) {
     const at = mention.fragmentAt(text, pos);
-    return at ? {at, list: mention.complete(at.fragment, this.agent.cwd, mention.COMPLETE_LIMIT, () => this.set({}))} : null;
+    // All matches, as in the local Controller (deep Part B R4-1), not
+    // mention.COMPLETE_LIMIT's first 6.
+    return at ? {at, list: mention.complete(at.fragment, this.agent.cwd, 10000, () => this.set({}))} : null;
   }
   applyAtPick(at, pick) {
     const {text, pos} = this.s;
@@ -287,7 +329,7 @@ export class RemoteController {
     }
     const at = mention.fragmentAt(text, pos);
     if (at) {
-      const list = mention.complete(at.fragment, this.agent.cwd, mention.COMPLETE_LIMIT, () => this.set({}));
+      const list = mention.complete(at.fragment, this.agent.cwd, 10000, () => this.set({}));
       if (!list.length) return;
       const format = pick => { const q = /\s/.test(pick) ? '"' + pick + '"' : pick; return pick.endsWith('/') ? q : q + ' '; };
       const ins = format(list[0]), nt = text.slice(0, at.start) + ins + text.slice(pos);
@@ -315,6 +357,11 @@ export class RemoteController {
     // for every front-end, and /reload restarts this client, not the server.
     if (cmd === '/exit' || cmd === '/quit') return this.onExit();
     if (cmd === '/reload') return this.onReload ? this.onReload() : undefined;
+    // c8 #5: no second send while one is in flight — the attachments stay
+    // attached until a 2xx (the #63 fix), so a repeat Enter in that window
+    // used to re-post the same images with the fallback text.
+    if (this._sending) return;
+    this._sending = true;
     if (cmd === '/clear') this.set({clearCount: this.s.clearCount + 1}); // the server resets the entries too
     // An image-only message still needs a text for the wire (the local
     // Controller's own fallback words for the same case).
@@ -326,9 +373,15 @@ export class RemoteController {
     // images. Only a 2xx clears them; on failure the text goes back into the
     // composer (when it is empty) and the attachments stay attached.
     let res = null;
-    try { res = await r; } catch { res = null; }
+    try { res = await r; } catch { res = null; } finally { this._sending = false; }
     if (res && res.status >= 200 && res.status < 300) {
-      if (this.s.attachments.length) this.set({attachments: []});
+      // Remove only what this send carried (c8 #5): an attachment added
+      // while the send was in flight is not this send's to clear.
+      if (body.attachments?.length) {
+        const left = [...this.s.attachments];
+        for (const sent of body.attachments) { const i = left.indexOf(sent); if (i >= 0) left.splice(i, 1); }
+        if (left.length !== this.s.attachments.length) this.set({attachments: left});
+      }
     } else if (!this._stopped) {
       this.flash(t('接続が切れました。再接続しています…'), 5000);
       if (trimmed && !this.s.text) this.setText(trimmed);
@@ -336,6 +389,11 @@ export class RemoteController {
     return res;
   }
   submitReason(text) {
+    // Clear BEFORE posting (deep H5): the modal is answered, so a repeat key
+    // before the next snapshot must not be able to answer whatever modal
+    // the server has since promoted. Clearing is the local Controller's
+    // behaviour on answer (it consumes the state it answers).
+    this.set({reasonFor: null});
     return Promise.resolve(this.post(this.base() + '/approval', {decision: {allow: false, reason: String(text ?? '').trim()}}));
   }
   setMode(m) {
@@ -368,10 +426,51 @@ export class RemoteController {
       if (!/^\d+$/.test(digits)) return this.flash(t('0 以上の整数を入力してください（0 は無制限）'));
       return this.set({limitInput: {...edit, selected: false, text: (edit.selected ? '' : edit.text) + digits}});
     }
-    if (this.s.approval || this.s.menu) return;
+    // #158's remote recurrence (c8 #6): while a decline reason is being
+    // typed the composer belongs to it, even if a menu opened meanwhile.
+    if (this.s.approval || (this.s.menu && !this.s.reasonFor)) return;
     const paths = clip.pastedImagePaths(value);
     if (paths) return paths.forEach(p => this.attach(p));
-    this.insert(value.replace(/\r\n?/g, '\n'));
+    // Sanitised exactly like the local Controller's paste (deep H4): pasted
+    // text is untrusted, and an OSC 52 / CSI sequence in it would otherwise
+    // execute in the terminal at render time. stripControls keeps \n and \t.
+    this.insert(stripControls(value.replace(/\r\n?/g, '\n')));
+  }
+  // Paste whatever the clipboard holds (ctrl+shift+v, a right-click), the
+  // local Controller's pasteFromClipboard (first #24): an image attaches,
+  // text inserts at the caret through paste() (the sanitised path).
+  async pasteFromClipboard() {
+    const {files, error} = await clip.clipboardImages();
+    if (!error && files.length) return files.forEach(f => this.attach(f.path, f.temporary));
+    const text = await clip.clipboardText().catch(() => '');
+    if (text) return this.paste(text);
+    if (error) return this.flash(t('クリップボードを読めませんでした: {error}', {error}), 6000);
+    this.flash(t('クリップボードに貼れるものがありません'));
+  }
+  // SGR mouse sequences, the local Controller's mouseInput: only a
+  // right-button press means anything (it pastes); every sequence is
+  // swallowed so clicks never land in the composer as garbage.
+  mouseInput(input) {
+    const re = /\x1b\[<\d+;\d+;\d+[Mm]/g;
+    let right = false;
+    for (const seq of input.match(re) || []) if (/\x1b\[<2;\d+;\d+M/.test(seq)) right = true;
+    if (right && !this.s.approval && !this.s.menu && !this.s.limitInput) this.pasteFromClipboard();
+  }
+  // ctrl+o (first #25): the newest tool output in full. The outputs live
+  // server-side, so fetch them (GET /outputs, newest first) and show the
+  // newest as a local note entry, the way the local showOutput does; the
+  // old code only ever read a local array nothing filled, so the key
+  // always claimed there was no output.
+  async showLatestOutput() {
+    let res = null;
+    try { res = await this.request('GET', this.base() + '/outputs'); } catch { res = null; }
+    const list = res?.json?.outputs;
+    if (!Array.isArray(list)) return; // request() already flashed the failure
+    this.outputs = list;
+    if (!list.length) return this.flash(t('まだ PC 操作の出力はありません。'));
+    const o = list[0], lines = String(o?.text ?? '').split('\n'), long = lines.length > 400;
+    const note = [...(o?.title ? [String(o.title)] : []), ...(long ? [t('… 先頭の {n} 行は省略', {n: lines.length - 200})] : []), ...(long ? lines.slice(-200) : lines)];
+    this.set({entries: [...this.s.entries, {id: 'remote-output-' + (++this._localEntrySeq), type: 'note', lines: note}]});
   }
 
   // ---- modal key modes (the local Controller's priority order) ----
@@ -382,11 +481,12 @@ export class RemoteController {
     if (k.downArrow || k.tab) return this.set({approval: {...a, index: (a.index + 1) % n}});
     if (/^[1-9]$/.test(input) && Number(input) <= n) return this.answerApproval(Number(input) - 1);
     if (k.return) return this.answerApproval(a.index || 0);
-    if (k.escape || (k.ctrl && input === 'c')) return this.post(this.base() + '/approval', {decision: {allow: false}});
+    if (k.escape || (k.ctrl && input === 'c')) { this.set({approval: null}); return this.post(this.base() + '/approval', {decision: {allow: false}}); }
   }
   answerApproval(i) {
     const a = this.s.approval, o = a?.options?.[i];
     if (!o) return;
+    this.set({approval: null}); // answered: consume it at once (deep H5, see submitReason)
     // The snapshot option's shape decides, as the local answer() does; the
     // "always" answers go as always: true and the server translates them to
     // the pending approval's own key / the auto-edit switch (gui-server).
@@ -394,34 +494,49 @@ export class RemoteController {
     if (typeof o.always === 'string' || o.autoEdit) return this.post(this.base() + '/approval', {decision: {allow: true, always: true}});
     return this.post(this.base() + '/approval', {decision: {allow: true}});
   }
+  // Answering a menu consumes it at once (deep H5, see submitReason): the
+  // buffered digit and its timer go with it, and repeat keys find no menu.
+  answerMenu(body) { this.menuBuf = ''; clearTimeout(this.menuTimer); this.set({menu: null}); return this.post(this.base() + '/menu', body); }
   menuKey(input, k) {
     const m = this.s.menu, n = m.options?.length || 0;
     if (!n) return;
-    if (k.upArrow) return this.set({menu: {...m, index: (m.index + n - 1) % n}});
-    if (k.downArrow || k.tab) return this.set({menu: {...m, index: (m.index + 1) % n}});
+    // Browsing cancels a buffered digit (c8 #4): the 400 ms reservation is
+    // for the menu as the user left it, not for wherever the highlight
+    // has since moved. (Answering — Enter / Esc / a completed digit —
+    // already clears it in answerMenu.)
+    if (k.upArrow) { this.menuBuf = ''; clearTimeout(this.menuTimer); return this.set({menu: {...m, index: (m.index + n - 1) % n}}); }
+    if (k.downArrow || k.tab) { this.menuBuf = ''; clearTimeout(this.menuTimer); return this.set({menu: {...m, index: (m.index + 1) % n}}); }
     if (/^[0-9]$/.test(input)) {
       const buf = (this.menuBuf || '') + input, val = Number(buf);
-      if (val >= 1 && val <= n && (buf.length === 2 || val * 10 > n)) { this.menuBuf = ''; clearTimeout(this.menuTimer); return this.post(this.base() + '/menu', {index: val - 1}); }
+      if (val >= 1 && val <= n && (buf.length === 2 || val * 10 > n)) return this.answerMenu({index: val - 1});
       if (val >= 1 && val * 10 <= n) {
         this.menuBuf = buf; clearTimeout(this.menuTimer);
-        this.menuTimer = setTimeout(() => { this.menuBuf = ''; if (this.s.menu) this.post(this.base() + '/menu', {index: val - 1}); }, 400); this.menuTimer.unref?.();
+        // Judge by fingerprint, not object identity (c8 #4): a state frame
+        // re-sends the still-open menu as a NEW object, and the buffered
+        // digit must still land on it — but never on a different menu.
+        const fp = menuFp(m);
+        this.menuTimer = setTimeout(() => { this.menuBuf = ''; if (this.s.menu && menuFp(this.s.menu) === fp) this.answerMenu({index: val - 1}); }, 400); this.menuTimer.unref?.();
         return this.set({});
       }
       if (buf.length > 1) { this.menuBuf = ''; return this.menuKey(input, k); }
       return;
     }
-    if (k.return) return this.post(this.base() + '/menu', {index: m.index || 0});
-    if (k.escape || (k.ctrl && input === 'c')) { this.menuBuf = ''; clearTimeout(this.menuTimer); return this.post(this.base() + '/menu', {cancel: true}); }
+    if (k.return) return this.answerMenu({index: m.index || 0});
+    if (k.escape || (k.ctrl && input === 'c')) return this.answerMenu({cancel: true});
   }
   limitKey(input, k) {
     const edit = this.s.limitInput;
-    if (k.escape || (k.ctrl && input === 'c')) return this.post(this.base() + '/limit', {cancel: true});
+    if (k.escape || (k.ctrl && input === 'c')) { this.set({limitInput: null}); return this.post(this.base() + '/limit', {cancel: true, key: edit.key}); }
     if (k.return) {
       const value = Number(edit.text);
       const range = () => this.flash(t('{min}〜{max} の整数を入力してください', {min: edit.min, max: edit.max}));
       if (!/^\d+$/.test(edit.text) || !Number.isSafeInteger(value)) return edit.min !== undefined ? range() : this.flash(t('0 以上の整数を入力してください（0 は無制限）'));
       if (edit.min !== undefined && (value < edit.min || value > edit.max)) return range();
-      return this.post(this.base() + '/limit', {value});
+      this.set({limitInput: null}); // answered: consume it at once (deep H5)
+      // First #22: name the input being answered (its key rides in the
+      // snapshot) — the server refuses a missing/stale key, so a delayed
+      // answer cannot land on a newer limit input.
+      return this.post(this.base() + '/limit', {value, key: edit.key});
     }
     if ((k.ctrl && (input === 'a' || input === 'u')) || k.backspace || k.delete)
       return this.set({limitInput: {...edit, selected: false, text: edit.selected || k.ctrl ? '' : edit.text.slice(0, -1)}});
@@ -430,26 +545,35 @@ export class RemoteController {
 
   // ---- the composer ----
   key(input, k = {}) {
+    if (input && input.includes('\x1b[<')) return this.mouseInput(input);
     if (this.s.approval) return this.approvalKey(input, k);
     if (this.s.limitInput) return this.limitKey(input, k);
-    if (this.s.menu) return this.menuKey(input, k);
+    // #158's remote recurrence (c8 #6): while a decline reason is being
+    // typed the composer keys win over a menu that opened meanwhile; the
+    // menu is still there when the reason is submitted or escaped.
+    if (this.s.menu && !this.s.reasonFor) return this.menuKey(input, k);
     if (!k.tab) this.tabState = null;
     const {text, pos} = this.s;
     if (k.ctrl && input === 'c') {
+      // c8 #6: ctrl+c while a reason is pending answers it with an empty
+      // reason (the local submitReason('')), instead of arming an exit
+      // that leaves the server's reason wait unresolved forever.
+      if (this.s.reasonFor) return this.submitReason('');
       if (this.s.bangRunning) { this.post(this.base() + '/interrupt', {target: 'bang'}); return this.flash(t('中断しています…')); }
       if (this.s.busy) { this.post(this.base() + '/interrupt', {target: 'turn'}); return this.flash(t('中断しています…')); }
       if (text) { this.hIndex = -1; return this.setText(''); }
       if (this.exitArmed.key === 'c' && Date.now() - this.exitArmed.at < 1500) return this.onExit();
       this.exitArmed = {key: 'c', at: Date.now()}; return this.flash(t('もう一度 ctrl+c で終了'));
     }
-    if (k.ctrl && input === 'd' && !text) {
-      if (this.exitArmed.key === 'd' && Date.now() - this.exitArmed.at < 1500) return this.onExit();
-      this.exitArmed = {key: 'd', at: Date.now()}; return this.flash(t('もう一度 ctrl+d で終了'));
+    if (k.ctrl && input === 'd') {
+      if (this.s.reasonFor) return this.submitReason(''); // c8 #6, same as ctrl+c
+      if (!text) {
+        if (this.exitArmed.key === 'd' && Date.now() - this.exitArmed.at < 1500) return this.onExit();
+        this.exitArmed = {key: 'd', at: Date.now()}; return this.flash(t('もう一度 ctrl+d で終了'));
+      }
+      return;
     }
-    if (k.ctrl && input === 'o') {
-      if (!this.outputs.length) return this.flash(t('まだ PC 操作の出力はありません。'));
-      return; // outputs live server-side; /output (forwarded) shows them in the entries
-    }
+    if (k.ctrl && input === 'o') return this.showLatestOutput(); // first #25: fetch the server's outputs
     if (k.escape) {
       if (this.s.reasonFor) { this.setText(''); return this.submitReason(''); }
       if (this.s.busy) { this.post(this.base() + '/interrupt', {target: 'turn'}); return this.flash(t('中断しています…')); }
@@ -461,6 +585,10 @@ export class RemoteController {
       return;
     }
     if (k.tab && k.shift) return this.cycleMode();
+    // ctrl+shift+v (first #24), the local Controller's branch: paste
+    // whatever the clipboard holds — text through paste(), an image as
+    // an attachment. Plain ctrl+v below stays image-only.
+    if (k.ctrl && k.shift && (input === 'V' || input === 'v')) { this.pasteFromClipboard(); return; }
     if ((k.meta && input === 'v') || (k.ctrl && input === 'v') || input === '\x16') { this.pasteImage(); return; }
     if (k.backspace && !text && this.s.attachments.length) return this.set({attachments: this.s.attachments.slice(0, -1)});
     if (k.tab && !k.shift) return this.completeTab(text, pos);
@@ -486,10 +614,12 @@ export class RemoteController {
       return this.submit(text);
     }
     if (input === '\n') return this.insert('\n'); // ctrl+j
-    if (k.backspace) { if (pos) { const ch = [...text.slice(0, pos)].pop(); this.setText(text.slice(0, pos - ch.length) + text.slice(pos), pos - ch.length); } return; }
-    if (k.delete) { const ch = [...text.slice(pos)][0]; if (ch) this.setText(text.slice(0, pos) + text.slice(pos + ch.length), pos); return; }
-    if (k.leftArrow) { if (pos) this.set({pos: pos - [...text.slice(0, pos)].pop().length}); return; }
-    if (k.rightArrow) { const ch = [...text.slice(pos)][0]; if (ch) this.set({pos: pos + ch.length}); return; }
+    // Deletes and caret moves are one grapheme cluster, not one code
+    // point (c8 #9, the local Controller's helpers at the top of file).
+    if (k.backspace) { if (pos) { const n = lastClusterLen(text.slice(0, pos)); this.setText(text.slice(0, pos - n) + text.slice(pos), pos - n); } return; }
+    if (k.delete) { const n = firstClusterLen(text.slice(pos)); if (n) this.setText(text.slice(0, pos) + text.slice(pos + n), pos); return; }
+    if (k.leftArrow) { if (pos) this.set({pos: pos - lastClusterLen(text.slice(0, pos))}); return; }
+    if (k.rightArrow) { const n = firstClusterLen(text.slice(pos)); if (n) this.set({pos: pos + n}); return; }
     if (k.home || (k.ctrl && input === 'a')) return this.set({pos: text.lastIndexOf('\n', pos - 1) + 1});
     if (k.end || (k.ctrl && input === 'e')) { const e = text.indexOf('\n', pos); return this.set({pos: e < 0 ? text.length : e}); }
     if (k.ctrl && input === 'u') return this.setText(text.slice(pos), 0);
@@ -510,6 +640,23 @@ export class RemoteController {
           return this.set({});
         }
       }
+    }
+    // In a multi-line draft ↑/↓ move the caret between lines (c8 #8, the
+    // local Controller's recovery-scan block): they used to be dead keys
+    // there — history is single-line only — so a pasted multi-line prompt
+    // could not be edited without ←→ through every line.
+    if ((k.upArrow || k.downArrow) && text.includes('\n')) {
+      const lineStart = text.lastIndexOf('\n', pos - 1) + 1;
+      const col = pos - lineStart;
+      if (k.upArrow) {
+        if (!lineStart) return;
+        const prevEnd = lineStart - 1, prevStart = text.lastIndexOf('\n', prevEnd - 1) + 1;
+        return this.set({pos: prevStart + Math.min(col, prevEnd - prevStart)});
+      }
+      const lineEnd = text.indexOf('\n', pos);
+      if (lineEnd < 0) return;
+      const nextStart = lineEnd + 1, nextEnd = text.indexOf('\n', nextStart);
+      return this.set({pos: nextStart + Math.min(col, (nextEnd < 0 ? text.length : nextEnd) - nextStart)});
     }
     if ((k.upArrow || k.downArrow) && !text.includes('\n')) {
       if (!this.history.length) return;

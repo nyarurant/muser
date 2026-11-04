@@ -12,7 +12,14 @@ test('background shell: starts at once, output is read incrementally, kill stops
   assert.equal(r.payload.shell_id, 'bg1'); assert.ok(r.payload.running);
   const a = await TOOLS['shell.output'].run({shell_id: 'bg1', wait_s: 3}, ctx);
   assert.match(a.payload.output, /tick \d+/);
-  assert.ok(!a.payload.output.includes('tick 1\n') || !r.payload.output.includes('tick 1\n'), 'second read does not repeat the first');
+  // t6 #8 (deep audit): the old assert here compared a against the START
+  // result with an OR, and looked for 'tick 1\n' — PowerShell output is CRLF,
+  // so that substring never occurs and the assert was always true. Compare
+  // whole tick lines of the first read against the post-kill read instead:
+  // no tick number may be delivered twice.
+  const ticksOf = s => [...String(s).replace(/\r/g, '').matchAll(/tick (\d+)\n/g)].map(m => m[1]);
+  const firstTicks = ticksOf(a.payload.output);
+  assert.ok(firstTicks.length >= 1, 'the first read delivered at least one whole tick line: ' + JSON.stringify(a.payload.output));
   assert.equal(TOOLS['shell.list'].run({}, ctx).payload.shells[0].running, true);
   TOOLS['shell.kill'].run({shell_id: 'bg1'}, ctx);
   // A fixed 1500 ms sleep asserted the Windows process tree was gone by then; under
@@ -24,6 +31,7 @@ test('background shell: starts at once, output is read incrementally, kill stops
     await new Promise(res => setTimeout(res, 250));
   }
   assert.equal(b.payload.running, false, 'the killed shell stopped');
+  assert.deepEqual(ticksOf(b.payload.output).filter(n => firstTicks.includes(n)), [], 'the post-kill read does not repeat any tick the first read delivered');
   assert.ok(!/tick 50/.test(a.payload.output + b.payload.output), 'stopped before the end');
   await assert.rejects(TOOLS['shell.output'].run({shell_id: 'bg9'}, ctx), /No background shell/);
 });
@@ -194,7 +202,13 @@ test('#143: an adopted shell keeps stdout/stderr chronology and does not re-deli
   assert.ok(r.backgrounded, 'moved to the background');
   const s = shells.get(r.backgrounded);
   assert.ok(s.out.indexOf('A') >= 0 && s.out.indexOf('A') < s.out.indexOf('B'), 'seed keeps arrival order (A before B): ' + JSON.stringify(s.out));
-  const done = await new Promise(res => shells.on('finished', x => { if (x.id === s.id) res(x); }));
+  // t6 #9 (deep audit): this finished-wait had no timeout — the same
+  // unbounded hang #255 fixed elsewhere in this file. Bound it the same way.
+  const done = await new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error('timed out after 60 s waiting for adopted shell ' + s.id + ' to finish; output so far: ' + JSON.stringify(s.out).slice(0, 200))), 60000);
+    timer.unref?.();
+    shells.on('finished', x => { if (x.id === s.id) { clearTimeout(timer); res(x); } });
+  });
   assert.equal(done.status, 'completed');
   const main = await shells.output(s.id, {});
   assert.match(main.output, /C/);

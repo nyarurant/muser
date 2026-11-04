@@ -35,6 +35,12 @@ const MAX_SEND_BUFFER_BYTES = 8 * 1024 * 1024;
 // a second time (audit #108). Matches the proxy/phone request timeout.
 const REQ_REPLAY_WINDOW_MS = 30000;
 const MAX_LEDGER_ENTRIES = 256;
+// An in-flight ledger entry whose proxy request ignores the abort signal
+// and never settles must not lock its fingerprint forever (deep audit c23
+// #3): past this age a resend stops joining it and executes fresh. The real
+// proxy answers or times out within 30 s (proxy.js REQUEST_TIMEOUT_MS), so
+// three windows of grace still leave genuinely stuck entries to expire.
+const REQ_IN_FLIGHT_TIMEOUT_MS = 90000;
 
 // Tunnel ids correlate requests/subscriptions with their replies on the
 // phone, which allocates them from one counter (audit #109): an id must be
@@ -65,6 +71,56 @@ function classifyProxyError(err, method) {
   return {status: 502, body: {error: 'proxy request failed', code: 'proxy-failed', retryable: false, outcome: 'unknown'}};
 }
 
+// Channel allowlist (first audit #6): a paired phone is a remote control for
+// ONE conversation, not a second local operator. The tunnel may only reach
+// the ordinary serve API the phone actually uses — per-conversation routes
+// (bare or under /api/s/:id/) and the session list/open/close routes. Server
+// administration is NEVER reachable through a channel: everything under
+// /api/server (info, events, stop, link pair/revoke) is denied, as is any
+// other path or method, so a stolen phone cannot mint a new pairing, stop
+// the server, or revoke other devices through the tunnel.
+function channelPathname(rawPath) {
+  if (typeof rawPath !== 'string' || !rawPath.startsWith('/') || rawPath.startsWith('//') || rawPath.includes('\\')) return null;
+  // Dot segments in ANY encoding are refused outright: URL parsing silently
+  // normalises %2e%2e away, which must never smuggle a path past the rules.
+  for (const seg of rawPath.split(/[?#]/)[0].split('/')) {
+    let decoded = seg;
+    try { decoded = decodeURIComponent(seg); } catch { return null; }
+    if (decoded === '.' || decoded === '..') return null;
+  }
+  let p;
+  try { p = new URL(rawPath, 'http://channel.invalid').pathname; } catch { return null; }
+  try { p = decodeURIComponent(p); } catch { return null; }
+  if (p.includes('\\') || p.split('/').includes('..')) return null;
+  return p;
+}
+const CHANNEL_REQ_RULES = [
+  ['GET', /^\/api\/(?:s\/[^/]+\/)?(?:state|events|complete|changes|muse-avatar|outputs|entries)$/],
+  ['POST', /^\/api\/(?:s\/[^/]+\/)?(?:send|approval|mode|menu|limit|interrupt|shell-kill)$/],
+  ['GET', /^\/api\/sessions$/],
+  ['POST', /^\/api\/sessions$/],
+  ['POST', /^\/api\/sessions\/[^/]+\/(?:open|close)$/],
+];
+function isAllowedChannelRequest(method, rawPath) {
+  const p = channelPathname(rawPath);
+  if (!p) return false;
+  if (p === '/api/server' || p.startsWith('/api/server/')) return false;
+  // The allowlist governs the serve API namespace: gui-server routes ONLY
+  // /api/* (anything else falls through to its 404), so a path outside /api/
+  // names no serve capability at all and the proxy's 404 is the whole story.
+  // Inside /api/, only the rules above may pass.
+  if (!p.startsWith('/api/')) return true;
+  const m = String(method || '').toUpperCase();
+  return CHANNEL_REQ_RULES.some(([mm, re]) => mm === m && re.test(p));
+}
+function isAllowedChannelSubscription(rawPath) {
+  const p = channelPathname(rawPath);
+  if (!p) return false;
+  if (!p.startsWith('/api/')) return true; // as above: no serve route exists there
+  // Only the per-conversation SSE stream; /api/server/events never matches.
+  return /^\/api\/(?:s\/[^/]+\/)?events$/.test(p);
+}
+
 // In-flight / undelivered request outcomes, shared by every channel that
 // uses the same proxy (i.e. every channel of one Link), keyed by device +
 // a fingerprint of the request itself (audit #108). A phone whose channel
@@ -85,6 +141,25 @@ function requestFingerprint(method, path, body) {
   let bodyText;
   try { bodyText = JSON.stringify(body ?? null); } catch { bodyText = String(body); }
   return crypto.createHash('sha256').update(String(method || 'GET') + ' ' + String(path || '') + '\n' + bodyText).digest('hex');
+}
+// Ledger eviction (deep audit c23 #2): only an entry whose loss cannot
+// cause a second execution may be evicted — an aborted/delivered leftover,
+// or a settled entry whose replay window has already closed. An in-flight
+// entry, and a settled-but-undelivered entry still inside its replay
+// window, are never dropped to make room: a resend that found them gone
+// would execute the same non-idempotent request a second time, which is
+// exactly what the ledger exists to prevent. When nothing is evictable the
+// ledger stays over the cap until entries settle or expire — the memory
+// bound yields to correctness.
+function evictLedgerEntries(ledger, replayWindowMs) {
+  while (ledger.size > MAX_LEDGER_ENTRIES) {
+    let victim = null;
+    for (const [k, e] of ledger) {
+      if (e.aborted || e.delivered || (e.settled && Date.now() - e.settledAt > replayWindowMs)) { victim = k; break; }
+    }
+    if (victim === null) break;
+    ledger.delete(victim);
+  }
 }
 
 // Accept the keys in loadOrCreateLinkKeys()'s shape, or a bare Noise pair.
@@ -113,10 +188,13 @@ function notePairAttempt(pairing) {
 function notePairFailure(ctx) {
   try { ctx.onPairFailure?.(); } catch {}
 }
-function notePairSuccess(ctx) {
-  const p = ctx.pairing;
+function notePairSuccess(ctx, claimedPairing) {
+  const p = claimedPairing || ctx.pairing;
   if (p) p.consumed = true;
-  try { ctx.onPairSuccess?.(); } catch {}
+  // The claimed pairing object travels with the callback (first audit #7):
+  // link.js clears its current pairing only when it IS this object, so a
+  // stale channel can never wipe a newer pairing it never belonged to.
+  try { ctx.onPairSuccess?.(p); } catch {}
 }
 function codeMatches(given, expected) {
   const a = Buffer.from(String(given ?? '')), b = Buffer.from(String(expected ?? ''));
@@ -247,7 +325,12 @@ async function handleChannelSocket(ws, ctx) {
     let payload;
     try { payload = Buffer.from(JSON.stringify(obj), 'utf8'); } catch { return false; }
     const buffered = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
-    if (buffered > sendBufferLimit) {
+    // The check must cover THIS message too (deep audit c23 #4, the rest of
+    // audit #118): checking only what is already buffered lets one oversized
+    // reply queue its every frame past the limit. Refuse the message whole
+    // when it would push the socket over the limit — never send half a
+    // message, which would corrupt the framing of everything behind it.
+    if (buffered + payload.length > sendBufferLimit) {
       if (obj && obj.t === 'ev') return false;
       close(1009);
       return false;
@@ -265,8 +348,21 @@ async function handleChannelSocket(ws, ctx) {
   let transportFailure = null;
   const APP_TIMEOUT = Symbol('app-timeout');
   const nextApp = async timeoutMs => {
+    // One deadline for the whole wait (deep audit c23 #1): frames that are
+    // skipped below — retransmitted handshake copies, incomplete frame
+    // fragments — are not application activity and must not rewind the
+    // clock, or a trickle of meaningless frames keeps a dead channel (and
+    // the pairing wait, which shares this helper) alive forever. Only a
+    // completed application message ends the wait, so only it counts as
+    // activity for the caller's idle accounting.
+    const deadline = timeoutMs ? Date.now() + timeoutMs : 0;
     for (;;) {
-      const item = await queue.next(timeoutMs);
+      let remainingMs = timeoutMs;
+      if (deadline) {
+        remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return APP_TIMEOUT;
+      }
+      const item = await queue.next(remainingMs);
       if (!item) return queue.timedOut ? APP_TIMEOUT : null;
       // Retransmitted handshake messages are not transport (audit #95):
       // message 3 was already exempted; a late duplicate message 1 (the
@@ -301,20 +397,43 @@ async function handleChannelSocket(ws, ctx) {
     // may have claimed it since, and one code pairs exactly one phone. Re-check
     // before the device is stored (audit #87) — no await between this check and
     // notePairSuccess, so the claim cannot interleave with another connection's.
-    if (pairing.consumed || (pairing.expiresAt && pairing.expiresAt <= Date.now())) {
+    if (pairing.consumed || pairing.burned || (pairing.expiresAt && pairing.expiresAt <= Date.now())) {
       try { sendApp({t: 'pair-failed', error: 'pairing already used'}); } catch {}
       close();
       return {ok: false, reason: 'pairing-consumed'};
     }
+    // The pairing must still be the link's CURRENT pairing (first audit #7):
+    // a channel that grabbed pairing A before the user replaced it with B
+    // must not register on the stale object. link.js supplies getPairing();
+    // contexts without it keep the consumed/expired/burned checks above.
+    if (typeof ctx.getPairing === 'function') {
+      let current = null;
+      try { current = ctx.getPairing(); } catch { current = null; }
+      if (current !== pairing) {
+        try { sendApp({t: 'pair-failed', error: 'pairing superseded'}); } catch {}
+        close();
+        return {ok: false, reason: 'pairing-superseded'};
+      }
+    }
     try { device = ctx.remoteStore.add({name: first.name || 'phone', staticPub: remoteStatic}); }
     catch (e) { close(); return {ok: false, reason: 'store-failed', error: e}; }
-    notePairSuccess(ctx);
+    notePairSuccess(ctx, pairing);
     sendApp({t: 'paired', device: {id: device.id, name: device.name}, pc: {name: os.hostname(), pcId: pcIdOf(ctx), relay: ctx.relayUrl || null, lan: ctx.lanAddresses || []}});
   } else {
     device = ctx.remoteStore.findByStatic(remoteStatic);
     if (!device) { close(4403); return {ok: false, reason: 'unpaired'}; }
   }
   try { ctx.remoteStore.touch(device.id); } catch {} // lastSeen, on connect
+
+  // Revocation must reach LIVE channels (first audit #5): the store was only
+  // consulted at connect time, so a phone revoked mid-session kept working
+  // forever as long as it pinged. Re-validate the device against the store
+  // on every application message (ping included); a store read failure is
+  // not a revocation and never kills the channel by itself.
+  const deviceRevoked = () => {
+    if (!device || !remoteStatic) return false;
+    try { return !ctx.remoteStore.findByStatic(remoteStatic); } catch { return false; }
+  };
 
   // Requests are dispatched, not awaited in the loop (audit #104): one slow
   // serve request (up to the proxy's 30 s) must not park ping/pong and every
@@ -328,6 +447,7 @@ async function handleChannelSocket(ws, ctx) {
     const msg = await nextApp(idleTimeoutMs || undefined);
     if (msg === APP_TIMEOUT) { close(); return {ok: false, reason: 'idle-timeout', device}; }
     if (!msg) break;
+    if (deviceRevoked()) { close(4403); return {ok: false, reason: 'revoked', device}; }
     if (msg.t === 'ping') { sendApp({t: 'pong'}); continue; }
     if (msg.t === 'req') {
       // An id that cannot correlate a reply, or one this channel is already
@@ -337,6 +457,13 @@ async function handleChannelSocket(ws, ctx) {
       if (reqIdsInFlight.has(msg.id)) continue;
       reqIdsInFlight.add(msg.id);
       const run = (async () => {
+        // Allowlist first (first audit #6): a forbidden path/method is
+        // answered 403 here and never reaches the proxy or the dedupe
+        // ledger, so it cannot execute on serve or pollute replays.
+        if (!isAllowedChannelRequest(msg.method, msg.path)) {
+          sendApp({t: 'res', id: msg.id, status: 403, body: {error: 'path not allowed over the channel', code: 'channel-forbidden'}});
+          return;
+        }
         // Dedupe across channels (audit #108): an identical request from the
         // same device joins the outcome already in flight in the shared
         // ledger, and replays it when the original finished but its reply
@@ -346,13 +473,19 @@ async function handleChannelSocket(ws, ctx) {
         const ledger = ledgerFor(ctx.proxy);
         const key = (device?.id || '') + '|' + requestFingerprint(msg.method, msg.path, msg.body);
         const replayWindowMs = ctx.reqReplayWindowMs ?? REQ_REPLAY_WINDOW_MS;
+        const inFlightTimeoutMs = ctx.reqInFlightTimeoutMs ?? REQ_IN_FLIGHT_TIMEOUT_MS;
         let entry = ledger.get(key);
-        if (entry && (entry.aborted || entry.delivered || (entry.settled && Date.now() - entry.settledAt > replayWindowMs))) {
+        if (entry && (entry.aborted || entry.delivered || (entry.settled && Date.now() - entry.settledAt > replayWindowMs) || (!entry.settled && Date.now() - entry.createdAt > inFlightTimeoutMs))) {
+          // A stuck in-flight entry expires like a settled one (deep audit
+          // c23 #3): abort it so a proxy that honours the signal frees the
+          // request, and let this resend execute fresh instead of joining
+          // a promise that will never settle.
+          if (!entry.settled) { try { entry.controller?.abort(); } catch {} }
           ledger.delete(key);
           entry = null;
         }
         if (!entry) {
-          entry = {settled: false, delivered: false, aborted: false, settledAt: 0, result: null, listeners: new Set(), controller: null, promise: null};
+          entry = {settled: false, delivered: false, aborted: false, settledAt: 0, createdAt: Date.now(), result: null, listeners: new Set(), controller: null, promise: null};
           const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
           entry.controller = controller;
           entry.promise = (async () => {
@@ -379,11 +512,7 @@ async function handleChannelSocket(ws, ctx) {
             if (entry.aborted && ledger.get(key) === entry) ledger.delete(key);
           });
           ledger.set(key, entry);
-          while (ledger.size > MAX_LEDGER_ENTRIES) {
-            const oldest = ledger.keys().next().value;
-            if (oldest === key) break;
-            ledger.delete(oldest);
-          }
+          evictLedgerEntries(ledger, replayWindowMs);
         }
         // This channel's interest in the entry: the proxy request is aborted
         // only when EVERY channel waiting on it has gone away, so a resend
@@ -413,6 +542,12 @@ async function handleChannelSocket(ws, ctx) {
       // A duplicate id keeps the original subscription (audit #109): the new
       // one is not opened, and the original is not silently replaced.
       if (subs.has(msg.id)) continue;
+      // Subscriptions obey the same allowlist (first audit #6): only the
+      // per-conversation event stream may be opened through a channel.
+      if (!isAllowedChannelSubscription(msg.path)) {
+        sendApp({t: 'sub-failed', id: msg.id, error: 'subscription not allowed over the channel', code: 'channel-forbidden'});
+        continue;
+      }
       let closeSub = null;
       let failedBeforeOpen = false;
       const onSubError = () => {
@@ -454,4 +589,4 @@ async function handleChannelSocket(ws, ctx) {
   return {ok: true, device};
 }
 
-module.exports = {handleChannelSocket, pairingActive, messageQueue, HANDSHAKE_TIMEOUT_MS, CHANNEL_IDLE_TIMEOUT_MS, MAX_QUEUED_ITEMS, MAX_QUEUED_BYTES};
+module.exports = {handleChannelSocket, pairingActive, messageQueue, isAllowedChannelRequest, isAllowedChannelSubscription, HANDSHAKE_TIMEOUT_MS, CHANNEL_IDLE_TIMEOUT_MS, MAX_QUEUED_ITEMS, MAX_QUEUED_BYTES};

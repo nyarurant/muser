@@ -2,7 +2,7 @@
 // The last six of the 100-improvement run (95-100), 2026-11-01. #95 (dead i18n keys)
 // has its test in tests/i18n.test.js; the other five live here.
 const test = require('node:test');
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');

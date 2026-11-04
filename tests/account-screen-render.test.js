@@ -26,13 +26,16 @@ test('the account-add screen renders in the real Ink components', async () => {
   const stdout = new EventEmitter(); Object.assign(stdout, {columns: 100, rows: 40, isTTY: false, text: ''});
   stdout.write = data => { stdout.text += data; return true; };
   const app = render(React.createElement(Live, {s: ctrl.get(), ctrl, W: 99}), {stdout, debug: true, patchConsole: false, exitOnCtrlC: false});
-  await waitForText(stdout, /アカウントを追加しています…/, 'the add-screen frame'); app.unmount();
-  assert.match(stdout.text, /アカウントを追加/);
-  assert.match(stdout.text, /追加するアカウントの名前/);
-  assert.match(stdout.text, /認証コードを送っています/);
-  assert.match(stdout.text, /アカウントを追加しています…/, 'the composer hint is the add one, not the chat one');
-  assert.ok(!stdout.text.includes('何をしますか'), 'the chat placeholder never shows on the add screen');
-  clearTimeout(ctrl.flashTimer);
+  // Cleanup in finally (t3 #19): an assertion failure used to skip unmount
+  // and the flash timer, leaving Ink mounted into the next test.
+  try {
+    await waitForText(stdout, /アカウントを追加しています…/, 'the add-screen frame');
+    assert.match(stdout.text, /アカウントを追加/);
+    assert.match(stdout.text, /追加するアカウントの名前/);
+    assert.match(stdout.text, /認証コードを送っています/);
+    assert.match(stdout.text, /アカウントを追加しています…/, 'the composer hint is the add one, not the chat one');
+    assert.ok(!stdout.text.includes('何をしますか'), 'the chat placeholder never shows on the add screen');
+  } finally { try { app.unmount(); } catch {} clearTimeout(ctrl.flashTimer); }
 });
 
 test('on the add screen, a pending question makes the composer say what to do', async () => {
@@ -47,8 +50,9 @@ test('on the add screen, a pending question makes the composer say what to do', 
   const stdout = new EventEmitter(); Object.assign(stdout, {columns: 100, rows: 40, isTTY: false, text: ''});
   stdout.write = data => { stdout.text += data; return true; };
   const app = render(React.createElement(Live, {s: ctrl.get(), ctrl, W: 99}), {stdout, debug: true, patchConsole: false, exitOnCtrlC: false});
-  await waitForText(stdout, /ここに入力して Enter/, 'the prompt-hint frame'); app.unmount();
-  assert.match(stdout.text, /ここに入力して Enter/);
-  assert.ok(!stdout.text.includes('何をしますか'));
-  clearTimeout(ctrl.flashTimer);
+  try {
+    await waitForText(stdout, /ここに入力して Enter/, 'the prompt-hint frame');
+    assert.match(stdout.text, /ここに入力して Enter/);
+    assert.ok(!stdout.text.includes('何をしますか'));
+  } finally { try { app.unmount(); } catch {} clearTimeout(ctrl.flashTimer); }
 });

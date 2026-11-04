@@ -57,7 +57,7 @@ function makeHost(t, hostOpts = {}) {
   const made = [];
   const stored = new Map();
   const host = new SessionsHost({
-    create: async ({cwd, session}) => { const pair = makePair(cwd); if (session) pair.agent.session = {...session}; made.push(pair); return pair; },
+    create: async ({cwd, session}) => { const pair = makePair(cwd); if (session && typeof session === 'object') pair.agent.session = {...session}; made.push(pair); return pair; },
     findSession: ref => stored.get(ref) || null,
     idleMs: 0, // no sweep in tests unless a test sets it
     ...hostOpts,
@@ -150,7 +150,7 @@ test('host #57: concurrent opens cannot pass the cap together, and the same sess
   let release; const gate = new Promise(r => { release = r; });
   const madeSlow = [];
   const slow = new SessionsHost({
-    create: async ({cwd, session}) => { await gate; const pair = makePair(cwd); if (session) pair.agent.session = {...session}; madeSlow.push(pair); return pair; },
+    create: async ({cwd, session}) => { await gate; const pair = makePair(cwd); if (session && typeof session === 'object') pair.agent.session = {...session}; madeSlow.push(pair); return pair; },
     findSession: ref => (ref === 'past-1' ? {id: 'past-1', cwd: dir, turns: 1} : null),
     idleMs: 0, maxOpen: 2,
   });
@@ -305,7 +305,7 @@ test('v6: the new routes answer under /api/s/:id/ for that conversation only', a
   const answers = [];
   pair2.controller.answerLimit = v => { answers.push(v); pair2.controller.set({limitInput: null}); };
   pair2.controller.set({limitInput: {key: 'concurrent', text: '4'}});
-  assert.equal((await call(server, 'POST', '/api/s/' + id2 + '/limit', {headers: AUTH, body: {value: 6}})).status, 200);
+  assert.equal((await call(server, 'POST', '/api/s/' + id2 + '/limit', {headers: AUTH, body: {value: 6, key: 'concurrent'}})).status, 200);
   assert.deepEqual(answers, [6]);
   let cancelled = 0;
   pair2.controller.cancelMenu = () => { cancelled++; pair2.controller.set({menu: null}); };
@@ -340,7 +340,7 @@ test('v5: /api/sessions lists stored conversations with open/busy; open and clos
   assert.equal((await call(server, 'POST', '/api/sessions/ghost/open', {headers: AUTH, body: {}})).status, 404);
 });
 
-test('v5: /api/server/events streams session and approval events', async t => {
+test('v5: /api/server/events streams session and approval events', {timeout: 30000}, async t => {
   const {host} = makeHost(t);
   host.addPrepared({...makePair('C:\\a'), isDefault: true});
   const {server} = makeServer(t, host);
@@ -351,10 +351,13 @@ test('v5: /api/server/events streams session and approval events', async t => {
   const reader = res.body.getReader(), decoder = new TextDecoder();
   let buf = '';
   const nextEvent = async () => {
+    // t6 #2 (deep audit): a bare reader.read() loop waits forever when the
+    // server stops sending the event — the suite hung with no failing assert
+    // to point at. Bound each read and name what was being awaited.
     for (;;) {
       const i = buf.indexOf('\n\n');
       if (i >= 0) { const block = buf.slice(0, i); buf = buf.slice(i + 2); const line = block.split('\n').find(l => l.startsWith('data: ')); if (line) return JSON.parse(line.slice(6)); continue; }
-      const {done, value} = await reader.read();
+      const {done, value} = await Promise.race([reader.read(), new Promise((_, rej) => setTimeout(() => rej(new Error('timed out waiting for the next SSE event')), 10000))]);
       if (done) throw new Error('stream ended');
       buf += decoder.decode(value, {stream: true});
     }
@@ -462,7 +465,12 @@ test('gui #61: GET polls do not count as use; POST actions and an open SSE strea
   assert.equal(res.status, 200);
   assert.ok(def.lastUsedAt > stale, 'opening the event stream counts as use');
   def.lastUsedAt = stale;
-  await new Promise(r => setTimeout(r, 140));
+  // t6 #1 (deep audit): a fixed 140 ms sleep against a 25 ms heartbeat timer
+  // flakes under load (timers can all slip past the window on a busy Windows
+  // box). Poll for the touch with a deadline instead — the claim is that the
+  // heartbeat touches, not that it does so within 140 ms.
+  const hbDeadline = Date.now() + 5000;
+  while (!(def.lastUsedAt > stale) && Date.now() < hbDeadline) await new Promise(r => setTimeout(r, 15));
   assert.ok(def.lastUsedAt > stale, 'the open stream keeps touching on its heartbeat');
   ac.abort();
 });
@@ -480,10 +488,15 @@ test('autostart: the VBS launcher runs node serve hidden; schtasks gets the logo
   const on = await autostart.setAutostart(true, {binFile: 'C:\\muser\\bin\\muser.js', home, platform: 'win32', run});
   assert.equal(on.task, 'muser-server');
   assert.deepEqual(calls[0].slice(0, 4), ['schtasks', '/Create', '/TN', 'muser-server']);
+  // Phase-2 coordination (autostart fix): turning ON now also deletes the
+  // other (Run-key) registration, so both do not fire at logon — that call
+  // sits between the create and any later delete.
+  assert.deepEqual(calls[1].slice(0, 4), ['reg', 'delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v'], 'on removes the Run-key registration too');
   assert.ok(fs.existsSync(path.join(home, '.muser', 'autostart.vbs')));
   const off = await autostart.setAutostart(false, {binFile: 'x', home, platform: 'win32', run});
   assert.equal(off.on, false);
-  assert.deepEqual(calls[1].slice(0, 4), ['schtasks', '/Delete', '/TN', 'muser-server']);
+  assert.deepEqual(calls[2].slice(0, 4), ['schtasks', '/Delete', '/TN', 'muser-server']);
+  assert.deepEqual(calls[3].slice(0, 4), ['reg', 'delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v'], 'off removes the Run-key registration too');
   assert.equal(fs.existsSync(path.join(home, '.muser', 'autostart.vbs')), false);
   await assert.rejects(() => autostart.setAutostart(true, {binFile: 'x', platform: 'linux', run}), /Windows-only/);
 });

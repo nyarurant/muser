@@ -7,11 +7,18 @@ const {MuseClient} = require('./core/muse-client');
 
 const PINS = store.file('gateway-pins.json');
 
+// The pins file is hand-editable and synced by outside tools, so valid JSON that is
+// not an object (null, an array, a string) must read as "no pins": null used to make
+// checkPin throw a TypeError on every connect until the file was deleted by hand,
+// and a string spread its characters into numeric keys in the rewritten file
+// (deep audit c18 #15).
+function asPins(v) { return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }
+
 // The client, not yet connected: the TUI is drawn first and connects behind it.
 // file: the store name of this account's gateway credentials (src/accounts.js).
 function createChat(web, {file = 'session.enc'} = {}) {
   let pins = {};
-  try { pins = JSON.parse(fs.readFileSync(PINS, 'utf8')); } catch {}
+  try { pins = asPins(JSON.parse(fs.readFileSync(PINS, 'utf8'))); } catch {}
   const client = new MuseClient({
     credentials: store.load(file), fetchJson: web.fetchJson, requireLogin: true,
     locale: Intl.DateTimeFormat().resolvedOptions().locale,
@@ -22,7 +29,7 @@ function createChat(web, {file = 'session.enc'} = {}) {
     checkPin: (id, fingerprint) => {
       if (pins[id] === fingerprint) return;
       // Re-read and write through a temp file: several muser windows record here.
-      try { pins = {...JSON.parse(fs.readFileSync(PINS, 'utf8')), ...pins}; } catch {}
+      try { pins = {...asPins(JSON.parse(fs.readFileSync(PINS, 'utf8'))), ...pins}; } catch {}
       pins[id] = fingerprint;
       const temp = PINS + '.tmp-' + process.pid + '-' + Date.now();
       try { fs.mkdirSync(store.DIR, {recursive: true}); fs.writeFileSync(temp, JSON.stringify(pins)); fs.renameSync(temp, PINS); } catch { try { fs.unlinkSync(temp); } catch {} }

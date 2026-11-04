@@ -10,6 +10,11 @@
 // the CLI's add behaved. Neither the window's account nor the default changes here.
 const {t} = require('./i18n');
 
+// Note something on a thrown value without ever replacing it: assigning to a
+// string or a frozen object throws in strict mode, and the caller must see
+// the original failure, not that TypeError (c13 #15).
+const attach = (e, key, value) => { try { e[key] = value; } catch {} };
+
 async function addAccount(label, {ui, log = () => {}, deps = {}} = {}) {
   const accounts = deps.accounts || require('./accounts');
   const a = accounts.add(label); // throws on a blank or duplicate name
@@ -34,8 +39,18 @@ async function addAccount(label, {ui, log = () => {}, deps = {}} = {}) {
       // The rollback outcome travels with the error instead of being swallowed: a remove
       // that could not delete the Edge profile (still open) leaves a logged-in leftover
       // the caller needs to be able to name.
-      try { const r = accounts.remove(a.id); if (r?.leftover) e.rollbackLeftover = r.leftover; }
-      catch (re) { e.rollbackError = re?.message || String(re); }
+      let leftover, rollbackError;
+      try { const r = accounts.remove(a.id); leftover = r?.leftover; }
+      catch (re) { rollbackError = re?.message || String(re); }
+      if (leftover) attach(e, 'rollbackLeftover', leftover);
+      if (rollbackError) attach(e, 'rollbackError', rollbackError);
+    } else {
+      // The account stays (its login landed; only the device registration
+      // failed). Say so on the error itself: the caller can tell the user the
+      // name is now taken by this half-finished account and how to finish it,
+      // instead of leaving a bare failure whose retry only reports that the
+      // name 'already exists' (first audit #33).
+      attach(e, 'accountKept', {id: a.id, label: a.label});
     }
     throw e;
   }

@@ -1,6 +1,6 @@
 'use strict';
 const test = require('node:test');
-const assert = require('node:assert');
+const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -19,8 +19,9 @@ process.env.USERPROFILE = process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(
 
 const {McpHub, params, checkRemoteUrl} = require('../src/mcp');
 
-test('stdio MCP server: tools become device commands, nested args travel as JSON', async () => {
+test('stdio MCP server: tools become device commands, nested args travel as JSON', async t => {
   const hub = new McpHub();
+  t.after(() => hub.close()); // close on the failure path too, not only at the end (t8 #5)
   await hub.connect('Fix ture', {command: process.execPath, args: [path.join(__dirname, 'fixtures-mcp-server.js')]});
   hub.index();
   const defs = hub.defs();
@@ -33,8 +34,9 @@ test('stdio MCP server: tools become device commands, nested args travel as JSON
   await hub.close();
 });
 
-test('slug collisions are suffixed (-2) instead of overwriting', async () => {
+test('slug collisions are suffixed (-2) instead of overwriting', async t => {
   const hub = new McpHub();
+  t.after(() => hub.close());
   const fixture = {command: process.execPath, args: [path.join(__dirname, 'fixtures-mcp-server.js')]};
   await hub.connect('Fix ture', fixture);
   await hub.connect('fix ture', fixture);
@@ -63,7 +65,7 @@ test('corrupt config is backed up; secrets move to the secure-store as $secret r
   const script = path.join(home, 'child.js');
   fs.writeFileSync(script, `
     const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
-    const assert = require('node:assert');
+    const assert = require('node:assert/strict');
     const mcp = require(process.env.MUSER_REPO + '/src/mcp.js');
     const dir = path.join(os.homedir(), '.muser'), file = path.join(dir, 'mcp.json');
     fs.mkdirSync(dir, {recursive: true});
@@ -92,7 +94,7 @@ test('corrupt config is backed up; secrets move to the secure-store as $secret r
   assert.match(r.stdout, /CHILD OK/);
 });
 
-test('number args keep floating point and bad values are a clear error, not a silent fallback', async () => {
+test('number args keep floating point and bad values are a clear error, not a silent fallback', async t => {
   // params(): a JSON-schema 'number' must NOT become an 'integer' device spec (that
   // truncates floats downstream); it travels as a JSON-encoded string instead.
   const p = params({type: 'object', properties: {factor: {type: 'number'}}, required: ['factor']});
@@ -100,6 +102,7 @@ test('number args keep floating point and bad values are a clear error, not a si
   assert.ok(p.json.has('factor'));
   assert.equal(p.types.factor, 'number');
   const hub = new McpHub();
+  t.after(() => hub.close());
   await hub.connect('fixture', {command: process.execPath, args: [path.join(__dirname, 'fixtures-mcp-server.js')]});
   hub.index();
   assert.equal((await hub.call('mcp.fixture.scale', {factor: '2.5', value: '1.5'})).text, 'product=3.75');
@@ -124,8 +127,9 @@ function fakeHub(result) {
   return {hub, calls, entry};
 }
 
-test('coercion errors: boolean/object/array/integer reject bad values before the server is called', async () => {
+test('coercion errors: boolean/object/array/integer reject bad values before the server is called', async t => {
   const {hub, calls} = fakeHub({content: [{type: 'text', text: 'ok'}]});
+  t.after(() => hub.close());
   for (const args of [{b: 'yes'}, {b: '1'}, {arr: '[1,'}, {arr: '{"a":1}'}, {obj: '[1,2]'}, {obj: '{bad'}, {i: '3.5'}, {i: 3.5}, {n: 'x'}, {n: NaN}]) {
     const r = await hub.call('mcp.fake.do', args);
     assert.equal(r.isError, true, JSON.stringify(args));
@@ -138,7 +142,7 @@ test('coercion errors: boolean/object/array/integer reject bad values before the
   await hub.close();
 });
 
-test('result content: structuredContent is appended and non-text blocks become placeholders', async () => {
+test('result content: structuredContent is appended and non-text blocks become placeholders', async t => {
   const {hub} = fakeHub({content: [
     {type: 'text', text: 'hello'},
     {type: 'image', data: 'AA==', mimeType: 'image/png'},
@@ -146,6 +150,7 @@ test('result content: structuredContent is appended and non-text blocks become p
     {type: 'resource_link', uri: 'https://example.com/doc'},
     {type: 'resource', resource: {uri: 'file:///x.txt', text: 'body'}},
   ], structuredContent: {total: 6.5}});
+  t.after(() => hub.close());
   const r = await hub.call('mcp.fake.do', {s: 'x'});
   assert.equal(r.isError, false);
   assert.ok(r.text.startsWith('hello'));
@@ -158,8 +163,9 @@ test('result content: structuredContent is appended and non-text blocks become p
   await hub.close();
 });
 
-test('fixture report tool: structured + image + resource survive the real SDK round-trip', async () => {
+test('fixture report tool: structured + image + resource survive the real SDK round-trip', async t => {
   const hub = new McpHub();
+  t.after(() => hub.close());
   await hub.connect('fixture', {command: process.execPath, args: [path.join(__dirname, 'fixtures-mcp-server.js')]});
   hub.index();
   const r = await hub.call('mcp.fixture.report', {});
@@ -171,8 +177,9 @@ test('fixture report tool: structured + image + resource survive the real SDK ro
   await hub.close();
 });
 
-test('liveness: _markDead flips status to error, drops commands, and notifies', async () => {
+test('liveness: _markDead flips status to error, drops commands, and notifies', async t => {
   const {hub, entry} = fakeHub({content: []});
+  t.after(() => hub.close());
   const seen = [];
   hub.onChange = (name, e) => seen.push([name, e?.status]);
   assert.ok(hub.commands.has('mcp.fake.do'));
@@ -187,8 +194,9 @@ test('liveness: _markDead flips status to error, drops commands, and notifies', 
   await hub.close();
 });
 
-test('liveness: a fixture server that exits mid-session is marked error and de-indexed', async () => {
+test('liveness: a fixture server that exits mid-session is marked error and de-indexed', async t => {
   const hub = new McpHub();
+  t.after(() => hub.close());
   await hub.connect('fixture', {command: process.execPath, args: [path.join(__dirname, 'fixtures-mcp-server.js')]});
   hub.index();
   assert.ok(hub.commands.has('mcp.fixture.crash'));
@@ -201,7 +209,7 @@ test('liveness: a fixture server that exits mid-session is marked error and de-i
   await hub.close();
 });
 
-test('remote URL check: non-https is refused except loopback, and surfaces as error status', async () => {
+test('remote URL check: non-https is refused except loopback, and surfaces as error status', async t => {
   assert.throws(() => checkRemoteUrl('http://example.com/mcp'), /non-https/);
   assert.throws(() => checkRemoteUrl('ftp://example.com/mcp'), /non-https/);
   assert.throws(() => checkRemoteUrl('not a url'), /Invalid MCP server URL/);
@@ -209,6 +217,7 @@ test('remote URL check: non-https is refused except loopback, and surfaces as er
   assert.equal(checkRemoteUrl('http://localhost:8080/mcp').hostname, 'localhost');
   assert.equal(checkRemoteUrl('http://127.0.0.1:8080/mcp').hostname, '127.0.0.1');
   const hub = new McpHub();
+  t.after(() => hub.close());
   await assert.rejects(hub.connect('remote', {url: 'http://example.com/mcp', headers: {Authorization: 'Bearer abcdef'}}), /non-https/);
   assert.equal(hub.servers.get('remote').status, 'error');
   assert.match(hub.servers.get('remote').error, /headers may carry secrets/);
@@ -217,8 +226,9 @@ test('remote URL check: non-https is refused except loopback, and surfaces as er
 
 // Audit #235: a 'string' parameter was the one schema type call() never checked, so a
 // value the gateway had already coerced (123, true) reached the server type-changed.
-test('coercion errors: a string parameter rejects non-string values before the server is called', async () => {
+test('coercion errors: a string parameter rejects non-string values before the server is called', async t => {
   const {hub, calls} = fakeHub({content: [{type: 'text', text: 'ok'}]});
+  t.after(() => hub.close());
   for (const args of [{s: 123}, {s: true}, {s: null}, {s: ['x']}, {s: {a: 1}}]) {
     const r = await hub.call('mcp.fake.do', args);
     assert.equal(r.isError, true, JSON.stringify(args));
@@ -256,7 +266,7 @@ test('save prunes orphaned vault secrets; a missing vault entry refuses the conn
   const script = path.join(home, 'child.js');
   fs.writeFileSync(script, `
     const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
-    const assert = require('node:assert');
+    const assert = require('node:assert/strict');
     const mcp = require(process.env.MUSER_REPO + '/src/mcp.js');
     const store = require(process.env.MUSER_REPO + '/src/secure-store.js');
     const dir = path.join(os.homedir(), '.muser'), file = path.join(dir, 'mcp.json');
@@ -309,7 +319,7 @@ test('setEnabled on a started hub connects/disconnects live (child process, temp
   const script = path.join(home, 'child.js');
   fs.writeFileSync(script, `
     const fs = require('node:fs'), path = require('node:path'), os = require('node:os');
-    const assert = require('node:assert');
+    const assert = require('node:assert/strict');
     const mcp = require(process.env.MUSER_REPO + '/src/mcp.js');
     const dir = path.join(os.homedir(), '.muser');
     fs.mkdirSync(dir, {recursive: true});

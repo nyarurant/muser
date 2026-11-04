@@ -31,37 +31,55 @@ function slug(label) {
 // gone. Such a read is retried, then the last good registry of this process is used, and a
 // change gives up (throws) rather than write over a registry it could not read.
 let lastGood = null;
+// Entries readRegistry cannot use (an invalid id, a missing label — a hand edit or a restore
+// merge) and top-level keys it does not know (a newer muser's fields) are not the reader's to
+// throw away: they ride along on the parsed registry (fourth audit M21) and writeRegistry puts
+// them back untouched, so a routine change like setActive no longer purges them silently with
+// no backup. list()/get()/resolve() only ever see the valid entries.
+function parseRegistry(v) {
+  const valid = [], invalid = [];
+  for (const a of v.accounts) (a && validId(a.id) && typeof a.label === 'string' ? valid : invalid).push(a);
+  const extra = {};
+  for (const k of Object.keys(v)) if (k !== 'accounts' && k !== 'activeId') extra[k] = v[k];
+  return {accounts: valid, activeId: typeof v.activeId === 'string' ? v.activeId : null, _preservedInvalid: invalid, _preservedExtra: extra};
+}
+function emptyRegistry() { return {accounts: [], activeId: null, _preservedInvalid: [], _preservedExtra: {}}; }
 function readRegistry({strict = false} = {}) {
   for (let i = 0; ; i++) {
     let raw;
     try { raw = fs.readFileSync(registryFile(), 'utf8'); }
     catch (e) {
-      if (e?.code === 'ENOENT') return {accounts: [], activeId: null};
+      if (e?.code === 'ENOENT') return emptyRegistry();
       if (i < 5 && ['EPERM', 'EBUSY', 'EACCES'].includes(e?.code)) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (i + 1)); continue; }
       if (!strict && lastGood) return structuredClone(lastGood);
-      if (strict) throw e;
-      return {accounts: [], activeId: null};
+      // First audit #20: with no last good registry to fall back to, an unreadable file is NOT
+      // an empty registry. Returning empty made a fresh window silently run on the default
+      // account and report real account names as not found, so surface the failure instead.
+      throw e;
     }
     try {
       const v = JSON.parse(raw);
       if (v && typeof v === 'object' && Array.isArray(v.accounts)) {
-        lastGood = {accounts: v.accounts.filter(a => a && validId(a.id) && typeof a.label === 'string'), activeId: typeof v.activeId === 'string' ? v.activeId : null};
+        lastGood = parseRegistry(v);
         return structuredClone(lastGood);
       }
     } catch {}
     // Not a registry (a hand edit gone wrong): a change must not replace it with an empty one,
     // and a plain read must not call it empty either when this process has already read a good
     // one — a window that took corrupt for empty silently ran on the default account and
-    // reported real account names as not found (audit #39).
+    // reported real account names as not found (audit #39). With no good read yet, the first
+    // audit's #20 applies: throw, naming the file, rather than pretend there are no accounts.
     if (!strict && lastGood) return structuredClone(lastGood);
-    if (strict) throw new Error(t('アカウントの一覧 {file} を読めませんでした。中身を確認してください。', {file: registryFile()}));
-    return {accounts: [], activeId: null};
+    throw new Error(t('アカウントの一覧 {file} を読めませんでした。中身を確認してください。', {file: registryFile()}));
   }
 }
 // Every change is read-modify-write of the one registry file, possibly from several processes at
 // once (`muser account use`, add, remove). Unlocked, a setActive landing between
 // `muser account add`'s read and write dropped the account just added.
-function changeRegistry(fn) {
+// afterWrite, when given, still runs inside the lock after the registry write (remove()
+// deletes the account's files there, so a same-name add cannot complete in between and have
+// its fresh files deleted by the pending removal — deep audit c25 #3).
+function changeRegistry(fn, afterWrite) {
   return withRegistryLock(token => {
     const reg = readRegistry({strict: true});
     const out = fn(reg);
@@ -72,6 +90,7 @@ function changeRegistry(fn) {
     try { owned = fs.readFileSync(registryFile() + '.lock', 'utf8') === token; } catch {}
     if (!owned) throw new Error(t('アカウントの一覧が使用中のため変更できませんでした。もう一度実行してください。'));
     writeRegistry(reg);
+    if (afterWrite) afterWrite();
     return out;
   });
 }
@@ -79,14 +98,32 @@ function changeRegistry(fn) {
 // and Windows answers EPERM while the previous holder's lock file is being deleted. With four
 // processes changing the registry, adds were still lost that way. The registry is changed rarely
 // and briefly: wait longer, retry those errors, and never change it unlocked.
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } }
 function withRegistryLock(fn) {
-  const lock = registryFile() + '.lock', token = crypto.randomBytes(16).toString('hex'), until = Date.now() + 10000;
+  // The lock file carries the holder's pid next to the token (the sessions.js pattern): a lock
+  // whose holder is still alive is never stolen, however long it is held, and a dead holder's
+  // lock — or a legacy token-only lock over 10 s old — is claimed by atomically renaming it
+  // away, so of two waiters who both judge it stale only one wins the rename and proceeds.
+  // The old code unlinked whatever sat at the lock path after a bare stat, with no check that
+  // it was still the file it had judged stale: the second waiter deleted the first stealer's
+  // fresh lock and both believed they held it (deep audit c25 #2).
+  const lock = registryFile() + '.lock', token = crypto.randomBytes(16).toString('hex') + ':' + process.pid, until = Date.now() + 10000;
   fs.mkdirSync(path.dirname(lock), {recursive: true});
   for (;;) {
     try { const fd = fs.openSync(lock, 'wx'); try { fs.writeSync(fd, token); } finally { fs.closeSync(fd); } break; }
     catch (e) {
       if (!['EEXIST', 'EPERM', 'EBUSY', 'EACCES'].includes(e?.code)) throw e;
-      try { if (Date.now() - fs.statSync(lock).mtimeMs > 10000) { fs.unlinkSync(lock); continue; } } catch {}
+      try {
+        const held = fs.readFileSync(lock, 'utf8');
+        const ownerPid = Number((held.split(':')[1] || '').trim());
+        const stale = ownerPid > 0 ? !pidAlive(ownerPid) : Date.now() - fs.statSync(lock).mtimeMs > 10000;
+        if (stale) {
+          const grave = lock + '.stale-' + crypto.randomBytes(6).toString('hex');
+          let claimed = true;
+          try { fs.renameSync(lock, grave); } catch { claimed = false; } // another waiter claimed it first
+          if (claimed) { try { fs.unlinkSync(grave); } catch {} continue; }
+        }
+      } catch {}
       if (Date.now() > until) throw new Error(t('アカウントの一覧が使用中のため変更できませんでした。もう一度実行してください。'));
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
@@ -97,36 +134,55 @@ function writeRegistry(reg) {
   const f = registryFile();
   fs.mkdirSync(path.dirname(f), {recursive: true});
   const temp = f + '.tmp-' + process.pid + '-' + Date.now();
-  try { fs.writeFileSync(temp, JSON.stringify(reg, null, 2)); store.renameRetry(temp, f); lastGood = structuredClone(reg); }
+  // The preserved entries/keys ride back out (fourth audit M21): the file keeps everything
+  // readRegistry could not use, in case a hand edit or a newer muser put it there on purpose.
+  const out = {...(reg._preservedExtra || {}), accounts: [...reg.accounts, ...(reg._preservedInvalid || [])], activeId: reg.activeId ?? null};
+  try { fs.writeFileSync(temp, JSON.stringify(out, null, 2)); store.renameRetry(temp, f); lastGood = structuredClone({accounts: reg.accounts, activeId: out.activeId, _preservedInvalid: reg._preservedInvalid || [], _preservedExtra: reg._preservedExtra || {}}); }
   catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
 }
 
 // The default account is always there: it is the login every install before multi-account
 // support already had. Registry entries for it only override its label.
-function list() {
-  const reg = readRegistry();
+function listFrom(reg) {
   const named = reg.accounts.find(a => a.id === DEFAULT_ID);
   const out = [{id: DEFAULT_ID, label: named?.label || 'default', createdAt: named?.createdAt || null}];
   for (const a of reg.accounts) if (a.id !== DEFAULT_ID) out.push({id: a.id, label: a.label, createdAt: a.createdAt || null});
   return out;
 }
+function list() { return listFrom(readRegistry()); }
 function get(id) { return list().find(a => a.id === id) || null; }
 // By id, by exact label, or by an unambiguous prefix of either.
 function resolve(ref) {
   const all = list(), r = String(ref || '').trim().toLowerCase();
   if (!r) return null;
-  const exact = all.find(a => a.id === r || a.label.toLowerCase() === r);
-  if (exact) return exact;
+  // An exact match is held to the same standard as a prefix one (fourth audit M20): when two
+  // accounts carry the exact label asked for (a hand-edited or merged registry — add() blocks
+  // it in normal use), the first one used to win silently and work went to whichever Muse
+  // happened to be listed first. Ambiguous is ambiguous: no match.
+  const exacts = all.filter(a => a.id === r || a.label.toLowerCase() === r);
+  if (exacts.length === 1) return exacts[0];
+  if (exacts.length > 1) return null;
   const hits = all.filter(a => a.id.startsWith(r) || a.label.toLowerCase().startsWith(r));
   return hits.length === 1 ? hits[0] : null;
 }
 function activeId() {
+  // One read, one snapshot (fourth audit M9): this used to read the registry twice — once
+  // here, once inside get() — so a switch landing between the two reads was answered from a
+  // mix of both registries (the old activeId, already removed, fell back to 'default'
+  // although neither snapshot ever had the default account active).
   const reg = readRegistry();
-  return reg.activeId && get(reg.activeId) ? reg.activeId : DEFAULT_ID;
+  return reg.activeId && listFrom(reg).some(a => a.id === reg.activeId) ? reg.activeId : DEFAULT_ID;
 }
 function setActive(id) {
-  if (!get(id)) throw new Error(t('アカウントが見つかりません: {id}', {id}));
-  changeRegistry(reg => { reg.activeId = id; });
+  // The existence check happens INSIDE the registry lock (deep audit c25 #1), like add()'s
+  // and rename()'s since audits #37/#38: checked outside, a remove() landing in between was
+  // undone by the locked change writing activeId back for an account that no longer exists —
+  // "switch succeeded", but the id silently fell back to the default account (and a later
+  // re-add of the same id suddenly became the active account).
+  changeRegistry(reg => {
+    if (id !== DEFAULT_ID && !reg.accounts.some(a => a.id === id)) throw new Error(t('アカウントが見つかりません: {id}', {id}));
+    reg.activeId = id;
+  });
 }
 function add(label) {
   const name = String(label || '').trim();
@@ -177,24 +233,42 @@ function hasLogin(id) { try { return fs.existsSync(store.file(filesFor(id).web))
 function hasDevice(id) { try { return fs.existsSync(store.file(filesFor(id).device)); } catch { return false; } }
 function remove(id) {
   if (id === DEFAULT_ID) throw new Error(t('最初のアカウントは削除できません（ログアウトは `muser logout` です）。'));
-  if (!get(id)) throw new Error(t('アカウントが見つかりません: {id}', {id}));
-  // Out of the registry first: a lock that times out then leaves the files (removing it again
-  // works), not a listed account with nothing behind it that blocks adding the name again.
+  // The existence check, the registry change and the file deletion all happen under ONE lock
+  // hold (deep audit c25 #3): the check used to sit outside the lock (the setActive pattern of
+  // c25 #1), and the files were deleted after the lock was released, so a same-name add that
+  // completed in between — registry entry plus a fresh login's files — could have those files
+  // deleted by this pending removal. A lock that times out now changes nothing at all, so
+  // removing again simply works.
+  let leftover = null;
+  const leftoverFiles = [];
   changeRegistry(reg => {
+    if (!reg.accounts.some(a => a.id === id)) throw new Error(t('アカウントが見つかりません: {id}', {id}));
     reg.accounts = reg.accounts.filter(a => a.id !== id);
     if (reg.activeId === id) reg.activeId = DEFAULT_ID;
+  }, () => {
+    const files = filesFor(id);
+    // store.remove swallows every unlink error, so each secret file's deletion is verified
+    // here and retried once directly; whatever still exists is reported by path instead of
+    // silently staying behind for a same-name re-add to inherit (c25 #3).
+    const secretPaths = [files.web, files.session, files.device].map(name => store.file(name));
+    for (const name of [files.web, files.session, files.device]) store.remove(name);
+    for (const p of secretPaths) {
+      if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch {} }
+      if (fs.existsSync(p)) leftoverFiles.push(p);
+    }
+    // The folder holds the account's Edge profile, still logged in to muse.ai. Left behind (Edge
+    // open on it), a new account of the same name got the same folder and came back logged in to
+    // the removed account. Returned so the caller can say so.
+    try { fs.rmSync(path.dirname(files.browser), {recursive: true, force: true}); } catch {}
+    if (fs.existsSync(path.dirname(files.browser))) leftover = path.dirname(files.browser);
+    // The folder removal may have finished off a secret file the direct retry could not.
+    for (let i = leftoverFiles.length - 1; i >= 0; i--) if (!fs.existsSync(leftoverFiles[i])) leftoverFiles.splice(i, 1);
+    if (!leftover && leftoverFiles.length) leftover = path.dirname(leftoverFiles[0]);
   });
-  const files = filesFor(id);
-  for (const name of [files.web, files.session, files.device]) store.remove(name);
-  // The folder holds the account's Edge profile, still logged in to muse.ai. Left behind (Edge
-  // open on it), a new account of the same name got the same folder and came back logged in to
-  // the removed account. Returned so the caller can say so.
-  let leftover = null;
-  try { fs.rmSync(path.dirname(files.browser), {recursive: true, force: true}); } catch {}
-  if (fs.existsSync(path.dirname(files.browser))) leftover = path.dirname(files.browser);
-  // Its Muse's name is not needed any more either.
+  // Its Muse's name is not needed any more either. (Outside the lock: updateIdentity takes
+  // the registry lock itself.)
   try { updateIdentity(v => { if (!v.byAccount?.[id]) return false; delete v.byAccount[id]; }); } catch {}
-  return {leftover};
+  return {leftover, leftoverFiles};
 }
 
 // The name of each account's Muse, as last seen, so a window shows it before /identity answers.
@@ -220,11 +294,34 @@ function writeIdentity(v) {
   catch (e) { try { fs.unlinkSync(temp); } catch {} throw e; }
 }
 function updateIdentity(fn) {
-  withRegistryLock(() => {
-    let v = {}, exists = false;
-    try { v = JSON.parse(fs.readFileSync(nameFile(), 'utf8')) || {}; exists = true; } catch (e) { if (e?.code !== 'ENOENT') return; }
+  withRegistryLock(token => {
+    // identity.json is replaced by the same atomic rename as the registry, so its read gets
+    // the same transient-error retries readRegistry has (deep audit c25 #4): one EPERM while
+    // another window's rename lands used to abandon the update silently — the Muse name or
+    // the /usage record was simply never saved, and nothing anywhere said so. A file that
+    // exists but does not parse is still left alone, exactly as before.
+    let v = {}, exists = false, raw = null;
+    for (let i = 0; ; i++) {
+      try { raw = fs.readFileSync(nameFile(), 'utf8'); break; }
+      catch (e) {
+        if (e?.code === 'ENOENT') { raw = null; break; }
+        if (i < 5 && ['EPERM', 'EBUSY', 'EACCES'].includes(e?.code)) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (i + 1)); continue; }
+        return;
+      }
+    }
+    if (raw !== null) {
+      exists = true;
+      try { v = JSON.parse(raw); } catch { return; }
+    }
     if (!v || typeof v !== 'object' || Array.isArray(v)) { if (exists) return; v = {}; }
     if (fn(v) === false) return;
+    // Fencing, like changeRegistry (audit #40): a holder paused past the steal threshold
+    // until its lock was taken must not write over the thief's identity update when it wakes
+    // (deep audit c25 #2). Ownership is re-checked immediately before the write; losing the
+    // lock abandons this update (the remember* callers retry on their next call).
+    let owned = false;
+    try { owned = fs.readFileSync(registryFile() + '.lock', 'utf8') === token; } catch {}
+    if (!owned) throw new Error(t('アカウントの一覧が使用中のため変更できませんでした。もう一度実行してください。'));
     writeIdentity(v);
   });
 }

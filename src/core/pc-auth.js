@@ -3,6 +3,14 @@ const crypto=require('node:crypto');
 const {t}=require('../i18n');
 
 const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
+const isToken = v => typeof v === 'string' && !!v;
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Interval checks (the vm cache, the refresh suppression) use a monotonic clock
+// (c29 #6): with Date.now() a clock rollback made the age negative-or-small and
+// stretched a 60 s window by the whole rollback, serving an expired VM/token far
+// too long. A negative age (a timestamp that cannot be from this clock) is stale.
+const monoNow = () => performance.now();
+const fresh = (at, ms) => { if (typeof at !== 'number') return false; const age = monoNow() - at; return age >= 0 && age < ms; };
 // Native authentication and device credentials are distinct from the website cookie.
 // Wire schemas: https://github.com/chaitanyarahalkar/muse-desktop-bridge/blob/main/docs/protocol.md
 class PcAuth {
@@ -12,10 +20,13 @@ class PcAuth {
     this.login=null;this.pending=null;this.message='';this.active=false;this.generation=0;
   }
   snapshot() {
-    const label=(item,fallback)=>[item.display_name,item.name,item.username,item.masked_contact,item.masked_contact_point].find(v=>typeof v==='string'&&v.trim())?.slice(0,160)||fallback;
+    // A malformed element (accounts: [null], say) must degrade to the fallback
+    // label, not a bare TypeError that wedges the login on the same response
+    // (c29 #7, the unvalidated-element residue of audit #188).
+    const label=(item,fallback)=>isObj(item)?([item.display_name,item.name,item.username,item.masked_contact,item.masked_contact_point].find(v=>typeof v==='string'&&v.trim())?.slice(0,160)||fallback):fallback;
     return {phase:this.phase,hasSdkToken:!!this.saved.sdkToken,hasDevice:!!this.saved.device,
       accounts:this.phase==='account'?(this.pending?.accounts||[]).map((a,i)=>({label:label(a,t('アカウント {n}', {n: i+1}))})):[],
-      methods:this.phase==='two_factor'?(this.pending?.two_factor_methods||[]).map((a,i)=>({label:label(a,({TOTP:t('認証アプリ'),SMS:'SMS',EMAIL:t('メール')})[String(a.method_type).toUpperCase()]||t('認証方法 {n}', {n: i+1}))})):[],
+      methods:this.phase==='two_factor'?(this.pending?.two_factor_methods||[]).map((a,i)=>({label:label(a,({TOTP:t('認証アプリ'),SMS:'SMS',EMAIL:t('メール')})[String(isObj(a)?a.method_type:'').toUpperCase()]||t('認証方法 {n}', {n: i+1}))})):[],
       ...(this.phase==='checkpoint'&&this.checkpointUrl?{checkpointUrl:this.checkpointUrl}:{}),message:this.message};
   }
   persist(update) {
@@ -30,7 +41,12 @@ class PcAuth {
     // in-memory copy over a fresher one from disk (or vice versa).
     const diskDev=isObj(fresh.device)?fresh.device:null, knownDev=isObj(this.saved?.device)?this.saved.device:null;
     const stamp=d=>Number(d?.access_token_saved_at)||0;
-    const newestDev=diskDev&&knownDev?(stamp(diskDev)>stamp(knownDev)?diskDev:knownDev):diskDev||knownDev;
+    // Stamps are second-granularity (mint/refresh), so a tie is common when two
+    // windows save within the same second: the disk copy wins a tie (c29 #4).
+    // It is the last state actually persisted; this window's in-memory copy may
+    // be the stale one it started with, and letting it win silently rolled a
+    // newer pair back to the old tokens.
+    const newestDev=diskDev&&knownDev?(stamp(diskDev)>=stamp(knownDev)?diskDev:knownDev):diskDev||knownDev;
     if(isObj(update?.device)){
       // Merge into the previously saved device instead of replacing it wholesale:
       // a mint/refresh only carries the token pair, and other saved device fields
@@ -39,6 +55,13 @@ class PcAuth {
       const olderDev=newestDev===(diskDev||null)?knownDev:diskDev;
       next.device={...(olderDev||{}),...(newestDev||{}),...update.device};
     } else if(newestDev&&(update===undefined||!('device' in (update||{})))){
+      next.device=newestDev;
+    } else if(update&&'device' in update&&update.device===undefined&&newestDev&&newestDev===diskDev&&diskDev!==knownDev){
+      // An explicit pair deletion (start() dropping a dead pair) must not erase
+      // a DIFFERENT pair another window has since saved to disk (c29 #4): this
+      // window proved only its own pair dead. The delete is honoured when the
+      // disk still holds the pair this window knows (or this window's unsaved
+      // pair is the newest), and the newer disk pair survives otherwise.
       next.device=newestDev;
     }
     // Keep the new state in memory even when the disk save fails (audit #195): an
@@ -70,6 +93,17 @@ class PcAuth {
           // through to a fresh login. A transient failure (network, 5xx) keeps it.
           if(!(e.deviceMismatch||e.deadDevice||e.status===401))throw e;
           this.persist({device:undefined});check();
+          // The drop may have been refused by persist (c29 #4): another window
+          // had already saved a different, newer pair, which is now this
+          // window's pair too. That pair is a live registration, not the dead
+          // one — this PC is authenticated, so do not fall through to a fresh
+          // login (send() would only refuse it as already registered).
+          if(this.saved.device){this.phase='authenticated';this.message=t('PC 端末の認証は完了しています。');return;}
+          // The pair is gone: phase must stop claiming 'authenticated' right
+          // here (c29 #8). It used to stay at the constructor's value when a
+          // later step threw (terms not accepted, say), so snapshot consumers
+          // skipped the registration step for a PC no longer registered.
+          this.phase=this.saved.sdkToken?'contact':'start';
         }
       }
       if(!this.saved.sdkToken){
@@ -128,6 +162,7 @@ class PcAuth {
     return this.action(async check=>{
       if(this.phase!=='account'||!this.pending?.selection_state)throw new Error(t('アカウント選択を最初から開始してください。'));
       const account=this.choice(this.pending.accounts,index);
+      if(!isObj(account)||!isToken(account.account_ref))throw new Error(t('アカウント候補を確認できません。'));
       const result=await this.auth('select_account',{selection_state:this.pending.selection_state,account_ref:account.account_ref});check();await this.accept(result,check);
     });
   }
@@ -136,6 +171,7 @@ class PcAuth {
     return this.action(async check=>{
       if(this.phase!=='two_factor'||!this.pending?.two_factor_state)throw new Error(t('追加認証を最初から開始してください。'));
       const method=this.choice(this.pending.two_factor_methods,index);
+      if(!isObj(method))throw new Error(t('追加認証の方法を確認できません。'));
       if(code===undefined&&/^(?:TOTP|AUTHENTICATOR)$/i.test(method.method_type||method.method_id||'')){this.message=t('認証アプリに表示されたコードを入力してください。');return;}
       const result=await this.auth(code===undefined?'two_factor/send_code':'two_factor',{two_factor_state:this.pending.two_factor_state,method_id:method.method_id,...code!==undefined?{code:code.trim()}:{}});check();
       if(code===undefined)this.message=t('追加認証コードを送信しました。');else await this.accept(result,check);
@@ -150,8 +186,8 @@ class PcAuth {
       try{const u=new URL(result.checkpoint_url||result.checkpointUrl);if(u.protocol==='https:'&&(u.hostname==='muse.ai'||u.hostname.endsWith('.muse.ai')||u.hostname==='auth.meta.com'))this.checkpointUrl=u.href;}catch{}
       return;
     }
-    if(result.account_selection_required){if(!Array.isArray(result.accounts)||!result.accounts.length)throw new Error(t('アカウント候補を確認できません。'));this.phase='account';this.message=t('現在 Muse で使っているアカウントを選んでください。');return;}
-    if(result.two_factor_required){if(!Array.isArray(result.two_factor_methods)||!result.two_factor_methods.length)throw new Error(t('追加認証の方法を確認できません。'));this.phase='two_factor';this.message=t('追加認証の方法を選び、コードを入力してください。');return;}
+    if(result.account_selection_required){if(!Array.isArray(result.accounts)||!result.accounts.length||!result.accounts.every(isObj))throw new Error(t('アカウント候補を確認できません。'));this.phase='account';this.message=t('現在 Muse で使っているアカウントを選んでください。');return;}
+    if(result.two_factor_required){if(!Array.isArray(result.two_factor_methods)||!result.two_factor_methods.length||!result.two_factor_methods.every(isObj))throw new Error(t('追加認証の方法を確認できません。'));this.phase='two_factor';this.message=t('追加認証の方法を選び、コードを入力してください。');return;}
     if(typeof result.abra_access_token!=='string'||!result.abra_access_token||!result.abra_user_id)throw new Error(t('Muse 側で追加の認証が必要です。'));
     // Minting needs this PC's node id (audit #199): a flow that reached accept()
     // without start() (a restored sdkToken, say) used to send device_id:undefined
@@ -161,7 +197,10 @@ class PcAuth {
     const minted=await this.request('device','/device_token/mint',{device_id:this.saved.nodeId,sdk_token:this.saved.sdkToken},result.abra_access_token,this.signal());
     check();
     const pair=isObj(minted)?(minted.payload||minted):null;
-    if(!isObj(pair)||!pair.access_token||!pair.refresh_token)throw new Error(t('PC 端末の認証情報を取得できませんでした。'));
+    // Token TYPES are checked, not just truthiness (c29 #7): a numeric token
+    // used to be persisted as-is and then failed every later request forever;
+    // rejecting it here lets a re-mint recover instead.
+    if(!isObj(pair)||!isToken(pair.access_token)||!isToken(pair.refresh_token))throw new Error(t('PC 端末の認証情報を取得できませんでした。'));
     this.persist({device:{access_token:pair.access_token,refresh_token:pair.refresh_token,access_token_saved_at:Math.floor(Date.now()/1000)}});
     this.login=null;this.pending=null;this.phase='authenticated';
     // The pair is saved: authentication HAS succeeded (audit #190). A vm() failure
@@ -181,15 +220,41 @@ class PcAuth {
     // undefined-keyed cache hit used to serve ANOTHER account's VM unchecked
     // (audit #197). With no expected VM there is nothing safe to match against:
     // skip the cache and let lookupVm() ask (and fail) properly.
-    if(expected!==undefined&&this.vmCache&&this.vmCache.expected===expected&&Date.now()-this.vmCache.at<60000)return this.vmCache.vm;
-    if(expected!==undefined&&this.vmPromise&&this.vmPromiseExpected===expected)return this.vmPromise;
-    const promise=this.lookupVm().then(vm=>{this.vmCache={at:Date.now(),vm,expected};return vm;})
-      .finally(()=>{if(this.vmPromise===promise){this.vmPromise=null;this.vmPromiseExpected=undefined;}});
-    this.vmPromise=promise;this.vmPromiseExpected=expected;return promise;
+    // The key also carries the device pair's identity (c29 #5): after a
+    // re-pairing for the SAME account, the old pair's cached VM used to be
+    // served for another minute.
+    const pairToken=this.saved.device?.access_token;
+    if(expected!==undefined&&this.vmCache&&this.vmCache.expected===expected&&this.vmCache.pairToken===pairToken&&fresh(this.vmCache.at,60000))return this.vmCache.vm;
+    if(expected!==undefined&&this.vmPromise&&this.vmPromiseExpected===expected&&this.vmPromisePair===pairToken)return this.vmPromise;
+    // lookupVm is told the expected VM this call keyed on (c29 #5): it used to
+    // re-read expectedVm() on its own, so an account switch between the two
+    // reads fetched the NEW account's VM and cached it under the OLD key.
+    const promise=this.lookupVm(expected).then(vm=>{if(vm?.vm_id===expected)this.vmCache={at:monoNow(),vm,expected,pairToken};return vm;})
+      .finally(()=>{if(this.vmPromise===promise){this.vmPromise=null;this.vmPromiseExpected=undefined;this.vmPromisePair=undefined;}});
+    this.vmPromise=promise;this.vmPromiseExpected=expected;this.vmPromisePair=pairToken;return promise;
   }
-  async lookupVm() {
+  // Deep H16: refresh tokens are single-use, so when two windows/instances refresh at once
+  // only one wins; the loser's refresh fails with a 4xx even though the pairing is healthy.
+  // Before believing any refresh failure, re-read the disk pair several times with a short
+  // backoff (the winner needs a moment to persist) and adopt it when its access token differs
+  // from ours. Returns the adopted disk device, or null when the disk still holds our pair.
+  // (config.withLock is synchronous and cannot be held across the awaited refresh request,
+  // so re-read/adopt is the coordination mechanism available here.)
+  async adoptDiskPair(attempts = 5) {
+    const delays = [0, 25, 50, 100, 200];
+    for (let i = 0; i < attempts; i++) {
+      if (delays[i]) await sleep(delays[i]);
+      let disk = null; try { disk = this.load?.()?.device || null; } catch {}
+      if (disk?.access_token && disk.access_token !== this.saved.device?.access_token) {
+        this.saved = {...this.saved, device: {...this.saved.device, ...disk}};
+        return disk;
+      }
+    }
+    return null;
+  }
+  async lookupVm(expectedHint) {
     if(!this.saved.device)throw new Error(t('PC 端末の認証が必要です。'));
-    const expected=await this.expectedVm();if(!expected)throw new Error(t('先に Muse アプリへログインしてください。'));
+    const expected=expectedHint!==undefined?expectedHint:await this.expectedVm();if(!expected)throw new Error(t('先に Muse アプリへログインしてください。'));
     let result,expired=false,firstError=null;
     try{result=await this.request('device','/fetch_vms',undefined,this.saved.device.access_token,this.signal());}
     catch(e){
@@ -210,7 +275,7 @@ class PcAuth {
     if(!result&&expired){
       // A pair this process refreshed a moment ago is not refreshed again when the
       // follow-up fetch keeps failing: each retry burned the next single-use token.
-      if(this.refreshedAccess&&this.saved.device.access_token===this.refreshedAccess&&Date.now()-this.refreshedAt<60000)throw firstError;
+      if(this.refreshedAccess&&this.saved.device.access_token===this.refreshedAccess&&fresh(this.refreshedAt,60000))throw firstError;
       const storedRefresh=this.saved.device.refresh_token;
       if(typeof storedRefresh!=='string'||!storedRefresh.trim()||!storedRefresh.split(':').pop())throw Object.assign(new Error(t('保存済みの更新トークンの形式が正しくありません。PC 端末を再認証してください。保存済みの情報は変更していません。')),{deadDevice:true});
       const refresh=storedRefresh.split(':').pop();
@@ -218,27 +283,41 @@ class PcAuth {
       try{response=await this.request('device','/device_token/refresh',{device_id:this.saved.nodeId,sdk_token:this.saved.sdkToken},'hatch_refresh:'+refresh,this.signal());}
       catch(refreshError){
         // muser: the refresh may have failed because another window refreshed first and used
-        // up this window's refresh token, saving a fresh pair meanwhile. Re-load from disk and
-        // retry fetch_vms once with the saved pair before giving up with the refresh error.
-        let disk=null;try{disk=this.load?.()?.device||null;}catch{}
-        if(disk?.access_token&&disk.access_token!==this.saved.device.access_token){
-          this.saved={...this.saved,device:{...this.saved.device,...disk}};
+        // up this window's refresh token, saving a fresh pair meanwhile (deep H16). Re-read
+        // the disk pair repeatedly with backoff and retry fetch_vms with the adopted pair
+        // before giving up with the refresh error.
+        const adopted=await this.adoptDiskPair();
+        if(adopted){
           try{result=await this.request('device','/fetch_vms',undefined,this.saved.device.access_token,this.signal());}catch{}
+          // The disk shows a different, newer pair: this failure is the race, not a dead
+          // device. Never mark deadDevice here — start() would persist-clear the winner's
+          // freshly saved pair.
+          if(!result){delete refreshError.deadDevice;throw refreshError;}
         }
-        if(!result){if(refreshError.status>=400&&refreshError.status<500)refreshError.deadDevice=true;throw refreshError;}
+        // 408/429 are retryable, not death (c29 #3): the refresh token was not
+        // consumed, so marking the pair dead made start() erase a healthy
+        // pairing over a rate limit. Other 4xx keep the phase-1 behaviour.
+        if(!result){const rs=refreshError.status;if(rs>=400&&rs<500&&rs!==408&&rs!==429)refreshError.deadDevice=true;throw refreshError;}
       }
       if(!result){
         const pair=isObj(response)?(response.payload||response):null;
-        if(!isObj(pair)||!pair.access_token||!pair.refresh_token)throw Object.assign(new Error(t('PC 端末の認証を更新できません。保存済みの情報は変更していません。')),{deadDevice:true});
+        if(!isObj(pair)||!isToken(pair.access_token)||!isToken(pair.refresh_token))throw Object.assign(new Error(t('PC 端末の認証を更新できません。保存済みの情報は変更していません。')),{deadDevice:true});
         this.persist({device:{access_token:pair.access_token,refresh_token:pair.refresh_token,access_token_saved_at:Math.floor(Date.now()/1000)}});
-        this.refreshedAt=Date.now();this.refreshedAccess=pair.access_token;
+        this.refreshedAt=monoNow();this.refreshedAccess=pair.access_token;
         result=await this.request('device','/fetch_vms',undefined,this.saved.device.access_token,this.signal());
         if(!isObj(result))throw new Error(t('PC 端末の認証情報を取得できませんでした。'));
       }
     }
-    const vm=result.vm_list?.find(v=>v.vm_id===expected);
+    // Deep H15: a malformed vm_list (missing / not an array / empty) or a VM that exists but
+    // is not provisioned yet (no auth token) is a shape/transient problem, NOT proof that this
+    // pairing belongs to another account. Throw a retryable error and keep the pair;
+    // deviceMismatch is reserved for a proper non-empty list that does not contain the
+    // expected VM at all. (Guarding on Array.isArray also keeps .find off non-arrays.)
+    if(!Array.isArray(result.vm_list)||!result.vm_list.length)throw Object.assign(new Error(t('PC 端末の認証情報を取得できませんでした。')),{retryable:true});
+    const vm=result.vm_list.find(v=>v?.vm_id===expected);
     // muser: marked, so a window can fail over to another account (src/agent.js ensureConnected).
-    if(!vm?.vm_auth_token)throw Object.assign(new Error(t('PC 端末の認証先が、現在の Muse アカウントと一致しません。')),{deviceMismatch:true});
+    if(!vm)throw Object.assign(new Error(t('PC 端末の認証先が、現在の Muse アカウントと一致しません。')),{deviceMismatch:true});
+    if(!vm.vm_auth_token)throw Object.assign(new Error(t('PC 端末の認証情報を取得できませんでした。')),{retryable:true});
     return vm;
   }
   cancel() {this.generation++;this.abortCtrl?.abort();this.login=null;this.pending=null;this.checkpointUrl=undefined;this.phase=this.saved.device?'authenticated':this.saved.sdkToken?'contact':'start';this.message='';return this.snapshot();}

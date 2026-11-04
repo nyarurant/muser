@@ -22,6 +22,12 @@ test('real Ink components show Focus evidence and a verification-wait outcome', 
   };
   const final = await show(Entry, {e: {type: 'focus', focus, full: true}});
   assert.match(final, /確認・判断待ち/); assert.match(final, /Tests pass/); assert.match(final, /e1/); assert.match(final, /Please check the device/);
+  // The rest of the panel's content is asserted too (t8 #17): the goal text,
+  // the UNMET criterion's text, and the focus-level reason must all render —
+  // the asserts above would still pass if any of them silently disappeared.
+  assert.match(final, /Fix the visible issue/, 'the goal text renders');
+  assert.match(final, /Visible on device/, 'the unmet criterion text renders');
+  assert.match(final, /Actual device confirmation needed/, 'the focus-level reason renders');
   // The automatic end-of-turn form is one compact line: status, met count, unmet ids — no panel.
   const compact = await show(Entry, {e: {type: 'focus', focus}});
   const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');

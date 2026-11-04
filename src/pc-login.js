@@ -30,8 +30,13 @@ function plainUi() {
   };
 }
 
-async function pcLogin(web, ui = plainUi(), opts = {}) {
-  const auth = createAuth(web, opts);
+async function pcLogin(web, ui, opts = {}) {
+  // plainUi() is created INSIDE the try: as a default argument it ran before the try, so
+  // when createAuth() threw (a broken saved device file) the readline was never closed
+  // and the process hung instead of exiting (audit c17 #12).
+  if (!ui) ui = plainUi();
+  let auth;
+  try { auth = createAuth(web, opts); } catch (e) { ui.close?.(); throw e; }
   try {
     let s = auth.snapshot();
     if (s.phase === 'authenticated') {
@@ -59,7 +64,12 @@ async function pcLogin(web, ui = plainUi(), opts = {}) {
         if (!list.tokens.some(x => x?.id === shared.sdkTokenId)) throw new Error(t('この muse.ai アカウントの SDK トークンが上限（{max} 個）に達しています。使っていないトークンを muse.ai 側で削除してから、もう一度 `muser pc-login` を実行してください。', {max: list.maxActiveTokens}));
         ui.info(t('SDK トークンは Muse Desktop Community のものを共有します（この CLI は別の端末として登録）。'));
         auth.persist(shared);
-      } else if (!(await ui.confirm(t('SDK トークン「muser CLI」を発行します。利用規約に同意しますか？')))) throw new Error(t('中止しました。'));
+      } else {
+        // 'SDK token' was used with no definition anywhere (fourth audit M25): say what it
+        // is before asking for consent to issue one.
+        ui.info(t('SDK トークンは、この PC を Muse の端末として認めるための鍵です。発行すると、この PC から Muse に接続できるようになります。'));
+        if (!(await ui.confirm(t('SDK トークン「muser CLI」を発行します。利用規約に同意しますか？')))) throw new Error(t('中止しました。'));
+      }
     }
     s = await ui.busy(t('準備しています'), () => auth.start(true));
     // Only a failure that a fresh code could fix is retried (audit #190): a fatal
@@ -67,6 +77,18 @@ async function pcLogin(web, ui = plainUi(), opts = {}) {
     // pair was saved and only vm() failed), must surface as-is, not as a code
     // re-entry prompt. A wrong code is a 4xx answer while the phase is unchanged.
     const codeRetryable = (e, phase) => !e.network && !e.timeout && !e.parse && !(e.status >= 500) && auth.snapshot().phase === phase;
+    // A failure a retry of the SAME request can fix (audit c17 #10/#11): network blips,
+    // timeouts, 429 and 5xx are not the user's input being wrong.
+    const transient = e => !!(e.network || e.timeout || e.status === 429 || e.status >= 500);
+    // Retry one stage's request itself, instead of throwing away every stage before it:
+    // select() and the twoFactor() preparation used to be one-shot, so one blip there
+    // discarded the completed OTP stage (audit c17 #10).
+    const retryBusy = async (label, fn) => {
+      for (let a = 1; ; a++) {
+        try { return await ui.busy(label, fn); }
+        catch (e) { if (a >= 3 || !transient(e)) throw e; }
+      }
+    };
     // A pick that is not a number (plain UI: Number('')/NaN) used to kill the whole
     // login, completed OTP stage included (audit #192): re-ask for the choice.
     const pickIndex = async (q, items) => {
@@ -82,24 +104,37 @@ async function pcLogin(web, ui = plainUi(), opts = {}) {
     let contact;
     for (let attempt = 1; ; attempt++) {
       contact = await ui.ask(t('Muse にログインしているメールアドレス'), {hint: t('電話番号なら +81…'), placeholder: 'you@example.com'});
-      try { s = await ui.busy(t('認証コードを送っています'), () => auth.send(contact)); break; }
+      try { s = await retryBusy(t('認証コードを送っています'), () => auth.send(contact)); break; }
+      // Transient failures retry the SAME contact inside retryBusy and never reach here;
+      // re-asking the contact is only for failures the input could actually fix. The old
+      // loop spent its 3 attempts on network/429 errors and blamed the contact (c17 #11).
       catch (e) { if (attempt >= 3 || e.status === 401 || e.status === 403) throw e; ui.info(t('{message} もう一度入力してください。', {message: e.message})); }
     }
     ui.info(t('{contact} にコードを送りました。', {contact}));
+    let resends = 0;
     for (let tries = 0; ;) {
-      const code = await ui.ask(t('届いた認証コード'), {placeholder: '123456'});
+      // The resend word was a hidden feature (fourth audit M23): name it in the hint.
+      const code = await ui.ask(t('届いた認証コード'), {placeholder: '123456', hint: t('届かないときは resend と入力すると送り直せます')});
       // Resend path (audit #191): typing resend asks for a fresh code instead of
-      // burning the remaining tries on a code that never arrived.
-      if (code === 'resend' || code === '再送') { s = await ui.busy(t('認証コードを送っています'), () => auth.send(contact)); ui.info(t('{contact} にコードを送りました。', {contact})); continue; }
+      // burning the remaining tries on a code that never arrived. It is capped and a
+      // failed resend no longer kills the login (audit c17 #9): unlimited resends ran
+      // into muse.ai rate limits and invalidated codes, making login LESS likely.
+      if (code === 'resend' || code === '再送') {
+        if (resends >= 3) { ui.info(t('再送は3回までです。届いたコードを入力するか、しばらく待ってから最初からやり直してください。')); continue; }
+        resends++;
+        try { s = await retryBusy(t('認証コードを送っています'), () => auth.send(contact)); ui.info(t('{contact} にコードを送りました。', {contact})); }
+        catch (e) { ui.info(t('{message} 再送できませんでした。届いているコードがあれば入力してください。', {message: e.message})); }
+        continue;
+      }
       tries++;
       try { s = await ui.busy(t('確認しています'), () => auth.confirm(code)); break; }
       catch (e) { if (tries >= 3 || !codeRetryable(e, 'code')) throw e; ui.info(t('{message} もう一度入力してください。', {message: e.message})); }
     }
     for (let guard = 0; s.phase !== 'authenticated' && guard < 6; guard++) {
-      if (s.phase === 'account') { const i = await pickIndex(t('どのアカウントで Muse を使っていますか？'), s.accounts); s = await ui.busy(t('確認しています'), () => auth.select(i)); }
+      if (s.phase === 'account') { const i = await pickIndex(t('どのアカウントで Muse を使っていますか？'), s.accounts); s = await retryBusy(t('確認しています'), () => auth.select(i)); }
       else if (s.phase === 'two_factor') {
         const i = await pickIndex(t('追加認証の方法'), s.methods);
-        s = await ui.busy(t('追加認証を準備しています'), () => auth.twoFactor(i));
+        s = await retryBusy(t('追加認証を準備しています'), () => auth.twoFactor(i));
         if (s.message) ui.info(s.message);
         for (let tries = 1; ; tries++) {
           const code = await ui.ask(t('追加認証コード'));

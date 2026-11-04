@@ -65,7 +65,7 @@ test('seeding: snapshot maps onto the flat state, the facade and previewRow', as
   ctrl.stop(); assert.equal(client.eventsClosed, true);
 });
 
-test('events: entry appends; entries-reset replaces, and a shrink bumps clearCount', async () => {
+test('events: entry appends; entries-reset replaces, and every reset bumps clearCount', async () => {
   const {ctrl, client} = await started();
   client.emit({kind: 'entry', entry: {id: 3, type: 'user', text: 'more'}});
   assert.deepEqual(ctrl.get().entries.map(e => e.id), [1, 2, 3]);
@@ -73,8 +73,11 @@ test('events: entry appends; entries-reset replaces, and a shrink bumps clearCou
   client.emit({kind: 'entries-reset', entries: [{id: 9, type: 'banner'}]});
   assert.deepEqual(ctrl.get().entries.map(e => e.id), [9]);
   assert.equal(ctrl.get().clearCount, clears + 1, 'a shorter reset remounts the scrollback');
+  // Deep H3: the server sends entries-reset for ANY non-append replacement, not
+  // only shrinks — a same-size or growing reset is a different conversation, so
+  // it must clear too, or the old conversation stays on screen.
   client.emit({kind: 'entries-reset', entries: [{id: 9, type: 'banner'}, {id: 10, type: 'gap'}]});
-  assert.equal(ctrl.get().clearCount, clears + 1, 'a growing reset does not clear');
+  assert.equal(ctrl.get().clearCount, clears + 2, 'a growing reset clears too (deep H3)');
 });
 
 test('menu: arrows move the local highlight, enter posts {index}, esc and ctrl+c post {cancel:true}', async () => {
@@ -86,8 +89,14 @@ test('menu: arrows move the local highlight, enter posts {index}, esc and ctrl+c
   assert.equal(client.posts().length, 0, 'arrows are local');
   ctrl.key('', {return: true});
   assert.deepEqual(client.posts('/api/s/sess-1/menu').at(-1).body, {index: 1});
+  // Deep H5: answering clears the local modal at once, so the esc / ctrl+c
+  // cases below re-seed the menu from a fresh snapshot first (a repeated key
+  // must not answer the NEXT modal).
+  assert.equal(ctrl.get().menu, null, 'the answered menu is cleared locally');
+  state(ctrl, client, {menu: {title: 'Pick', hint: null, index: 0, current: null, options: [{value: 'a', label: 'A'}, {value: 'b', label: 'B'}, {value: 'c', label: 'C'}]}});
   ctrl.key('', {escape: true});
   assert.deepEqual(client.posts('/api/s/sess-1/menu').at(-1).body, {cancel: true});
+  state(ctrl, client, {menu: {title: 'Pick', hint: null, index: 0, current: null, options: [{value: 'a', label: 'A'}, {value: 'b', label: 'B'}, {value: 'c', label: 'C'}]}});
   ctrl.key('c', {ctrl: true});
   assert.deepEqual(client.posts('/api/s/sess-1/menu').at(-1).body, {cancel: true});
 });
@@ -112,16 +121,18 @@ test('approval: enter maps the highlighted option (plain allow / always / autoEd
   assert.deepEqual(last(), {decision: {allow: false}});
 });
 
-test('limitInput: digits edit the local echo, enter posts {value}, esc posts {cancel:true}', async () => {
+test('limitInput: digits edit the local echo, enter posts {value, key}, esc posts {cancel:true, key}', async () => {
   const {ctrl, client} = await started();
   state(ctrl, client, {limitInput: {key: 'maxToolCallsPerTurn', label: '上限', text: '25', min: 1, max: 10000, hint: '1〜10000'}});
   ctrl.key('0', {});
   assert.equal(ctrl.get().limitInput.text, '250', 'typed digits stay local');
   assert.equal(client.posts().length, 0);
   ctrl.key('', {return: true});
-  assert.deepEqual(client.posts('/api/s/sess-1/limit').at(-1).body, {value: 250});
+  assert.deepEqual(client.posts('/api/s/sess-1/limit').at(-1).body, {value: 250, key: 'maxToolCallsPerTurn'});
+  assert.equal(ctrl.get().limitInput, null, 'the answered input is cleared locally (deep H5)');
+  state(ctrl, client, {limitInput: {key: 'maxToolCallsPerTurn', label: '上限', text: '25', min: 1, max: 10000, hint: '1〜10000'}});
   ctrl.key('', {escape: true});
-  assert.deepEqual(client.posts('/api/s/sess-1/limit').at(-1).body, {cancel: true});
+  assert.deepEqual(client.posts('/api/s/sess-1/limit').at(-1).body, {cancel: true, key: 'maxToolCallsPerTurn'});
 });
 
 test('reasonFor: enter posts the composer as the reason, esc posts an empty one', async () => {
@@ -132,6 +143,8 @@ test('reasonFor: enter posts the composer as the reason, esc posts an empty one'
   ctrl.key('', {return: true});
   assert.deepEqual(client.posts('/api/s/sess-1/approval').at(-1).body, {decision: {allow: false, reason: 'その変更は危ない'}});
   assert.equal(ctrl.get().text, '', 'the reason left the composer');
+  assert.equal(ctrl.get().reasonFor, null, 'the answered reason prompt is cleared locally (deep H5)');
+  state(ctrl, client, {reasonFor: true});
   ctrl.setText('x');
   ctrl.key('', {escape: true});
   assert.deepEqual(client.posts('/api/s/sess-1/approval').at(-1).body, {decision: {allow: false, reason: ''}});
@@ -259,6 +272,42 @@ test('#68: modal identity needs more than a missing id / title+count / key — a
   assert.equal(ctrl.get().limitInput.text, '250');
   state(ctrl, client, {limitInput: {key: 'k', label: '上限', text: '9', min: 1, max: 999}});
   assert.equal(ctrl.get().limitInput.text, '9', 'the same key with a different range is a new dialog: the old local echo is not kept');
+  ctrl.stop();
+});
+
+test('completion glue: slash list is fetched once and cached; Tab cycles; @ picks quote and pad (t4 #6)', async () => {
+  const {ctrl, client} = await started();
+  await ctrl.refreshSlash();
+  const fetches = () => client.requests.filter(r => r.method === 'GET' && r.path.includes('/complete'));
+  assert.equal(fetches().length, 1, 'one /complete fetch (start() already asked)');
+  assert.ok(fetches()[0].path.includes('kind=slash'), 'for the slash kind');
+  await ctrl.refreshSlash();
+  assert.equal(fetches().length, 1, 'cached: no second fetch');
+  assert.deepEqual(ctrl.slashList('/'), ['/help', '/exit']);
+  assert.deepEqual(ctrl.slashList('/h'), ['/help']);
+  assert.deepEqual(ctrl.slashList('/x'), []);
+  // Tab on a lone slash word cycles the candidates and wraps.
+  ctrl.setText('/', 1);
+  ctrl.completeTab(ctrl.get().text, ctrl.get().pos);
+  assert.equal(ctrl.get().text, '/help');
+  ctrl.completeTab(ctrl.get().text, ctrl.get().pos);
+  assert.equal(ctrl.get().text, '/exit');
+  ctrl.completeTab(ctrl.get().text, ctrl.get().pos);
+  assert.equal(ctrl.get().text, '/help', 'the cycle wraps');
+  // @ picks: whitespace is quoted, a trailing space follows a file pick, a
+  // folder pick (trailing /) gets none, and the caret lands after the insert.
+  ctrl.setText('see @fi', 7);
+  ctrl.applyAtPick({start: 4, fragment: '@fi'}, 'my file.txt');
+  assert.equal(ctrl.get().text, 'see "my file.txt" ');
+  assert.equal(ctrl.get().pos, ctrl.get().text.length);
+  ctrl.setText('see @do', 7);
+  ctrl.applyAtPick({start: 4, fragment: '@do'}, 'docs/');
+  assert.equal(ctrl.get().text, 'see docs/');
+  assert.equal(ctrl.get().pos, ctrl.get().text.length);
+  // atIndex wraps the highlight within the list and resets per fragment.
+  ctrl.atPick = {key: '@a', idx: 5};
+  assert.equal(ctrl.atIndex('@a', 3), 2, 'wraps modulo the list length');
+  assert.equal(ctrl.atIndex('@b', 3), 0, 'a new fragment starts at the top');
   ctrl.stop();
 });
 

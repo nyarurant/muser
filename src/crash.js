@@ -13,6 +13,37 @@ const KEEP = 20;
 
 const list = v => (Array.isArray(v) ? v : []);
 
+// The error and the trail get the same treatment as the state: shapes, never content
+// (audit #33). An exception's message can carry what the user typed, a command string
+// or a file fragment (parse errors, tool errors), and its stack repeats that message
+// plus local paths — so the stack is dropped whole and only the first line of the
+// message is kept, with quoted spans and key=value parameters stripped out of it.
+// What remains (the error name and the message's own first-line wording, e.g.
+// "Maximum update depth exceeded") is what identifies the crash.
+function safeErrorText(error) {
+  let name = '', message = '';
+  try {
+    if (error && typeof error === 'object') { name = String(error.name || ''); message = String(error.message ?? error); }
+    else if (error !== undefined && error !== null) message = String(error);
+  } catch { return 'unknown error'; }
+  if (!message) return 'unknown error';
+  let first = message.split(/\r?\n/)[0]
+    .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '<quoted>')
+    .replace(/([\w.-]+)=[^\s,;]+/g, '$1=<redacted>')
+    .slice(0, 300);
+  if (name && name !== 'Error' && !first.startsWith(name)) first = name + ': ' + first;
+  return first || 'unknown error';
+}
+
+// A trail entry's second element is, by construction (Controller.set / trace), the
+// comma-joined NAMES of the state keys that changed — identifiers and commas only.
+// Anything else in that slot is content that rode in by mistake: keep its slot and
+// timestamp, drop the text.
+function safeTrailWhat(v) {
+  const s = String(v ?? '');
+  return /^[\w,.-]*$/.test(s) && s.length <= 200 ? s : '<redacted>';
+}
+
 // The controller state, reduced to what does not carry content. Tolerant of odd shapes:
 // the reporter runs while the app is already broken, so its inputs cannot be trusted.
 function shape(s = {}) {
@@ -47,11 +78,15 @@ function write(input) {
     const {version, error, state, trail} = input || {};
     const d = dir();
     fs.mkdirSync(d, {recursive: true});
-    const file = path.join(d, new Date().toISOString().replace(/[:.]/g, '-') + '.json');
+    // The timestamp alone (millisecond precision) collided when several windows
+    // crashed in the same millisecond — exactly the shared-cause crash this
+    // reporter exists for — and the later write replaced the earlier report
+    // (c11 #11). Pid plus a random suffix keep every report.
+    const file = path.join(d, new Date().toISOString().replace(/[:.]/g, '-') + '-' + process.pid + '-' + require('node:crypto').randomBytes(4).toString('hex') + '.json');
     let safeState; try { safeState = shape(state); } catch { safeState = shape({}); }
     let safeTrail = [];
-    try { safeTrail = list(trail).map(e => (Array.isArray(e) ? [e[0], e[1]] : [null, String(e ?? '')])); } catch { safeTrail = []; }
-    let errorText; try { errorText = String(error?.stack || error); } catch { errorText = 'unknown error'; }
+    try { safeTrail = list(trail).map(e => (Array.isArray(e) ? [e[0], safeTrailWhat(e[1])] : [null, safeTrailWhat(e)])); } catch { safeTrail = []; }
+    let errorText; try { errorText = safeErrorText(error); } catch { errorText = 'unknown error'; }
     const report = {
       muser: version, node: process.version, windows: os.release(),
       terminal: {columns: process.stdout.columns, rows: process.stdout.rows, TERM: process.env.TERM || '', TERM_PROGRAM: process.env.TERM_PROGRAM || '', windowsTerminal: !!process.env.WT_SESSION, vscode: process.env.TERM_PROGRAM === 'vscode', conEmu: !!process.env.ConEmuPID},
@@ -65,4 +100,4 @@ function write(input) {
   } catch { return null; }
 }
 
-module.exports = {write, shape, dir};
+module.exports = {write, shape, dir, safeErrorText, safeTrailWhat};

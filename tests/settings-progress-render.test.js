@@ -28,8 +28,13 @@ test('settings menu, number entry and interim report render in the real Ink comp
   assert.match(out, /今回だけ適用/);
   assert.match(out, /既定値として保存/);
   ctrl.key('1', {}); ctrl.key('12', {});
+  // t5 #10 (deep audit): /12/ alone also matches '412' — the exact regression
+  // where a still-selected value is appended to instead of replaced. Pin the
+  // entry's text itself, and forbid the appended form in the render.
+  assert.equal(ctrl.get().limitInput?.text, '12', 'typing replaces the selected value instead of appending to it');
   out = await show(Live, {s: ctrl.get()}, 60);
   assert.match(out, /12/);
+  assert.doesNotMatch(out, /412/, 'the render shows 12, not the old value with 12 appended');
   assert.match(out, /enter/);
   assert.match(out, /esc/);
   ctrl.key('', {return: true}); ctrl.key('3', {});

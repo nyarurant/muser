@@ -9,10 +9,31 @@ const {c, width, pad} = createRequire(import.meta.url)('../tui/term.js');
 // the rule crossing exactly at the column borders, `---:` / `:---:` aligning right / centre.
 const TABLE = /^\s*\|.*\|\s*$/, TABLE_RULE = /^\s*\|[\s:|-]+\|\s*$/;
 export const isTableLine = src => TABLE.test(src);
-// Cells split at | that is not escaped (\| is a literal bar inside a cell).
-const cellsOf = src => src.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(x => x.trim().replace(/\\\|/g, '|'));
+// Cells split at | that is not escaped (\| is a literal bar inside a cell). The split
+// counts the backslash run before each |: an even run (\\ is an escaped backslash)
+// leaves the | a delimiter, an odd run escapes it (deep #211).
+const cellsOf = src => {
+  const body = src.trim().replace(/^\|/, '').replace(/\|$/, '');
+  const cells = [];
+  let cur = '', run = 0;
+  for (const ch of body) {
+    if (ch === '\\') { cur += ch; run++; continue; }
+    if (ch === '|' && run % 2 === 0) { cells.push(cur); cur = ''; run = 0; continue; }
+    cur += ch; run = 0;
+  }
+  cells.push(cur);
+  return cells.map(x => x.trim().replace(/\\(\\|\|)/g, '$1'));
+};
+const isRuleLine = (l, i, total) => {
+  // A delimiter row is only a rule in delimiter position: the second row of a
+  // table, or a lone line rendered on its own. The same shape anywhere else
+  // (| - | - | as data) is data and must not vanish into a rule (deep #212).
+  if (!(i === 1 || (total === 1 && i === 0))) return false;
+  if (!TABLE_RULE.test(l) || !l.includes('-')) return false;
+  return cellsOf(l).every(x => /^:?-+:?$/.test(x));
+};
 export function tableRows(lines) {
-  const parsed = lines.map(l => TABLE_RULE.test(l) && l.includes('-')
+  const parsed = lines.map((l, i) => isRuleLine(l, i, lines.length)
     ? {rule: cellsOf(l).map(x => x.startsWith(':') && x.endsWith(':') ? 'center' : x.endsWith(':') ? 'right' : 'left')}
     : {cells: cellsOf(l).map(x => inline(x))});
   // No spread into Math.max (recovery scan): feed() accumulates a whole streamed
@@ -28,11 +49,20 @@ export function tableRows(lines) {
     if (align[j] === 'center') return ' '.repeat(Math.floor(room / 2)) + s + ' '.repeat(Math.ceil(room / 2));
     return pad(s, widths[j]);
   };
-  return parsed.map((p, i) => {
-    if (p.rule) return {prefix: '', text: c.faint(widths.map(w => '─'.repeat(w + 2)).join('┼')), code: true};
-    const head = ruleAt > i;
-    return {prefix: '', text: widths.map((_, j) => ' ' + (head ? c.bold(fit(p.cells[j] || '', j)) : fit(p.cells[j] || '', j)) + ' ').join(c.faint('│')), code: true};
+  const ruleRow = () => ({prefix: '', text: c.faint(n === 1 ? '─'.repeat(widths[0] + 4) : widths.map(w => '─'.repeat(w + 2)).join('┼')), code: true});
+  const out = [];
+  parsed.forEach((p, i) => {
+    if (p.rule) { out.push(ruleRow()); return; }
+    // No delimiter row anywhere: the first row is the header (bold it and give it
+    // a rule), otherwise it renders exactly like a data row (r1-16).
+    const head = ruleAt >= 0 ? ruleAt > i : i === 0 && parsed.length > 1;
+    const seg = widths.map((_, j) => ' ' + (head ? c.bold(fit(p.cells[j] || '', j)) : fit(p.cells[j] || '', j)) + ' ').join(c.faint('│'));
+    // A one-column table has no join, so without explicit end borders it reads
+    // as plain lines under a rule (r1-15).
+    out.push({prefix: '', text: n === 1 ? c.faint('│') + seg + c.faint('│') : seg, code: true});
+    if (head && ruleAt < 0) out.push(ruleRow());
   });
+  return out;
 }
 
 // Markup inside `code` is literal: `__init__.py` showed as "init.py" and `ls *.js *.md` as
@@ -46,7 +76,33 @@ const HELD = new RegExp(HOLD + '([0-9]+)' + HOLD_END, 'g');
 export function inline(src) {
   const spans = [];
   const escaped = String(src).split(HOLD).join(HOLD + HOLD_ESC).split(HOLD_END).join(HOLD_END + HOLD_ESC);
-  const s = escaped.replace(/`([^`]+)`/g, (_, x) => HOLD + (spans.push(c.code(x)) - 1) + HOLD_END);
+  // Code spans are scanned, not regexed (deep #210): a span opens with a run of
+  // N backticks and closes at the next run of exactly N, so ``code with ` inside``
+  // works; a backtick escaped by an odd backslash run is literal text, and its
+  // backslash is consumed.
+  let s = '';
+  for (let i = 0; i < escaped.length;) {
+    const ch = escaped[i];
+    if (ch === '\\') {
+      let n = 0; while (escaped[i + n] === '\\') n++;
+      if (escaped[i + n] === '`' && n % 2 === 1) { s += '\\'.repeat(n - 1) + '`'; i += n + 1; continue; }
+      s += '\\'.repeat(n); i += n; continue;
+    }
+    if (ch !== '`') { s += ch; i++; continue; }
+    let n = 0; while (escaped[i + n] === '`') n++;
+    let close = -1;
+    for (let j = i + n; j < escaped.length;) {
+      if (escaped[j] !== '`') { j++; continue; }
+      let m = 0; while (escaped[j + m] === '`') m++;
+      if (m === n) { close = j; break; }
+      j += m;
+    }
+    if (close < 0) { s += '`'.repeat(n); i += n; continue; }
+    let content = escaped.slice(i + n, close).replace(/\n/g, ' ');
+    if (content.length > 1 && content.startsWith(' ') && content.endsWith(' ') && content.trim() !== '') content = content.slice(1, -1);
+    s += HOLD + (spans.push(c.code(content)) - 1) + HOLD_END;
+    i = close + n;
+  }
   const restored = format(s).replace(HELD, (_, i) => {
     const n = Number(i);
     // Unknown placeholder (index this call never created): leave it untouched,
@@ -63,8 +119,17 @@ function format(s) {
     .replace(/(^|[^*\w])\*([^*\s][^*]*)\*(?=[^*\w]|$)/g, (_, a, x) => a + c.italic(x))
     .replace(/(^|[^A-Za-z0-9_])_([^_\s][^_]*)_(?=[^A-Za-z0-9_]|$)/g, (_, a, x) => a + c.italic(x))
     // Link URLs may contain one level of balanced parentheses (e.g. Wikipedia titles).
-    .replace(/\[([^\]]+)\]\((https?:(?:[^()\s]|\([^()\s]*\))+)\)/g, (_, t, u) => c.under(t) + c.faint(' ' + u));
+    // The link text may not contain '[' either: with ']' absent, [^\]]+ rescanned to
+    // end-of-line from every '[', making a long bracket run quadratic (deep #209).
+    // Excluding '[' fails each stray bracket immediately instead.
+    .replace(/\[([^\]\[]{1,200})\]\((https?:(?:[^()\s]|\([^()\s]*\))+)\)/g, (_, t, u) => c.under(t) + c.faint(' ' + u));
 }
+
+// Tabs inside a code block expand to a 2-column tab stop before rendering:
+// the terminal would otherwise use 8-column stops and push the code itself
+// off a narrow screen (r1-14). (Module level: createMd's own `width`
+// parameter shadows the term.js width this needs.)
+const expandTabs = s => { let out = '', col = 0; for (const ch of s) { if (ch === '\t') { const n = 2 - (col % 2); out += ' '.repeat(n); col += n; } else { out += ch; col += width(ch); } } return out; };
 
 export function createMd(width) {
   // No explicit width: follow the terminal, as the call sites (controller/view)
@@ -76,19 +141,25 @@ export function createMd(width) {
   const r = {
     fence: null,
     row(src) {
-      const f = /^\s*(```|~~~)\s*([\w+-]*)/.exec(src);
-      if (f) {
-        if (!r.fence) { r.fence = f[1]; return {prefix: c.faint('╭─ ') , text: c.faint(f[2] || 'code')}; }
-        if (src.trim().startsWith(r.fence)) { r.fence = null; return {prefix: c.faint('╰─'), text: ''}; }
+      // A fence closes only on a bare line of the same character repeated at
+      // least as many times as the opener (first audit #28): a ```js example or
+      // a shorter ``` run inside a ```` block is content, not the end.
+      if (r.fence) {
+        const close = /^\s*(`{3,}|~{3,})\s*$/.exec(src);
+        if (close && close[1][0] === r.fence[0] && close[1].length >= r.fence.length) { r.fence = null; return {prefix: c.faint('╰─'), text: ''}; }
+        return {prefix: c.faint('│ '), text: c.code(expandTabs(src)), code: true};
       }
-      if (r.fence) return {prefix: c.faint('│ '), text: c.code(src), code: true};
+      const f = /^\s*(`{3,}|~{3,})\s*([\w+-]*)/.exec(src);
+      if (f) { r.fence = f[1]; return {prefix: c.faint('╭─ ') , text: c.faint(f[2] || 'code')}; }
       let m;
       if ((m = /^(#{1,6})\s+(.*)$/.exec(src))) { const inner = inlineCached(m[2]); return {prefix: '', text: c.bold(m[1].length <= 2 ? c.accent(inner) : inner)}; }
       if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(src)) return {prefix: '', text: c.faint('─'.repeat(Math.max(8, effWidth || 40)))};
       if ((m = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(src))) return {prefix: m[1] + (m[2] === ' ' ? c.gray('☐ ') : c.green('☒ ')), text: inlineCached(m[3])};
       if ((m = /^(\s*)[-*+]\s+(.*)$/.exec(src))) return {prefix: m[1] + c.gray('• '), text: inlineCached(m[2])};
       if ((m = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(src))) return {prefix: m[1] + c.gray(m[2] + '. '), text: inlineCached(m[3])};
-      if ((m = /^>\s?(.*)$/.exec(src))) return {prefix: c.faint('▎ '), text: c.italic(inlineCached(m[1]))};
+      // Nested quotes repeat the bar per level instead of leaving a raw '>'
+      // in the text (r1-19).
+      if ((m = /^((?:>\s?)+)(.*)$/.exec(src))) { const depth = m[1].split('>').length - 1; return {prefix: c.faint('▎'.repeat(depth) + ' '), text: c.italic(inlineCached(m[2]))}; }
       // One table line on its own (the unfinished line's preview); whole tables go through feed().
       if (isTableLine(src)) return tableRows([src])[0];
       return {prefix: '', text: inlineCached(src)};

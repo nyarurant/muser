@@ -58,6 +58,10 @@ class Relay {
   // account(): this window's Muse account id (src/accounts.js). A call is only ever handed to a
   // window on the same account: another account's window would run it for a Muse whose chat
   // never asked for it. Windows that do not say (older muser) are not filtered.
+  // The DEFAULT account's id is 'default' (src/accounts.js), but a default-account window's
+  // account() returns null — so null is normalised to the 'default' sentinel everywhere
+  // below (deep audit H8). Only a message with NO account field at all is a legacy
+  // unfiltered one; a present account that differs from the effective own id blocks.
   constructor({takes, run, account = () => null, dir = defaultDir(), idleTimeoutMs = IDLE_TIMEOUT_MS, maxLineBytes = MAX_LINE_BYTES}) {
     this.takes = takes; this.run = run; this.account = account; this.dir = dir;
     this.idleTimeoutMs = idleTimeoutMs; this.maxLineBytes = maxLineBytes;
@@ -80,7 +84,17 @@ class Relay {
       sock.setEncoding('utf8');
       sock.on('error', () => {});
       sock.on('close', () => { if (idle) clearTimeout(idle); this._sockets.delete(sock); });
+      // One connection carries exactly one request (see request()). Once a complete
+      // line has been taken, further data on this socket is never parsed or run: a
+      // second line used to be silently dropped when it shared the first chunk, but
+      // ran in parallel with the first invoke when it arrived in a later chunk (a
+      // long approval wait), and one of the two results was then lost when the first
+      // reply ended the socket (deep audit c18 #6). The first reply still ends the
+      // socket, so a peer that pipelines loses its second request visibly (closed
+      // connection) instead of having it run.
+      let taken = false;
       sock.on('data', async d => {
+        if (taken) return;
         buf += d; const i = buf.indexOf('\n');
         if (i < 0) {
           if (buf.length > this.maxLineBytes) return sock.destroy();
@@ -88,12 +102,15 @@ class Relay {
           return;
         }
         if (i > this.maxLineBytes) return sock.destroy();
+        taken = true;
         if (idle) clearTimeout(idle); // line complete: processing may legitimately take a while
         let msg; try { msg = JSON.parse(buf.slice(0, i)); } catch { return sock.destroy(); }
         buf = '';
         let reply;
         try {
-          const mine = this.account(), other = msg.account && mine && msg.account !== mine;
+          const mine = this.account() || 'default';
+          const hasAccount = !!msg && typeof msg === 'object' && Object.prototype.hasOwnProperty.call(msg, 'account');
+          const other = hasAccount && (msg.account || 'default') !== mine;
           if (msg.type === 'takes') reply = {takes: !other && !!this.takes(msg.params)};
           else if (msg.type === 'invoke') reply = {result: other ? {ok: false, error: 'This call came from another Muse account than this muser window is on.'} : await this.run(msg.command, msg.params, msg.timeoutMs, msg.id)};
           else reply = {error: 'unknown'};
@@ -132,7 +149,10 @@ class Relay {
   // {takers: 1, error} when the one that took it did not answer.
   async forward(command, params, timeoutMs, id) {
     // An entry whose pipe is gone (its pid now belongs to another program) is removed.
-    const account = this.account() || undefined;
+    // Always name the account explicitly — 'default' for the default account
+    // (deep audit H8) — so a receiving window can actually filter on it. A
+    // missing field is reserved for genuinely old windows that send none.
+    const account = this.account() || 'default';
     const ask = p => request(p.pipe, {type: 'takes', params, account}, ASK_MS, this.maxLineBytes).then(r => r.takes ? p : null, e => { if (e.code === 'ENOENT') { try { fs.unlinkSync(p.file); } catch {} } return null; });
     const answers = await Promise.all(this.peers().map(ask));
     const takers = answers.filter(Boolean);
@@ -144,4 +164,4 @@ class Relay {
   }
 }
 
-module.exports = {Relay, INVOKE_MARGIN_MS, MAX_LINE_BYTES, IDLE_TIMEOUT_MS, defaultDir, alive};
+module.exports = {Relay, INVOKE_MARGIN_MS, MAX_LINE_BYTES, IDLE_TIMEOUT_MS, defaultDir, alive, DEFAULT_ACCOUNT: 'default'};

@@ -23,7 +23,7 @@ const check = (status, evidence = [], reason = status) => [{id: 'c1', status, ev
 async function harness(t, work) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-goal-test-'));
   t.after(() => fs.rmSync(cwd, {recursive: true, force: true})); fs.writeFileSync(path.join(cwd, 'probe.txt'), 'probe');
-  const client = new EventEmitter(), events = [], sends = [];
+  const client = new EventEmitter(), events = [], sends = [], errors = [];
   Object.assign(client, {status: 'connected', ws: {readyState: 1}, taskStatus: 'running', disconnect() {}, closeAgentSubscription() {}, async subscribeAgent() {}, async cancel() { this.cancelled = true; }, async history() { return {chat_events: events}; }, async request() { return {session: {status: this.taskStatus}}; }});
   const agent = new Agent({client, auth: {}, cwd, session: sessions.create(cwd)}); agent.subscribed = true;
   t.after(() => agent.close());
@@ -39,14 +39,21 @@ async function harness(t, work) {
         if (agent.main.turn?.controller.signal.aborted) return;
         const done = {event: 'delta.message_done', seq: round * 2 + 1, payload: {session_id: sessionId, message_id: 'reply-' + round, role: 'assistant', text: 'reply ' + round, status: 'completed'}};
         events.push(done); client.taskStatus = 'completed'; inFlight = false; client.emit('event', done);
-      } catch (e) { client.taskStatus = 'failed'; inFlight = false; client.emit('event', {event: 'task.status', session_id: sessionId, payload: {status: 'failed'}}); }
+      } catch (e) { errors.push(e); client.taskStatus = 'failed'; inFlight = false; client.emit('event', {event: 'task.status', session_id: sessionId, payload: {status: 'failed'}}); }
     });
     return {message_id: id};
   }};
   const {Controller} = await import('../src/ui/controller.mjs');
   const ctrl = new Controller({agent, museName: 'Muse', version: '0.3.6', onExit() {}});
   agent.approver = async () => ({allow: true}); // the scripts write files: approve, like tests/agent.test.js does
-  return {agent, ctrl, sends, client};
+  // t2 #9: an assertion failing inside work() used to surface only as a
+  // generic 'failed' turn event (or a hang) — the diff was lost. Rethrow the
+  // first one after the test so it fails with its own message. (The other
+  // half of that finding — device.send absorbing a concurrent send as a
+  // postSteer post — is the behaviour under test in the clarification test
+  // below, and the sends log there is asserted, so it stays.)
+  t.after(() => { if (errors.length) throw errors[0]; });
+  return {agent, ctrl, sends, client, errors};
 }
 // One round of visible progress (an edit, so the stall detector stays quiet) that
 // still leaves the criterion unmet.
