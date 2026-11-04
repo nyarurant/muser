@@ -9,6 +9,8 @@ https://github.com/user-attachments/assets/93eb5d68-4bc8-4f50-9d2e-21bcf1118a4c
 
 > **Unofficial.** muser is a personal project with no affiliation with Meta / Muse. It speaks the private protocol the Muse web app uses, so a change on Muse's side can break it at any time, and it may sit uneasily with the terms of service — use it at your own discretion.
 
+> **About the 0.3.7 release notes.** They say 0.3.7 added selectable questions and Ctrl+Shift+V / right-click paste. We thought those were in, but they did not make it into 0.3.7 — sorry for the confusion. Selectable questions and Ctrl+Shift+V come in 0.3.8. Right-click paste already works today, as a feature of the terminal itself (Windows Terminal, conhost).
+
 ## Requirements
 
 - Windows 10 / 11
