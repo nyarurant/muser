@@ -108,6 +108,7 @@ class MuseClient extends EventEmitter {
     this.connecting=this.openWaking().finally(()=>{this.connecting=null;}); return this.connecting;
   }
   // muser: a VM that muse.ai suspended after idling makes the gateway answer 502/503/504
+  // (the status line only says it reconnects: a RUNNING VM can answer 502 too)
   // (found on a real account: vm_state SUSPENDED, every connect 502, restarting muser did
   // not help). muse.ai's own page wakes it (POST /api/hatch/vm/wake); do the same once,
   // then connect again. Any other failure, or a wake that does not bring the VM up, stays
@@ -116,7 +117,7 @@ class MuseClient extends EventEmitter {
     try { return await this.open(); }
     catch(e) {
       if(!this.wakeVm||!(e&&e.status>=502&&e.status<=504)) throw e;
-      this.state('connecting',t('Muse の VM が休止していたので、起こしています…'));
+      this.state('connecting',t('Muse につなぎ直しています…'));
       let woke=false; try { woke=await this.wakeVm(); } catch {}
       if(!woke) { this.state('error',e.message); throw e; }
       return await this.open();

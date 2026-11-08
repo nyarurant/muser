@@ -510,6 +510,26 @@ test('POST /api/account switches or adds; state.prompt / addFlow carry the add f
   assert.equal(cancelled, true);
 });
 
+test('/api/settings reads the settings as data and applies one change (app-ui)', async t => {
+  const {server, controller} = makeServer(t);
+  const applied = [];
+  controller.settingsModel = () => ({groups: ['作業の進め方'], items: [{key: 'bell', kind: 'switch', group: '作業の進め方', label: 'ベル', value: false}], skills: [], mcp: []});
+  controller.applySetting = async (key, value) => {
+    if (key === 'nope') { const e = new Error('unknown setting'); e.status = 404; throw e; }
+    if (key === 'focusRounds' && value > 99) { const e = new Error('1〜99'); e.status = 400; throw e; }
+    applied.push([key, value]); return controller.settingsModel();
+  };
+  await server.start();
+  assert.equal((await call(server, 'GET', '/api/settings')).status, 401, 'settings keep the Bearer auth');
+  const got = await (await call(server, 'GET', '/api/settings', {headers: AUTH})).json();
+  assert.equal(got.items[0].key, 'bell');
+  assert.equal((await call(server, 'POST', '/api/settings', {headers: AUTH, body: {value: true}})).status, 400, 'a key is required');
+  assert.equal((await call(server, 'POST', '/api/settings', {headers: AUTH, body: {key: 'bell', value: true}})).status, 200);
+  assert.deepEqual(applied, [['bell', true]]);
+  assert.equal((await call(server, 'POST', '/api/settings', {headers: AUTH, body: {key: 'focusRounds', value: 1000}})).status, 400);
+  assert.equal((await call(server, 'POST', '/api/settings', {headers: AUTH, body: {key: 'nope', value: 1}})).status, 404);
+});
+
 test('POST /api/mode sets a TUI mode name and 400s anything else', async t => {
   const {server, controller, agent} = makeServer(t);
   await server.start();

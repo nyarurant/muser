@@ -15,7 +15,8 @@ import {highlight, rowRange, selectedText} from './select.mjs';
 import {createRequire} from 'node:module';
 const {copyText} = createRequire(import.meta.url)('../../clipboard.js');
 const {t} = createRequire(import.meta.url)('../../i18n.js');
-import {truncateEnd} from './draw/primitives.mjs';
+import {truncateEnd, width as cellWidth, strip as stripAnsi, c as colors} from './draw/primitives.mjs';
+import {HINTS, findCols, underlineCols, promptBorderButtons, jumpLabel, footerTargets, runButton} from './buttons.mjs';
 
 import fs from 'node:fs';
 
@@ -33,6 +34,10 @@ export function runFullscreen({ctrl, renderEntry, renderLive, dim = s => s, labe
   // The mouse selection: anchor and head as {ref: {idx, off}, col} (conversation terms, so it
   // survives scrolling); pointer is where the dragging mouse is, resolved to a head each frame.
   let sel = null, lastRefs = [], edgeTimer = null, lastSid, bannerRow = -1;
+  // Clickable buttons of the last frame ({y, x0, x1, id}, see buttons.mjs) and the one a
+  // left press landed on (a click runs it when the release lands on the same button).
+  let regions = [], pressed = null;
+  const hitAt = (x, y) => regions.find(r => r.y === y && x >= r.x0 && x < r.x1) || null;
   // MUSER_FS_TRACE=<file>: where the time goes, from this process's start — each frame's parts,
   // keys, resizes, and any stretch the event loop was blocked (startup work, a heavy turn).
   let stallTimer = null;
@@ -90,9 +95,15 @@ export function runFullscreen({ctrl, renderEntry, renderLive, dim = s => s, labe
     if (sel?.dragging) resolveHead(refs, H);
     if (sel) for (let r = 0; r < H; r++) { const range = rowRange(sel, refs[r]); if (range) hist[r] = highlight(hist[r], range[0], range[1]); }
     bannerRow = -1;
+    const nextRegions = [];
     if (!history.follow && H > 0) {
       const label = unseen ? (labels.unseen || '↓ new output: {n} · PgDn / Ctrl+End').replace('{n}', unseen) : (labels.scrolled || '↑ scrolled · PgDn / Ctrl+End to the bottom');
-      hist[H - 1] = dim('── ' + label + ' ──');
+      // The band carries a [↓ 最新へ] button when it fits (jump to the newest output).
+      const head = '── ' + label + ' ', jump = jumpLabel();
+      if (!tiny && cellWidth(head) + cellWidth(jump) + 3 <= W) {
+        hist[H - 1] = dim(head) + colors.accent(jump) + dim(' ──');
+        nextRegions.push({y: H - 1, x0: cellWidth(head), x1: cellWidth(head) + cellWidth(jump), id: 'bottom'});
+      } else hist[H - 1] = dim('── ' + label + ' ──');
       // The banner REPLACES the history row at H - 1, but refs[H - 1] still names the
       // covered line: a selection started there would copy a line that is not on the
       // screen. The mouse handler refuses that row as an anchor (see bannerRow).
@@ -107,6 +118,47 @@ export function runFullscreen({ctrl, renderEntry, renderLive, dim = s => s, labe
       const y = (tiny ? 1 : 0) + H + liveCaret.row - cut;
       if (y < R) cursor = {x: liveCaret.col, y};
     }
+    if (!tiny) {
+      // The banner's key hints (history rows of the banner entry).
+      for (let r = 0; r < H; r++) {
+        if (r === bannerRow || s.entries[refs[r]?.idx]?.type !== 'banner') continue;
+        const plain = stripAnsi(hist[r]);
+        for (const [k, label, id] of HINTS) {
+          const f = findCols(plain, ' ' + k + '  ' + t(label));
+          if (!f) continue;
+          nextRegions.push({y: r, x0: f.x0 + 1, x1: f.x1, id});
+          hist[r] = underlineCols(hist[r], f.x0 + 1, f.x1);
+        }
+      }
+      // The prompt box's bottom border (the first border row under the caret) and the
+      // footer's mode / account / usage labels (the last two live rows).
+      const promptShown = !s.approval && !s.question && !s.menu;
+      const caretAt = liveCaret ? liveCaret.row - cut : -1;
+      if (promptShown && caretAt >= 0) {
+        for (let i = caretAt; i < live.length; i++) {
+          if (!/^╰─*╯$/.test(stripAnsi(live[i]))) continue;
+          const b = promptBorderButtons(live[i], {canSend: !!String(s.text || '').trim() || !!(s.attachments || []).length});
+          if (b) { live[i] = b.line; for (const r of b.regions) nextRegions.push({...r, y: H + i}); }
+          break;
+        }
+      }
+      for (let i = Math.max(0, live.length - 2); i < live.length; i++) {
+        const plain = stripAnsi(live[i]);
+        // The status lane: ' <mode>   …   ● <account> · … · 週 n% · …'. The mode is at the
+        // head of the row, the account right after the dot, the usage somewhere after it.
+        const dot = plain.search(/[●○] /);
+        for (const [label, id] of footerTargets(s)) {
+          const f = id === 'mode' ? (plain.startsWith(' ' + label) ? findCols(plain, label) : null)
+            : dot < 0 ? null
+            : id === 'account' ? (plain.startsWith(label, dot + 2) ? findCols(plain, label, dot + 2) : null)
+            : findCols(plain, label, dot + 2);
+          if (!f) continue;
+          nextRegions.push({y: H + i, x0: f.x0, x1: f.x1, id});
+          live[i] = underlineCols(live[i], f.x0, f.x1);
+        }
+      }
+    }
+    regions = nextRegions;
     const frameLines = tiny ? [dim(truncateEnd(labels.tooSmall || t('端末が小さすぎます。広げてください'), W)), ...live] : [...hist, ...live];
     screen.draw(frameLines.slice(0, R), cursor);
     // The events ring keeps this frame's cost and size (coalesced there;
@@ -191,6 +243,19 @@ export function runFullscreen({ctrl, renderEntry, renderLive, dim = s => s, labe
       // the screens that take no paste). The guards mirror Controller.mouseInput, so a
       // right click over an approval / menu / limit input / question list does not even
       // start a clipboard read. A right click never starts or moves a selection.
+      // A left click on a button (buttons.mjs) runs it: the press marks the button, the
+      // release on the same button runs it. A press on a button starts no selection.
+      if (button === 'left' && kind === 'down') { pressed = hitAt(x, y); if (pressed) { clearSelection(); return; } }
+      if (button === 'left' && pressed) {
+        if (kind === 'up') {
+          const hit = hitAt(x, y), id = pressed.id; pressed = null;
+          if (hit && hit.id === id) {
+            try { runButton(id, ctrl, {scrollToBottom: () => { history.toBottom(); schedule('button'); }}); } catch {}
+            schedule('button');
+          }
+        }
+        return;
+      }
       if (button === 'right') {
         if (kind === 'up') {
           const s = ctrl.get();

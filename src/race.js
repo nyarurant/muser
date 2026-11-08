@@ -535,7 +535,7 @@ async function applyWinner(result, index) {
     // (audit-cli wave 6). A result explicitly marked interrupted keeps
     // the interrupted wording even if its racer statuses were not.
     if (result.interrupted || result.status === 'interrupted') throw new Error(t('中断しました'));
-    throw new Error(t('競争は実行中です。終わるまで待ってください。'));
+    throw new Error(t('競争は実行中です。'));
   }
   const patch = diffText(result, index);
   if (!patch.trim()) return {ok: true, empty: true};

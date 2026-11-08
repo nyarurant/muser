@@ -136,4 +136,39 @@ async function ensureServer(deps = {}) {
   return {status: 'failed', reason: sawFile ? 'unreachable' : 'not-found'};
 }
 
-module.exports = {ensureServer, verdict, PROTOCOL, DEFAULT_TIMEOUT_MS};
+// True when a running server is an OLDER build than this CLI. The protocol
+// can stay the same across releases, so an updated muser attaches to the
+// resident server that logon autostart started from the previous install,
+// and every conversation keeps running the old code until that server
+// restarts. Unknown or malformed versions are not "older".
+function olderServer(serverVersion, ownVersion) {
+  const parse = v => { const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(v || '')); return m ? m.slice(1).map(Number) : null; };
+  const a = parse(serverVersion), b = parse(ownVersion);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) { if (a[i] !== b[i]) return a[i] < b[i]; }
+  return false;
+}
+
+// After an update the resident server (started at logon, or by the GUI) still runs
+// the previous build, and every conversation runs its code. When it is older than
+// this CLI and idle — no conversation working or waiting for an approval — stop it
+// so the caller can start the current build (ensureServer). A busy server is left
+// alone: stopping it would cut a running turn. Returns {restarted: true} once the
+// old server is gone, or {restarted: false, reason}.
+async function stopOlderServer({info, live, ownVersion, request, probe, sleep = ms => new Promise(r => setTimeout(r, ms)), timeoutMs = 10000, pollMs = 250} = {}) {
+  if (!info || !live || !olderServer(live.version, ownVersion)) return {restarted: false, reason: 'not-older'};
+  const sessions = Array.isArray(live.sessions) ? live.sessions : [];
+  if (sessions.some(s => s && (s.busy || s.approval))) return {restarted: false, reason: 'busy'};
+  let res = null;
+  try { res = await request(info, 'POST', '/api/server/stop', {}); } catch { res = null; }
+  if (!res || res.status >= 400) return {restarted: false, reason: 'stop-failed'};
+  for (let waited = 0; waited <= timeoutMs; waited += pollMs) {
+    let alive = null;
+    try { alive = await probe(info); } catch { alive = null; }
+    if (!alive) return {restarted: true};
+    await sleep(pollMs);
+  }
+  return {restarted: false, reason: 'still-running'};
+}
+
+module.exports = {ensureServer, verdict, olderServer, stopOlderServer, PROTOCOL, DEFAULT_TIMEOUT_MS};

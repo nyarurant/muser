@@ -185,6 +185,7 @@ export class RemoteController {
     this._sending = false; // a submit is in flight (c8 #5)
     this._flashSource = null; // who owns s.flash right now: 'local' | 'server' | null (c8 #7)
     this._localEntrySeq = 0; // ids for locally appended entries (ctrl+o's note)
+    this._pinned = []; // this window's own notes (pinNote): kept across entry replacements
   }
   // ---- store (the local Controller's shape, word for word) ----
   subscribe = fn => { this.listeners.add(fn); return () => this.listeners.delete(fn); };
@@ -285,7 +286,7 @@ export class RemoteController {
       // replacement, whatever its size, and view's <Static> is keyed on
       // clearCount — clearing only on a shrink left the old conversation
       // rendered above a same-size-or-larger replacement.
-      return this.set({entries: [...ev.entries], clearCount: this.s.clearCount + 1});
+      return this.set({entries: [...ev.entries, ...this._pinned], clearCount: this.s.clearCount + 1});
     }
     if (ev.kind === 'state' && ev.state) return this.applySnapshot(ev.state, Array.isArray(ev.state.entries));
     // {kind: 'server'} frames belong to serverEvents(), not a conversation stream.
@@ -300,7 +301,7 @@ export class RemoteController {
     if (!snap || typeof snap !== 'object') return;
     const live = snap.live || {}, patch = {};
     const pick = key => live[key] !== undefined ? live[key] : snap[key];
-    if (withEntries && Array.isArray(snap.entries)) { patch.entries = [...snap.entries]; this._entriesGen++; this.entriesHasMore = null; } // R16/R17, same as entries-reset
+    if (withEntries && Array.isArray(snap.entries)) { patch.entries = [...snap.entries, ...this._pinned]; this._entriesGen++; this.entriesHasMore = null; } // R16/R17, same as entries-reset
     const stream = pick('stream');
     if (stream !== undefined) patch.stream = stream ? {id: stream.id ?? null, started: !!stream.started, partial: stream.partial || '', done: 0, emitted: '', raw: stream.partial || '', table: Array.isArray(stream.table) ? stream.table.map(String) : []} : null;
     for (const key of ['running', 'bangRunning', 'status', 'activity', 'museRunning', 'agentWords', 'turnStart']) {
@@ -424,6 +425,14 @@ export class RemoteController {
 
   // ---- server-owned in the local Controller: harmless no-ops here ----
   showResumed() { return Promise.resolve(); } // the snapshot already carries the entries
+  // A note from this window itself (not the server's conversation), e.g. "the Server
+  // still runs an older build". A plain appended entry was wiped by the first
+  // snapshot or entries-reset that replaced the list, so pinned notes ride along.
+  pinNote(lines) {
+    const entry = {id: 'local-pinned-' + (++this._localEntrySeq), type: 'note', lines: [].concat(lines)};
+    this._pinned.push(entry);
+    this.set({entries: [...this.s.entries, entry]});
+  }
   checkUpdate() { return Promise.resolve(null); } // the snapshot's `update` field is the server's
   refreshPlan() { return Promise.resolve(this.s.plan || null); } // likewise `plan`
 
@@ -728,12 +737,14 @@ export class RemoteController {
     this.pasting = true;
     const target = this.pasteTarget();
     try {
-      const {files, error} = await clip.clipboardImages();
+      // Said at once: the two reads below are PowerShell runs, which take a second or
+      // more on a busy PC, and a right click that showed nothing for that long read as
+      // "right click does not paste". The image and the text are read in parallel.
+      this.flash(t('貼り付けています…'), 15000);
+      const [{files, error}, text] = await Promise.all([clip.clipboardImages(), clip.clipboardText().catch(() => '')]);
       if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
-      if (!error && files.length) return files.forEach(f => this.attach(f.path, f.temporary));
-      const text = await clip.clipboardText().catch(() => '');
-      if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
-      if (text) return this.paste(text);
+      if (!error && files.length) { this.flash(''); return files.forEach(f => this.attach(f.path, f.temporary)); }
+      if (text) { this.flash(''); return this.paste(text); }
       if (error) return this.flash(t('クリップボードを読めませんでした: {error}', {error}), 6000);
       this.flash(t('クリップボードに貼れるものがありません'));
     } finally { this.pasting = false; }

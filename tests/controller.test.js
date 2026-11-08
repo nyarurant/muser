@@ -78,9 +78,9 @@ test('@ candidates: tab still completes the first candidate', async () => {
 test('starting in the home folder warns once that searches will cover all of it', async () => {
   const {Controller} = await import('../src/ui/controller.mjs');
   const home = new Controller({agent: new FakeAgent(os.homedir()), museName: 'm', version: 't', onExit() {}});
-  assert.ok(home.get().entries.some(e => e.type === 'note' && /ホームかドライブ直下/.test(e.lines.join(''))));
+  assert.ok(home.get().entries.some(e => e.type === 'note' && /検索が広くなる/.test(e.lines.join(''))));
   const repo = new Controller({agent: new FakeAgent(process.cwd()), museName: 'm', version: 't', onExit() {}});
-  assert.ok(!repo.get().entries.some(e => e.type === 'note' && /ホームかドライブ直下/.test(e.lines.join(''))));
+  assert.ok(!repo.get().entries.some(e => e.type === 'note' && /検索が広くなる/.test(e.lines.join(''))));
 });
 
 test('a menu opening (e.g. the re-login offer) keeps what the user was typing', async () => {
@@ -1232,6 +1232,29 @@ test('resume shows an automatic continuation body kept as user text as a short l
     assert.ok(!users[1].includes('[muser:'), 'the instruction is not shown as the user\'s words');
     assert.match(users[1], /自動で続行|continued automatically/);
   } finally { transcript.forResume = orig; }
+});
+
+test('settingsModel lists the /settings rows as data; applySetting changes one and refuses bad input (app-ui)', async () => {
+  const {Controller} = await import('../src/ui/controller.mjs');
+  const settings = require('../src/settings');
+  const ctrl = new Controller({agent: new FakeAgent(process.cwd()), museName: 'm', version: 't', onExit() {}});
+  const model = ctrl.settingsModel();
+  const keys = model.items.map(i => i.key);
+  for (const k of ['agents.concurrent', 'focus', 'focusRounds', 'quotaFallback', 'mode', 'defaultMode', 'lang', 'bell', 'fullscreen']) assert.ok(keys.includes(k), k);
+  const rounds = model.items.find(i => i.key === 'focusRounds');
+  assert.equal(rounds.kind, 'number');
+  assert.equal(typeof rounds.min, 'number');
+  assert.ok(model.items.find(i => i.key === 'quotaFallback').choices.length >= 2);
+  assert.ok(model.groups.includes(model.items[0].group));
+  const before = !!settings.savedValue('bell');
+  const after = await ctrl.applySetting('bell', !before);
+  assert.equal(!!settings.savedValue('bell'), !before, 'the switch is saved');
+  assert.equal(after.items.find(i => i.key === 'bell').value, !before, 'the answer is the new model');
+  await ctrl.applySetting('bell', before);
+  await assert.rejects(ctrl.applySetting('focusRounds', rounds.max + 1), e => e.status === 400);
+  await assert.rejects(ctrl.applySetting('focusRounds', 'x'), e => e.status === 400);
+  await assert.rejects(ctrl.applySetting('quotaFallback', 'nonsense'), e => e.status === 400);
+  await assert.rejects(ctrl.applySetting('no-such-setting', 1), e => e.status === 404);
 });
 
 test('/account add typed at the name prompt runs after the outer flow closes (audit #163)', async () => {

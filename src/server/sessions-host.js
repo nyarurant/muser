@@ -122,9 +122,12 @@ class SessionsHost extends EventEmitter {
   // ('new') for a brand-new one (Third H3: never undefined — undefined means
   // "not specified" to the factory and used to inherit startup resume flags).
   // {findSession}: (ref) => stored session | null | undefined (default src/sessions.find).
-  constructor({create, findSession, maxOpen = MAX_OPEN, idleMs = IDLE_MS, sweepMs = SWEEP_MS} = {}) {
+  constructor({create, findSession, maxOpen = MAX_OPEN, idleMs = IDLE_MS, sweepMs = SWEEP_MS, holders = null} = {}) {
     super();
     this.create = create || null;
+    // Who else on this PC holds a stored conversation on its own (a standalone window, a
+    // muser exec): src/session-holders.js localHolders. Null = not checked (tests, old callers).
+    this.holders = typeof holders === 'function' ? holders : null;
     this.findSession = findSession || (ref => require('../sessions').find(ref));
     this.maxOpen = maxOpen;
     this.idleMs = idleMs;
@@ -331,7 +334,7 @@ class SessionsHost extends EventEmitter {
     return this._trackOpen(opening);
   }
 
-  async openExisting(ref, attachOpts = {}) {
+  async openExisting(ref, attachOpts = {}, {force = false} = {}) {
     if (!ref || typeof ref !== 'string') throw new HostError(400, 'session id is required');
     // serverfirst: same attach values as openNew (discovery sends them on
     // the /open route too). An already-open conversation is returned as-is —
@@ -348,6 +351,14 @@ class SessionsHost extends EventEmitter {
     if (this._opening.has(session.id)) return this._opening.get(session.id).then(entry => { if (attachDropped(attach, entry)) entry.attachDropped = true; return entry; });
     if (!this.create) throw new HostError(501, 'session hosting is not enabled');
     if (this._shuttingDown) throw new HostError(503, 'session host is shutting down');
+    // 2026-11-09: a chat a standalone window (or a muser exec) has open is not opened a
+    // second time here — two devices on one chat lose each other's work. [force] is the
+    // explicit override (the holder is known to be stuck).
+    if (this.holders && !force) {
+      let held = [];
+      try { held = this.holders(session.id) || []; } catch {}
+      if (held.length) { const e = new HostError(409, 'the conversation is open elsewhere on this PC'); e.code = 'held'; e.holders = held; throw e; }
+    }
     this.assertCapRoom();
     this._pendingOpens++;
     let counted = true;

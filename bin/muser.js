@@ -437,6 +437,19 @@ async function startBundle(o, session) {
   if (owner) { const a = accounts.get(owner); if (a) return {...pool.bundle(a), reason: 'resume'}; }
   return pool.initialBundle();
 }
+// 2026-11-09: a standalone window or a muser exec that resumes a chat another muser on this
+// PC has open (the resident Server, another window, a running exec) would be a second
+// device on it — Muse then loses one side's work or calls it offline. Refuse and say where.
+async function assertNotHeldElsewhere(o) {
+  if (!(o.resume || o.continue)) return;
+  let target = null;
+  try { target = sessionFromFlags(o); } catch { return; } // a bad target reports itself later, as before
+  if (!target?.id) return;
+  const holders = require('../src/session-holders');
+  const held = await holders.allHolders(target.id).catch(() => []);
+  if (!held.length) return;
+  throw new Error(t('この会話は {where} で開いています。そちらを閉じてから開いてください。', {where: held.map(h => holders.holderText(h)).join('、')}));
+}
 function sessionFromFlags(o) {
   const sessions = require('../src/sessions');
   if (o.resume) return resumeTarget(sessions, o.resume, o.cdGiven ? o.cwd : undefined);
@@ -751,6 +764,7 @@ async function interactive(o, initial, opts = {}) {
   // First run only: ask for the UI language before the onboarding screens.
   if (i18n.chosen() === null) await require('../src/tui/onboard').askLanguage();
   await onboardFor(o);
+  await assertNotHeldElsewhere(o);
   const {agent, museName, web} = await prepare(o);
   // A view that fails to load must not strand the prepared agent (deep c3 #1).
   let run;
@@ -788,7 +802,7 @@ async function interactive(o, initial, opts = {}) {
 // The client window itself: attach a conversation on a server that is known
 // to be live and answering, and run the TUI against it. Shared by the strict
 // --client entry and by the server-first default below.
-async function runClientWindow(o, initial, info, resolvedSessionId) {
+async function runClientWindow(o, initial, info, resolvedSessionId, serverVersion, restartedFrom) {
   const discovery = require('../src/server/discovery');
   let sessionId;
   // serverfirst-debug B13: the server-first entry resolves the requested
@@ -852,6 +866,13 @@ async function runClientWindow(o, initial, info, resolvedSessionId) {
   };
   ctrl = new RemoteController({client, sessionId: opened.id, version: VERSION, onExit, onReload});
   await ctrl.start();
+  // An updated muser on a resident Server still running the previous build:
+  // the conversation runs on the Server's code, so this update's fixes do
+  // not apply until it restarts. Said once, at the top of the window.
+  if (restartedFrom) ctrl.pinNote([t('Muser Server を {old} から {new} に起動し直しました。', {old: restartedFrom || '?', new: VERSION})]);
+  else if (require('../src/server/ensure-server').olderServer(serverVersion, VERSION)) {
+    ctrl.pinNote([t('Muser Server は {old} のまま動いています（この muser は {new}）。`muser server stop` のあと開き直すと、新しい版になります。', {old: serverVersion, new: VERSION})]);
+  }
   run({remoteCtrl: ctrl, version: VERSION, initial});
   } catch (e) {
     // Only a conversation THIS attach created can be an orphan; one the
@@ -887,7 +908,7 @@ async function clientInteractive(o, initial) {
   const v = verdict(info, live);
   if (v.status === 'protocol') throw new Error(t('動いている Muser Server の版が合いません。`muser server stop` してから起動し直すか、--client を外してください。'));
   if (v.status === 'setup') throw new Error(t('Muser Server は初回準備の途中です。`muser`（--client なし）で起動すると、この端末で準備を進められます。'));
-  return runClientWindow(o, initial, info);
+  return runClientWindow(o, initial, info, undefined, live.version);
 }
 
 // The one-line reason a server-first start fell back to a direct session.
@@ -924,7 +945,18 @@ async function serverFirstInteractive(o, initial) {
   const discovery = require('../src/server/discovery');
   // serverfirst-debug B2: the spawn lock sits next to the discovery
   // file, so two windows starting together spawn ONE server between them.
-  const ensured = await ensureServer({lockFile: discovery.serverFile() + '.spawnlock'}).catch(() => ({status: 'failed', reason: 'unreachable'}));
+  let ensured = await ensureServer({lockFile: discovery.serverFile() + '.spawnlock'}).catch(() => ({status: 'failed', reason: 'unreachable'}));
+  // An idle resident Server left over from before an update is restarted on the
+  // current build (a busy one is kept; the window then says it is older).
+  let restartedFrom = null;
+  if ((ensured.status === 'ready' || ensured.status === 'protocol') && ensured.live) {
+    const {stopOlderServer} = require('../src/server/ensure-server');
+    const r = await stopOlderServer({info: ensured.info, live: ensured.live, ownVersion: VERSION, request: discovery.request, probe: discovery.probeServer}).catch(() => ({restarted: false}));
+    if (r.restarted) {
+      restartedFrom = String(ensured.live.version || '');
+      ensured = await ensureServer({lockFile: discovery.serverFile() + '.spawnlock'}).catch(() => ({status: 'failed', reason: 'unreachable'}));
+    }
+  }
   let reason = null, extra = null;
   if (ensured.status === 'ready' || ensured.status === 'setup') {
     let ready = ensured.status === 'ready';
@@ -956,7 +988,7 @@ async function serverFirstInteractive(o, initial) {
       // user as itself instead of being retried as a server failure.
       const resolvedSessionId = (o.resume || o.continue) ? sessionFromFlags(o)?.id : undefined;
       for (;;) {
-        try { return await runClientWindow(o, initial, ensured.info, resolvedSessionId); }
+        try { return await runClientWindow(o, initial, ensured.info, resolvedSessionId, ensured.live?.version, restartedFrom); }
         catch (e) {
           const msg = String(e?.message || e);
           const notEnabled = e?.status === 501 || /session hosting is not enabled/.test(msg);
@@ -1128,6 +1160,7 @@ async function exec(o, prompt) {
   try {
     // exec is the one caller of connect(): a conversation it creates is marked
     // origin 'exec' (see Agent's sessionOrigin); --session/-c resumes keep theirs.
+    await assertNotHeldElsewhere(o);
     ({agent} = await connect(o, s => err('· ' + s), {waitForNodeMs: nodeWaitMs(), sessionOrigin: 'exec'}));
   } catch (e) {
     status.finish({exit: 1, ok: false, error: e.message}); noteWriteError();
@@ -1413,7 +1446,7 @@ async function serve(o) {
   }});
   // The server's open conversations share the node-slot cap (/settings 'maxNodeSlots'), so
   // every open conversation has a node slot of its own to register.
-  host = new SessionsHost({maxOpen: require('../src/settings').numberValue('maxNodeSlots'), create: async ({cwd, account, mode, session, maxAgents, maxAgentsTotal, focusEnabled, noFocus}) => {
+  host = new SessionsHost({maxOpen: require('../src/settings').numberValue('maxNodeSlots'), holders: id => require('../src/session-holders').localHolders(id), create: async ({cwd, account, mode, session, maxAgents, maxAgentsTotal, focusEnabled, noFocus}) => {
     // A conversation opened through the API onboards its own account first (its
     // login window opens if that account's login lapsed), like a window would.
     let accountId;

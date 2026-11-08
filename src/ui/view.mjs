@@ -869,7 +869,7 @@ function Prompt({s, W}) {
   // says so instead of the chat's placeholder.
   // Narrow screens get short placeholders that end as whole sentences: the long forms
   // were cut mid-phrase and lost exactly their point (deep r4 R4-7).
-  const placeholder = s.addFlow ? (s.promptFor ? t('ここに入力して Enter') : t('アカウントを追加しています…')) : reason ? t('断る理由（空でも可）') : W < 44 ? (s.busy ? t('Muse が作業中') : t('何をしますか？')) : s.busy ? t('Muse が作業中 · 送ると作業中の Muse に伝えます') : t('何をしますか？   / でコマンド');
+  const placeholder = s.addFlow ? (s.promptFor ? t('ここに入力して Enter') : t('アカウントを追加しています…')) : reason ? t('断る理由（空でも可）') : W < 44 ? (s.busy ? t('Muse が作業中') : t('何をしますか？')) : s.busy ? t('Muse が作業中 · 送ると伝えます') : t('何をしますか？   / でコマンド');
   return h(Box, {ref, flexDirection: 'column', borderStyle: 'round', borderColor: reason || bang ? '#e6be64' : s.busy ? '#3c3c44' : DIM, paddingX: 1, width: W, marginTop: 1},
     ...(above ? [h(Text, {key: 'above', color: DIM}, ' '.repeat(width(head)) + t('↑ ほか {n} 行（全部で {total} 行）', {n: above, total: all.length}))] : []),
     // The ❯ never shrinks: a placeholder wider than the box squeezed out the space after it.

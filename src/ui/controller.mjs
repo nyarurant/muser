@@ -28,7 +28,7 @@ const permissions = require('../permissions.js');
 const skills = require('../skills.js');
 const update = require('../update.js');
 const configStore = require('../config.js');
-const {applyAgentLimits, switchValue, savedValue, setSwitch, envOverride, NUMBERS, numberValue, setNumber, defaultMode, setDefaultMode, QUOTA_FALLBACKS, quotaFallback, setQuotaFallback, FOCUS_LOG_LEVELS, focusLogLevel, setFocusLogLevel} = require('../settings.js');
+const {applyAgentLimits, SWITCHES, switchValue, savedValue, setSwitch, envOverride, NUMBERS, numberValue, setNumber, defaultMode, setDefaultMode, QUOTA_FALLBACKS, quotaFallback, setQuotaFallback, FOCUS_LOG_LEVELS, focusLogLevel, setFocusLogLevel} = require('../settings.js');
 const {FocusLog, logFile} = require('../focus-log.js');
 // The 2026-11-07 feature cores (export, proof, lore, crash, parity, the
 // work log's reader) are required inside the command methods that use
@@ -290,7 +290,7 @@ export class Controller {
     // Started from the home folder or a drive root, every search without a path walks all of it.
     const cwd = path.resolve(agent.cwd || '.');
     if (cwd.toLowerCase() === path.resolve(os.homedir()).toLowerCase() || cwd === path.parse(cwd).root) {
-      this.note([t('作業フォルダーが {cwd} です（ホームかドライブ直下）。検索がフォルダー全体に広がるので、作業するフォルダーで起動するか muser --cd <フォルダー> を使ってください。', {cwd})]);
+      this.note([t('作業フォルダーが {cwd} です。検索が広くなるので、作業するフォルダーで起動するか muser --cd <フォルダー> を使ってください。', {cwd})]);
     }
   }
   // ---- store ----
@@ -982,6 +982,104 @@ export class Controller {
       this.set({}); return this.settingsMenu(at);
     }});
   }
+  // app-ui: /settings as data (GET /api/settings) for a client that draws its own settings
+  // screen (the phone), and one change at a time (POST /api/settings). Same rows, values,
+  // limits and setters as settingsMenu above; the menu stays the TUI's way in.
+  settingsModel() {
+    const a = this.agent, demo = a.client?.status === 'demo';
+    const limits = a.agentLimits || {concurrent: 4, perTurn: 0};
+    const G = {work: t('作業の進め方'), limits: t('上限と使用量'), approvals: t('承認'), display: t('表示'), terminal: t('ターミナルの表示'), notify: t('通知と更新')};
+    const env = key => envOverride(key) || null;
+    const sw = (key, group, label, extra = {}) => ({key, kind: 'switch', group, label, value: !!savedValue(key), effective: !!switchValue(key), env: env(key), ...extra});
+    const num = (key, group, label, extra = {}) => ({key, kind: 'number', group, label, value: numberValue(key), min: NUMBERS[key].min, max: NUMBERS[key].max, env: env(key), ...extra});
+    const pick = (key, group, label, value, choices) => ({key, kind: 'choice', group, label, value, choices});
+    const items = [
+      {key: 'agents.concurrent', kind: 'number', group: G.work, label: t('同時に動かすエージェント数'), value: limits.concurrent, min: 0, max: 1000, zero: t('無制限')},
+      {key: 'agents.perTurn', kind: 'number', group: G.work, label: t('1タスクで起動できる合計数'), value: limits.perTurn, min: 0, max: 1000, zero: t('無制限')},
+      sw('focus', G.work, t('Focus（完了条件の自動管理）')),
+      num('focusRounds', G.work, t('Focus の自動続行の回数')),
+      num('focusMinutes', G.work, t('Focus の自動続行の時間'), {unit: t('分')}),
+      pick('focusLogLevel', G.work, t('Focus の判定ログ'), focusLogLevel(), FOCUS_LOG_LEVELS.map(v => ({value: v, label: t(FOCUS_LOG_LEVEL_LABELS[v]), help: t(FOCUS_LOG_LEVEL_HELP[v])}))),
+      sw('worklog', G.work, t('作業ログを残す')),
+      num('worklogDays', G.work, t('作業ログの保持日数'), {unit: t('日')}),
+      pick('expectMode', G.work, t('想定外ストップ'), expectMode(), EXPECT_MODES.map(v => ({value: v, label: t(EXPECT_MODE_LABELS[v]), help: t(EXPECT_MODE_HELP[v])}))),
+      sw('lore', G.work, t('コードの言い伝え（lore）')),
+      sw('bangAutoSend', G.work, t('! の結果を Muse に送る')),
+      sw('bgAutoResume', G.work, t('バックグラウンド完了で自動再開')),
+      num('maxToolCallsPerTurn', G.limits, t('1ターンのツール呼び出し上限'), {unit: t('回')}),
+      num('maxNodeSlots', G.limits, t('端末枠の上限'), {unit: t('個')}),
+      num('dailyTurnLimit', G.limits, t('1日のターン数の警告'), {unit: t('ターン'), zero: t('オフ')}),
+      pick('quotaFallback', G.limits, t('週の上限で応答がないとき'), quotaFallback(), QUOTA_FALLBACKS.map(v => ({value: v, label: t(QUOTA_FALLBACK_LABELS[v]), help: t(QUOTA_FALLBACK_HELP[v])}))),
+      pick('mode', G.approvals, t('承認モード（このフォルダー）'), a.mode, MODES.map(m => ({value: m, label: t(LABELS[m]), help: t(MODE_HELP[m]), danger: m === 'bypass'}))),
+      pick('defaultMode', G.approvals, t('新しいフォルダーの承認モード'), defaultMode(), MODES.map(m => ({value: m, label: t(LABELS[m]), help: t(MODE_HELP[m]), danger: m === 'bypass'}))),
+      pick('lang', G.display, t('表示言語'), i18n.lang(), [{value: 'ja', label: '日本語'}, {value: 'en', label: 'English'}]),
+      sw('bell', G.notify, t('承認・完了時のベル')),
+      sw('updateCheck', G.notify, t('起動時に更新を確認'), {nextStart: true}),
+      sw('motion', G.terminal, t('スピナーのアニメーション')),
+      sw('codeWrap', G.terminal, t('長いコード行を折り返す')),
+      sw('footerDevice', G.terminal, t('フッターに端末名')),
+      sw('footerSlot', G.terminal, t('フッターに窓番号')),
+      sw('footerName', G.terminal, t('フッターに Muse の名前')),
+      sw('footerUsage', G.terminal, t('フッターに週の使用量')),
+      sw('footerCwd', G.terminal, t('フッターにフォルダー名')),
+      sw('footerSession', G.terminal, t('フッターにセッションID')),
+      sw('footerVersion', G.terminal, t('フッターにバージョン')),
+      sw('footerClock', G.terminal, t('フッターに時刻')),
+      sw('color', G.terminal, t('色を使う'), {nextStart: true}),
+      sw('kitty', G.terminal, t('拡張キー入力'), {nextStart: true}),
+      sw('fullscreen', G.terminal, t('全画面表示（スクロールは muser 内）'), {nextStart: true}),
+    ];
+    let skillList = [];
+    try { skillList = skills.load(a.cwd).map(s => ({name: s.name, desc: s.description || '', enabled: !!s.enabled, source: s.source || ''})); } catch {}
+    let mcpList = [];
+    try {
+      const cfg = mcpConfig.load(), hub = a.mcp;
+      mcpList = Object.entries(cfg.mcpServers || {}).map(([name, s]) => {
+        const live = hub?.servers.get(name);
+        return {name, enabled: !!s.enabled, status: live?.status || (s.enabled ? 'waiting' : 'off'), tools: live?.tools?.length ?? null, error: live?.error || null};
+      });
+    } catch {}
+    return {demo, groups: [G.work, G.limits, G.approvals, G.display, G.notify, G.terminal], items, skills: skillList, mcp: mcpList, mcpAvailable: !!a.mcp};
+  }
+  async applySetting(key, value) {
+    const a = this.agent, demo = a.client?.status === 'demo', save = !demo;
+    const fail = msg => { const e = new Error(msg); e.status = 400; throw e; };
+    const int = v => { const n = Number(v); if (!Number.isInteger(n)) fail(t('整数で指定してください')); return n; };
+    if (key === 'agents.concurrent' || key === 'agents.perTurn') {
+      const n = int(value); if (n < 0 || n > 1000) fail(t('{min}〜{max}', {min: 0, max: 1000}));
+      const limits = {...(a.agentLimits || {concurrent: 4, perTurn: 0}), [key.slice(7)]: n};
+      applyAgentLimits(a, limits, {save});
+    } else if (NUMBERS[key]) {
+      const n = int(value), d = NUMBERS[key]; if (n < d.min || n > d.max) fail(t('{min}〜{max}', {min: d.min, max: d.max}));
+      setNumber(key, n, {save});
+      if (key === 'maxToolCallsPerTurn') a.maxToolCallsPerTurn = numberValue(key);
+    } else if (key === 'focus') {
+      if (this.s.busy) fail(t('Focus の切替は作業が終わってから行ってください。'));
+      const next = !!value;
+      setSwitch('focus', next, {save}); a.focusEnabled = next; a.resumeFocus = null;
+    } else if (SWITCHES[key]) {
+      setSwitch(key, !!value, {save});
+    } else if (key === 'focusLogLevel') { if (!FOCUS_LOG_LEVELS.includes(value)) fail('bad value'); setFocusLogLevel(value, {save}); }
+    else if (key === 'expectMode') { if (!EXPECT_MODES.includes(value)) fail('bad value'); setExpectMode(value, {save}); }
+    else if (key === 'quotaFallback') { if (!QUOTA_FALLBACKS.includes(value)) fail('bad value'); setQuotaFallback(value, {save}); }
+    else if (key === 'defaultMode') { if (!MODES.includes(value)) fail('bad value'); setDefaultMode(value, {save}); }
+    else if (key === 'mode') { if (!MODES.includes(value)) fail('bad value'); this.setMode(value); }
+    else if (key === 'lang') { if (value !== 'ja' && value !== 'en') fail('bad value'); i18n.setLang(value, {save}); }
+    else if (key.startsWith('skill:')) {
+      if (demo) fail(t('デモでは設定を保存しません。'));
+      const name = key.slice(6), s = skills.load(a.cwd).find(x => x.name === name);
+      if (!s) { const e = new Error('unknown skill'); e.status = 404; throw e; }
+      skills.setEnabled(name, !!value);
+    } else if (key.startsWith('mcp:')) {
+      if (!a.mcp) fail(t('このモードでは MCP を使えません。'));
+      if (this.s.busy) fail(t('作業中は切り替えられません'));
+      const name = key.slice(4);
+      if (!(mcpConfig.load().mcpServers || {})[name]) { const e = new Error('unknown MCP server'); e.status = 404; throw e; }
+      await this.mcpPick({toggle: name, on: !!value});
+    } else { const e = new Error('unknown setting'); e.status = 404; throw e; }
+    this.set({});
+    return this.settingsModel();
+  }
   // The two agent limits: edited as a draft, then applied for this run or saved as defaults.
   agentLimitsMenu(draft) {
     const limits = {...(draft || this.agent.agentLimits || {concurrent: 4, perTurn: 0})};
@@ -1415,12 +1513,14 @@ export class Controller {
     this.pasting = true;
     const target = this.pasteTarget();
     try {
-      const {files, error} = await clip.clipboardImages();
+      // Said at once: the two reads below are PowerShell runs, which take a second or
+      // more on a busy PC, and a right click that showed nothing for that long read as
+      // "right click does not paste". The image and the text are read in parallel.
+      this.flash(t('貼り付けています…'), 15000);
+      const [{files, error}, text] = await Promise.all([clip.clipboardImages(), clip.clipboardText().catch(() => '')]);
       if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
-      if (!error && files.length) return files.forEach(f => this.attach(f.path, f.temporary));
-      const text = await clip.clipboardText().catch(() => '');
-      if (this.pasteTarget() !== target) return this.flash(t('画面が切り替わったため、貼り付けませんでした'));
-      if (text) return this.paste(text);
+      if (!error && files.length) { this.flash(''); return files.forEach(f => this.attach(f.path, f.temporary)); }
+      if (text) { this.flash(''); return this.paste(text); }
       if (error) return this.flash(t('クリップボードを読めませんでした: {error}', {error}), 6000);
       this.flash(t('クリップボードに貼れるものがありません'));
     } finally { this.pasting = false; }
@@ -1817,9 +1917,9 @@ export class Controller {
       // the add, at the next queue drain. Plain sends still just wait.
       if (fromQuestion) {
         if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
-        this.queue.push(text); (this.queuedQuestionAnswers ||= []).push(text); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを追加しています。完了するまでお待ちください。'));
+        this.queue.push(text); (this.queuedQuestionAnswers ||= []).push(text); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを追加しています…'));
       }
-      return this.flash(t('アカウントを追加しています。完了するまでお待ちください。'));
+      return this.flash(t('アカウントを追加しています…'));
     }
     // Focus fix: picker answers are plain messages, never commands — their
     // first line is the QUESTION text (submitQuestionAnswers), so a question
@@ -2708,10 +2808,10 @@ export class Controller {
     // Wave 15: /update installs for real — in the demo it refuses, like the
     // other demo guards, before anything is checked or installed.
     if (this.agent.client?.status === 'demo') return this.note(t('デモでは更新できません。'));
-    if (update.devCheckout()) return this.note(t('この muser は git から動いている開発用なので、/update では更新しません（git pull で更新してください）。'));
+    if (update.devCheckout()) return this.note(t('git から動いている muser は /update で更新しません。git pull で更新してください。'));
     // Like the other heavy commands (/export, /reload): never install over
     // work in flight — say so instead of running anyway (wave 7).
-    if (this.s.busy || this.agent.busy) return this.note(t('作業中は更新できません。終わってから /update してください。'));
+    if (this.s.busy || this.agent.busy) return this.note(t('作業中は更新できません。'));
     if (this.updating) return;
     // A successful install does not change THIS window: it keeps running the
     // old version until it is reopened. Remember the installed version, so a
@@ -2829,7 +2929,7 @@ export class Controller {
     if (this.exporting) return;
     if (a.client?.status === 'demo') return this.note(t('デモではレポートは送れません。'));
     if (!a.session?.id) return this.note(t('送る会話がまだありません。'));
-    if (this.s.busy || a.busy) return this.note(t('作業中は送れません。終わってから /export してください。'));
+    if (this.s.busy || a.busy) return this.note(t('作業中は送れません。'));
     if (this.s.menu || this.s.question || this.s.approval || this.s.promptFor || this.s.limitInput) return this.note(t('確認の画面が出せないため送りません。開いている選択や確認を終わらせてから /export してください。'));
     this.exporting = true;
     try {
@@ -2909,7 +3009,7 @@ export class Controller {
     // notes live only here), a numeric input, bang / shell notes not yet sent
     // (they live only in memory), and a running background shell.
     if (this.s.busy || this.s.approval || this.s.reasonFor || this.s.bangRunning || this.loggingIn || this.addingAccount || this.queue.length || this.s.promptFor || this.s.question || this.s.limitInput || (this.bangNotes || []).length || (this.shellNotes || []).length || (this.s.shells || []).some(sh => sh.state === 'working' || sh.running) || (this.s.agents || []).some(a => a.state === 'working'))
-      return this.note(t('作業中は再起動できません。終わってから /reload してください（キューや実行中の作業が消えてしまいます）。'));
+      return this.note(t('作業中は再起動できません（キューや実行中の作業が消えます）。'));
     this.note(t('再起動します…'));
     return this.onReload();
   }
@@ -3205,7 +3305,7 @@ export class Controller {
       const set = a.setGoal(arg);
       if (this.s.busy || a.busy) return this.note(t('ゴールを設定しました: {goal}（今の作業が終わったあと、ゴールに向けて続行します）', {goal: set.text}));
       this.note(t('ゴールを設定しました: {goal}', {goal: set.text}));
-      if (!a.focusEnabled) return this.note(t('Focus がオフなので自動続行はしません。/focus on で有効になります。'));
+      if (!a.focusEnabled) return this.note(t('Focus はオフです（/focus on で有効）。'));
       return this.submit(set.text);
     }
     if (cmd === '/login') return this.login();
@@ -3473,7 +3573,7 @@ export class Controller {
       if ((words[0] || 'list') === 'start') {
         // W2F-4: no guard existed — a second start ran concurrently. The
         // flag stands synchronously at the entrance, before any await.
-        if (this.overnightRun) return this.note(t('夜間作業は実行中です。終わるまで待ってください。'), 'error');
+        if (this.overnightRun) return this.note(t('夜間作業は実行中です。'), 'error');
         this.overnightRun = true;
         this.note(t('夜間作業を開始しました。終わったら報告をここに出します。'));
         return overnightCli(['start', ...words.slice(1)], {cwd: a.cwd}).then(r => this.push({type: 'overnight', lines: r.lines})).catch(e => this.note(String(e.message || e), 'error')).finally(() => { this.overnightRun = false; });
@@ -3500,7 +3600,7 @@ export class Controller {
     // the new-race start menu. They also work while another race runs here.
     const words = String(arg || '').split(/\s+/).filter(Boolean);
     if (words[0] === 'apply' || words[0] === 'clean') return this.raceApplyCommand(race, words);
-    if (this.raceRun) return this.note(t('競争は実行中です。終わるまで待ってください。'), 'error');
+    if (this.raceRun) return this.note(t('競争は実行中です。'), 'error');
     const opts = race.parseRaceArgs(arg);
     if (!opts.task) return this.note(t('使い方: /race [--n 3] [--accounts a,b] [--max-tokens N] [--yes] <頼み>'));
     // W2F-4: reserve synchronously here, at the entrance. The flag used to

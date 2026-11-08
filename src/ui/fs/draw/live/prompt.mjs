@@ -38,7 +38,7 @@ export function drawPrompt(s, ctx) {
   const start = all.length <= max ? 0 : Math.max(0, Math.min(cur.row - Math.floor(max / 2), all.length - max));
   const lines = all.slice(start, start + max);
   const above = start, below = all.length - start - lines.length;
-  const placeholder = state.addFlow ? (state.promptFor ? t('ここに入力して Enter') : t('アカウントを追加しています…')) : reason ? t('断る理由（空でも可）') : W < 44 ? (state.busy ? t('Muse が作業中') : t('何をしますか？')) : state.busy ? t('Muse が作業中 · 送ると作業中の Muse に伝えます') : t('何をしますか？   / でコマンド');
+  const placeholder = state.addFlow ? (state.promptFor ? t('ここに入力して Enter') : t('アカウントを追加しています…')) : reason ? t('断る理由（空でも可）') : W < 44 ? (state.busy ? t('Muse が作業中') : t('何をしますか？')) : state.busy ? t('Muse が作業中 · 送ると伝えます') : t('何をしますか？   / でコマンド');
   const borderColor = reason || bang ? GOLD : state.busy ? BUSY_BORDER : DIM;
   const headColor = hex(reason ? GOLD : ACCENT);
   const dim = hex(DIM);

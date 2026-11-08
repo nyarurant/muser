@@ -22,7 +22,7 @@ export function run({agent, museName, version, initial, connect, onReload, remot
   app = runFullscreen({ctrl, dim: hex(DIM),
     renderEntry: (e, W) => drawEntry(e, ctx(W)) ?? [],
     renderLive: (s, W) => drawLive(s, ctx(W)) ?? {lines: [], caret: null},
-    labels: {unseen: t('↓ 新しい出力 {n} 件 · PgDn / Ctrl+End で最下部'), scrolled: t('↑ 前の表示 · PgDn / Ctrl+End で最下部'),
+    labels: {unseen: t('↓ 新しい出力 {n} 件 · PgDn / Ctrl+End'), scrolled: t('↑ 前の表示 · PgDn / Ctrl+End'),
       copied: t('コピーしました（{n} 文字）'), copyFailed: t('コピーできませんでした')}});
   session.start();
   return app;

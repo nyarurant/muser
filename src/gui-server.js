@@ -780,8 +780,9 @@ class GuiServer {
       const openBody = await this.readBody(req, res).catch(() => null);
       if (openBody === null) return; // c4#2: refused body, no open
       if (!this.host) return this.json(res, 501, {error: 'session hosting is not enabled'});
-      try { const entry = await this.host.openExisting(decodeURIComponent(openMatch[1]), {maxAgents: openBody.maxAgents, maxAgentsTotal: openBody.maxAgentsTotal, focusEnabled: openBody.focusEnabled, noFocus: openBody.noFocus}); return this.json(res, 200, {id: entry.id, ...(entry.attachDropped ? {attachApplied: false} : {})}); }
-      catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
+      try { const entry = await this.host.openExisting(decodeURIComponent(openMatch[1]), {maxAgents: openBody.maxAgents, maxAgentsTotal: openBody.maxAgentsTotal, focusEnabled: openBody.focusEnabled, noFocus: openBody.noFocus}, {force: openBody.force === true}); return this.json(res, 200, {id: entry.id, ...(entry.attachDropped ? {attachApplied: false} : {})}); }
+      // held: who has it ([{kind: window|exec, pid, title}]) so the GUI / phone can say where.
+      catch (e) { return this.json(res, e.status || 400, {error: e.message, ...(e.code ? {code: e.code} : {}), ...(Array.isArray(e.holders) ? {holders: e.holders} : {})}); }
     }
     const closeMatch = /^\/api\/sessions\/([^/]+)\/close$/.exec(p);
     if (req.method === 'POST' && closeMatch) {
@@ -973,6 +974,19 @@ class GuiServer {
       Promise.resolve(controller.accountCommand(body.id)).catch(() => {});
       return this.json(res, 202, {ok: true});
     }
+    // app-ui: the settings as data, and one change at a time (Controller.settingsModel /
+    // applySetting — the same rows and setters as /settings).
+    if (req.method === 'GET' && p === '/api/settings') {
+      if (typeof controller.settingsModel !== 'function') return this.json(res, 501, {error: 'settings are not available'});
+      try { return this.json(res, 200, controller.settingsModel()); } catch (e) { return this.json(res, 500, {error: String(e?.message || e)}); }
+    }
+    if (req.method === 'POST' && p === '/api/settings') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (typeof body.key !== 'string' || !body.key) return this.json(res, 400, {error: 'key is required'});
+      if (typeof controller.applySetting !== 'function') return this.json(res, 501, {error: 'settings are not available'});
+      try { return this.json(res, 200, await controller.applySetting(body.key, body.value)); }
+      catch (e) { return this.json(res, e.status || 400, {error: String(e?.message || e)}); }
+    }
     if (req.method === 'POST' && p === '/api/prompt') {
       const body = await this.readBody(req, res); if (body === null) return;
       // One route for both sides of the release-039 merge: {cancel: true} cancels the
@@ -1144,7 +1158,10 @@ class GuiServer {
     const sessions = (recent || []).slice(0, limit).map(s => {
       const entry = this.resolveEntry(s.id);
       const origin = typeof s.origin === 'string' && s.origin ? s.origin : (execIds && execIds.has(s.id) ? 'exec' : null);
-      return {id: s.id, cwd: s.cwd ?? null, title: s.title || '', turns: s.turns ?? 0, created: s.created ?? null, updated: s.updated ?? null, account: s.account ?? null, origin, open: !!entry, busy: entry ? !!this.state(entry).busy : false};
+      // heldBy: a standalone window / muser exec on this PC has it open (it cannot be opened here).
+      let heldBy = null;
+      if (!entry && this.host?.holders) { try { const h = this.host.holders(s.id) || []; if (h.length) heldBy = h.map(x => ({kind: x.kind, pid: x.pid})); } catch {} }
+      return {id: s.id, cwd: s.cwd ?? null, title: s.title || '', turns: s.turns ?? 0, created: s.created ?? null, updated: s.updated ?? null, account: s.account ?? null, origin, open: !!entry, busy: entry ? !!this.state(entry).busy : false, ...(heldBy ? {heldBy} : {})};
     });
     return this.json(res, 200, {sessions});
   }

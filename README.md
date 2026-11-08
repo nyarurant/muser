@@ -58,6 +58,8 @@ Type what you want done and press Enter. Muse works on this PC and you see it ha
 | `!command` | Run in PowerShell directly, without Muse; when it finishes, its output goes to Muse, which answers it, as in Claude Code (off in `/settings`: it then goes with your next message); append ` &` at the end to run it in the background |
 | Alt+V / Ctrl+V | Attach the clipboard image |
 | Ctrl+Shift+V | Paste the clipboard (an image attaches), where the terminal passes the key to muser |
+| Right click | Paste the clipboard (an image attaches) |
+| Mouse | On the full-screen view these are buttons: the key hints at the top (commands, approval mode, interrupt, image, files, shell), the approval mode, account and weekly usage at the bottom, and `[Paste]` `[Send ⏎]` on the input box. While you read earlier output, `[↓ Latest]` jumps back to the newest. Dragging selects and copies text |
 | Ctrl+O | Show the newest tool output in full (`/output` lists them all). In `--client` mode Ctrl+O always has nothing to show — the outputs stay on the server and the client never fetches them; use `/output` instead, which is forwarded to the server |
 | ↑↓ | Input history (kept across restarts) |
 

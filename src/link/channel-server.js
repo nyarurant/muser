@@ -102,8 +102,8 @@ function channelPathname(rawPath) {
   return p;
 }
 const CHANNEL_REQ_RULES = [
-  ['GET', /^\/api\/(?:s\/[^/]+\/)?(?:state|events|complete|changes|muse-avatar|outputs|entries|image)$/],
-  ['POST', /^\/api\/(?:s\/[^/]+\/)?(?:send|approval|mode|menu|limit|interrupt|shell-kill|account|prompt)$/],
+  ['GET', /^\/api\/(?:s\/[^/]+\/)?(?:state|events|complete|changes|muse-avatar|outputs|entries|image|settings)$/],
+  ['POST', /^\/api\/(?:s\/[^/]+\/)?(?:send|approval|mode|menu|limit|interrupt|shell-kill|account|prompt|settings)$/],
   // app-ui: account management from the phone (the GUI runs the CLI for these).
   ['GET', /^\/api\/accounts$/],
   ['POST', /^\/api\/accounts\/(?:default|auto|rename|remove)$/],
