@@ -2,14 +2,15 @@
 // The account pool at runtime: build one account's {web, auth, client} bundle, read every
 // account's status (login present? device registered? weekly plan), and let src/accounts.js'
 // pure policy pick. Automatic selection only runs when more than one account exists and it
-// is not switched off (config {"accountAuto": false} or MUSER_NO_ACCOUNT_AUTO=1): a
+// is not switched off (config {"accountAuto": false} or MUSER_NO_ACCOUNT_AUTO set to
+// an envBool-true spelling — 1/true/yes/on, per config.envBool): a
 // single-account install behaves exactly as it always did, with no extra muse.ai calls.
 const accounts = require('./accounts');
 const store = require('./secure-store');
 const {t} = require('./i18n');
 
 function autoEnabled() {
-  if (process.env.MUSER_NO_ACCOUNT_AUTO === '1') return false;
+  if (require('./config').envBool(process.env.MUSER_NO_ACCOUNT_AUTO) === true) return false;
   try { if (require('./config').read().accountAuto === false) return false; } catch {}
   return true;
 }
@@ -51,8 +52,18 @@ async function statuses({plans = true} = {}) {
     // An account whose web.enc cannot be decrypted (corrupt, another Windows user) is shown as
     // not logged in; it used to reject the whole Promise.all: `muser account`, `muser usage`
     // and the /account picker all failed because of one unused account.
-    let jar = [], unreadable = false;
-    try { jar = loadJar(files.web); } catch { unreadable = true; }
+    // Wave 8: EVERY store file is probed, not just web.enc — a corrupt device.enc used to
+    // read exactly like "not registered", and a corrupt session.enc was invisible here and
+    // only blew up at connect time. unreadableFiles names the store files that exist but
+    // cannot be read (a missing file simply loads as null and is never listed), and
+    // `unreadable` stays as the boolean summary for readers written against it. A slow
+    // DPAPI answer (e.slow) is not corruption and is never listed as broken.
+    let jar = [], unreadableFiles = [];
+    try { jar = loadJar(files.web); } catch (e) { if (!e?.slow) unreadableFiles.push(files.web); }
+    let deviceUnreadable = false;
+    try { store.load(files.device); } catch (e) { if (!e?.slow) deviceUnreadable = true; }
+    if (deviceUnreadable) unreadableFiles.push(files.device);
+    try { store.load(files.session); } catch (e) { if (!e?.slow) unreadableFiles.push(files.session); }
     // A status read must never SAVE the jar (audit #44): these throwaway webs were bound to
     // the account's real web.enc, so a Set-Cookie absorbed by the plan read wrote this stale
     // snapshot back over the live window's newer jar and a healthy login rolled back to
@@ -61,7 +72,7 @@ async function statuses({plans = true} = {}) {
     const probeFile = probeFileFor(files.web);
     try {
       let device = false;
-      try { device = require('./pc-login').createAuth(createWeb([...jar], {file: probeFile}), {file: files.device}).snapshot().phase === 'authenticated'; } catch {}
+      if (!deviceUnreadable) try { device = require('./pc-login').createAuth(createWeb([...jar], {file: probeFile}), {file: files.device}).snapshot().phase === 'authenticated'; } catch {}
       let plan = null;
       if (plans && jar.length) { try { plan = await usage.plan(createWeb([...jar], {file: probeFile})); } catch {} }
       // The VM this login belongs to (audit #47): two accounts on the same VM share
@@ -70,7 +81,7 @@ async function statuses({plans = true} = {}) {
       // null and the account is treated as an allowance of its own, as before.
       let vm = null;
       if (plans && jar.length) { try { vm = (await createWeb([...jar], {file: probeFile}).fetchJson('/api/session'))?.vm_id || null; } catch {} }
-      return {id: a.id, label: a.label, available: !!jar.length && device, hasLogin: !!jar.length, device, ...(unreadable ? {unreadable} : {}), vm,
+      return {id: a.id, label: a.label, available: !!jar.length && device, hasLogin: !!jar.length, device, ...(unreadableFiles.length ? {unreadable: true, unreadableFiles} : {}), vm,
         percentUsed: plan?.percentUsed ?? null, quotaStatus: plan?.quotaStatus ?? null, plan};
     } finally { try { store.remove(probeFile); } catch {} }
   }));
@@ -119,12 +130,18 @@ function makePool(opts = {}) {
   // and the one next took could all differ, and the plan API was hit once per step.
   // currentStatus() below deliberately still reads fresh.
   const STATUS_TTL_MS = 15000;
+  // Wave 15: a FAILED read (statusesFn threw, read as []) used to ride the
+  // full 15 s TTL, so one muse.ai hiccup hid every account from peek /
+  // warm / next for the whole window. A failure is cached only briefly;
+  // the next read after that retries for real.
+  const STATUS_FAIL_TTL_MS = 1000;
   let statusCache = null;
   function readStatuses() {
-    if (statusCache && Date.now() - statusCache.at < STATUS_TTL_MS) return statusCache.promise;
-    const promise = (async () => { try { const all = await statusesFn(); return Array.isArray(all) ? all : []; } catch { return []; } })();
-    statusCache = {at: Date.now(), promise};
-    return promise;
+    if (statusCache && Date.now() - statusCache.at < statusCache.ttl) return statusCache.promise;
+    const entry = {at: Date.now(), ttl: STATUS_TTL_MS, promise: null};
+    entry.promise = (async () => { try { const all = await statusesFn(); return Array.isArray(all) ? all : []; } catch { entry.ttl = STATUS_FAIL_TTL_MS; return []; } })();
+    statusCache = entry;
+    return entry.promise;
   }
   const excluded = excludeIds => {
     if (!excludeIds) return new Set();
@@ -211,6 +228,7 @@ function makePool(opts = {}) {
       epoch++; // in-flight warm()s of this generation cache nothing when they land (c24 #2)
       for (const b of warmed.values()) disconnectBundle(b);
       warmed.clear();
+      statusCache = null; // wave 15: a dropped pool re-reads statuses, like it re-warms bundles
     },
     async next(excludeIds, opts) {
       // A bundle warm() already connected for a non-excluded account IS the pick (audit

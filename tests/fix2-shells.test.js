@@ -182,7 +182,7 @@ test('#141 (c16#15): the VBS launcher is written as BOM\'d UTF-16LE so non-ASCII
   const bytes = fs.readFileSync(on.vbs);
   assert.deepEqual([bytes[0], bytes[1]], [0xff, 0xfe], 'UTF-16LE BOM present (wscript parses BOM-less files as ANSI/cp932)');
   const text = bytes.toString('utf16le').replace(/^\ufeff/, '');
-  assert.equal(text, autostart.vbsContent(nodePath, binFile), 'the script round-trips exactly, Japanese path intact');
+  assert.equal(text, autostart.vbsContent(nodePath, binFile, home), 'the script round-trips exactly, Japanese path intact');
 });
 
 test('#142 (c16#16): autostart off reports a real removal failure and keeps the launcher', async t => {

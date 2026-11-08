@@ -6,9 +6,11 @@
 // Secret values (env / headers) are NOT stored in mcp.json: save() moves them into the
 // DPAPI-backed secure-store and leaves {"$secret": "<server>:<kind>:<key>"} references
 // behind, which load() resolves back. Plaintext configs from before (or written by other
-// tools) still load as-is and migrate on the first save(). Note: mcp.json should stay
-// user-only — it can briefly hold plaintext between an external edit and the next save —
-// so save() also chmods it 0600 where the OS honours that.
+// tools) still load as-is; load() now migrates plaintext env/header values into the
+// vault itself, best-effort (see migratePlaintext), instead of leaving them in the
+// clear until some unrelated save() happens. Note: mcp.json should stay user-only —
+// a failed migration (or an external edit after the last load) can still leave it
+// briefly holding plaintext — so save() also chmods it 0600 where the OS honours that.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -21,15 +23,41 @@ const FILE = path.join(DIR, 'mcp.json');
 const SECRETS_FILE = 'mcp-secrets.enc';
 const CONNECT_TIMEOUT = 15000, CALL_TIMEOUT = 120000, MAX_RESULT = 60000, MAX_LIST_PAGES = 20, MAX_LIST_TOOLS = 1000;
 
-// Values that must never appear verbatim in an error message or a log line. Only values
-// under a secret-looking KEY are noted (audit #234): noting every env value also redacted
-// plain configuration — NODE_ENV=production, a port, a URL — from every error message.
-// Secrets shorter than 4 characters ARE noted: they used to leak verbatim.
+// Values that must never appear verbatim in an error message or a log line. Plaintext
+// values are noted only under a secret-looking KEY (audit #234): noting every env value
+// also redacted plain configuration — NODE_ENV=production, a port, a URL — from every
+// error message. Secrets shorter than 4 characters ARE noted: they used to leak verbatim.
 const knownSecrets = new Set();
 const SECRET_KEY = /key|token|secret|passw|auth|cred|private|session|cookie/i;
 function noteSecret(v, key) {
   if (typeof v !== 'string' || !v) return;
   if (key !== undefined && !SECRET_KEY.test(String(key))) return;
+  knownSecrets.add(v);
+}
+// A value that came OUT of the vault (resolved from a $secret reference, being written
+// into it by save(), or handed to a server that is actually starting) is secret
+// material whatever KEY it sits under (wave5): a secret stored as CUSTOM_DATA was
+// vaulted like any other, yet noting keyed on the NAME left it out, so a server
+// echoing its own env on stderr handed it back in the clear. Such values are noted
+// under any key — except ones plainly shaped like configuration, the #234 false
+// positives (a common word, a boolean, a port, a URL, a host:port): save() vaults
+// EVERY env/header string indiscriminately, so the vault alone cannot tell a token
+// from NODE_ENV=production either, and redacting the word "production" from every
+// error would be the same garbling #234 removed. A short (<5) or dictionary-word
+// secret under an ordinary key therefore still goes unnoted — it cannot be told
+// apart from plain configuration without that garbling.
+function isPlainConfigValue(v) {
+  if (/^https?:\/\//i.test(v)) return true;
+  if (/^(true|false|yes|no|on|off|none|null)$/i.test(v)) return true;
+  if (/^[a-z]+$/.test(v) && v.length <= 12) return true; // production, development, debug…
+  if (/^[0-9]+$/.test(v) && v.length <= 8) return true; // a port / count, not a PIN-shaped secret
+  if (/^[a-z0-9.-]+:\d+$/i.test(v)) return true; // host:port
+  return false;
+}
+function noteVaultSecret(v, key) {
+  if (typeof v !== 'string' || !v) return;
+  if (key !== undefined && SECRET_KEY.test(String(key))) { knownSecrets.add(v); return; }
+  if (v.length < 5 || isPlainConfigValue(v)) return;
   knownSecrets.add(v);
 }
 const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -66,18 +94,133 @@ function stringBag(name, kind, bag) {
   return out;
 }
 
+// "mcpServers" itself must be a plain name -> config object. A string or an
+// array used to pass load() untouched (Object.entries walked its characters /
+// indices) and every server then vanished silently in hub.start(), or showed
+// up under a numeric name. That is a problem with the FILE, not with any one
+// server, so the error names mcp.json and says what shape it must have.
+function checkMcpServers(servers) {
+  if (servers === undefined) return;
+  if (!isBag(servers)) throw new Error('Invalid MCP config in ' + FILE + ': "mcpServers" must be an object mapping server names to server configs.');
+}
+// The top-level shape error load() last saw, if any (wave15). load() used to
+// throw it (checkMcpServers above, wave4), which took the whole session down
+// with it: bin calls load() while assembling, so one hand-edited line
+// ("mcpServers": [...]) kept muser itself from starting even though no valid
+// server could be lost by ignoring the value. load() now records the error
+// here instead, drops the malformed value, and everything else starts as
+// usual; hub.start() surfaces the record as an error entry + log line, and
+// configError() exposes it to other readers. save() still refuses the shape
+// via checkMcpServers: writing a bad shape back is a different matter.
+let lastConfigError = '';
+function configError() { return lastConfigError; }
+function mcpServersShapeError() {
+  return t('「mcpServers」の形式が正しくありません（サーバー名と設定のオブジェクトである必要があります）: {file}。この値は無視して、MCP なしで起動します。', {file: FILE});
+}
+// "enabled" is a boolean in a well-formed config, but a hand-edited file can
+// carry the string "false" — which is truthy, so the server the user meant to
+// turn OFF connected anyway (wave15). load() normalises the flag to a real
+// boolean: recognised true-words and non-zero numbers become true, everything
+// else ("false", other strings, objects, null) becomes false — an unclear
+// flag must not start a server.
+function normalizeEnabled(cfg) {
+  for (const s of Object.values(cfg.mcpServers || {})) {
+    if (!isBag(s) || !('enabled' in s)) continue;
+    const v = s.enabled;
+    if (typeof v === 'boolean') continue;
+    if (typeof v === 'string') { const w = v.trim().toLowerCase(); s.enabled = w === 'true' || w === '1' || w === 'yes' || w === 'on'; }
+    else if (typeof v === 'number') s.enabled = v !== 0;
+    else s.enabled = false;
+  }
+}
+// One server's entry must be a plain object too. A null / string / array entry
+// used to crash hub.start() wholesale (reading ".enabled" of null) and keep
+// every healthy server from starting; callers either surface this error for
+// the named entry (connect()/save()/setEnabled()) or record it as that
+// entry's error status and carry on with the rest (hub.start()).
+function invalidEntryError(name) {
+  return new Error('Invalid MCP server config for "' + name + '": the entry must be an object (for example {"command": ...} or {"url": ...}).');
+}
+
 function load() {
   let raw;
-  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { return {mcpServers: {}}; }
+  try { raw = fs.readFileSync(FILE, 'utf8'); } catch { lastConfigError = ''; return {mcpServers: {}}; }
   let cfg = null;
   try { cfg = require('./config').parseJson(raw); } catch {}
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {
     // Corrupt config: keep the bytes for recovery instead of silently starting empty.
+    lastConfigError = '';
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     try { fs.renameSync(FILE, FILE + '.corrupt-' + stamp); } catch {}
     return {mcpServers: {}};
   }
-  return resolveSecrets(cfg);
+  // A wrong top-level "mcpServers" shape is recorded, not thrown (see
+  // lastConfigError above): the malformed value is dropped, the rest of the
+  // config (and the app) proceeds normally.
+  if (cfg.mcpServers !== undefined && !isBag(cfg.mcpServers)) {
+    lastConfigError = mcpServersShapeError();
+    cfg = {...cfg, mcpServers: {}};
+  } else lastConfigError = '';
+  const hadPlaintext = hasPlaintextValues(cfg);
+  const resolved = resolveSecrets(cfg);
+  normalizeEnabled(resolved);
+  // Wave5: a plaintext config used to stay in the clear until some unrelated
+  // save() happened; close that window here, best-effort.
+  if (hadPlaintext) migratePlaintext(resolved);
+  return resolved;
+}
+// Any env/header value still written as a non-empty string in the file (as
+// opposed to a {"$secret": …} reference)? Those are the values save() would
+// vault, so they are what load-time migration looks for. '' is not one: save()
+// leaves empty strings as they are, so treating one as plaintext would retry
+// the migration on every load for ever.
+function hasPlaintextValues(cfg) {
+  for (const s of Object.values(cfg.mcpServers || {})) {
+    for (const kind of ['env', 'headers']) {
+      if (!isBag(s?.[kind])) continue;
+      for (const v of Object.values(s[kind])) if (typeof v === 'string' && v !== '') return true;
+    }
+  }
+  return false;
+}
+// The file version (mtime + size) this process last attempted to migrate, so a
+// migration that keeps failing (DPAPI down, an entry save() refuses) is tried
+// once per file version per process instead of on every load() — hub.config
+// alone calls load() on every access. A new process, or any change to the
+// file, retries.
+let lastMigrationStamp = null;
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; } }
+// Who holds the mcp.json lock right now: 'ours' (this process is inside a
+// withLock read-modify-write — setEnabled() / importServers() call load()
+// there, and taking the lock again would wait out the whole budget and throw),
+// 'other' (a live window is mid-save: its save vaults what it loaded, so skip
+// this time WITHOUT recording the stamp — a later load retries if plaintext
+// remains), or 'none' (no live holder; a stale lock file from a dead window
+// counts as none, save() takes it over itself).
+function lockState() {
+  try {
+    const pid = Number((fs.readFileSync(FILE + '.lock', 'utf8').split(':')[1] || '').trim());
+    if (!(pid > 0)) return 'none';
+    if (pid === process.pid) return 'ours';
+    return pidAlive(pid) ? 'other' : 'none';
+  } catch { return 'none'; }
+}
+// Best-effort: move a just-loaded config's plaintext env/header values into
+// the vault by running it through the normal save path (which also notes the
+// values for redaction). ANY failure is swallowed — load() must return the
+// config it read even when the vault or the file is unwritable; the plaintext
+// then simply stays, exactly as it did before this migration existed.
+function migratePlaintext(resolved) {
+  let stamp;
+  try { const st = fs.statSync(FILE); stamp = st.mtimeMs + ':' + st.size; } catch { return; }
+  if (stamp === lastMigrationStamp) return;
+  const state = lockState();
+  if (state === 'other') return;
+  lastMigrationStamp = stamp;
+  try {
+    if (state === 'ours') saveUnlocked(resolved); // already under the lock: write directly
+    else save(resolved);
+  } catch { /* best-effort: never break load() */ }
 }
 // $secret references the vault did not have, per server, from the latest resolveSecrets().
 // A missing entry used to become an empty string, so the server started with API_KEY=""
@@ -97,7 +240,9 @@ let unresolvedRefs = new Map();
 const unresolvedKey = (name, kind, k) => name + '\0' + kind + '\0' + k;
 
 // Replace {"$secret": key} references in env/headers with values from the secure-store.
-// Plaintext values pass through untouched (backward compat) and are noted for redaction.
+// Plaintext values pass through untouched (backward compat) and are noted for redaction
+// under secret-looking keys only; values resolved FROM the vault are noted under any
+// key via noteVaultSecret() — they are in the vault because they are secrets.
 function resolveSecrets(cfg) {
   missingByServer = new Map();
   unresolvedRefs = new Map();
@@ -120,7 +265,7 @@ function resolveSecrets(cfg) {
       for (const [k, v] of Object.entries(s[kind])) {
         if (isSecretRef(v)) {
           const val = vault[v.$secret];
-          if (typeof val === 'string') { s[kind][k] = val; noteSecret(val, k); }
+          if (typeof val === 'string') { s[kind][k] = val; noteVaultSecret(val, k); }
           else { s[kind][k] = ''; if (!missingByServer.has(name)) missingByServer.set(name, []); missingByServer.get(name).push(v.$secret); unresolvedRefs.set(unresolvedKey(name, kind, k), v.$secret); }
         }
       }
@@ -138,12 +283,13 @@ function save(cfg) { return require('./config').withLock(FILE, () => saveUnlocke
 function saveUnlocked(cfg) {
   // Work on a copy: the caller's object keeps its resolved plaintext values.
   const out = JSON.parse(JSON.stringify(cfg ?? {mcpServers: {}}));
+  checkMcpServers(out.mcpServers);
   // Shape first (deep c14 #5): a non-object env/headers, or a non-string value
   // inside one, is refused with a clear message before anything is written —
   // the old code threw a strict-mode TypeError (string env) or silently
   // rewrote the bag (array env) and vaulted values under numeric keys.
   for (const [name, s] of Object.entries(out.mcpServers || {})) {
-    if (!isBag(s)) continue;
+    if (!isBag(s)) throw invalidEntryError(name);
     for (const kind of ['env', 'headers']) {
       if (s[kind] === undefined || s[kind] === null) continue;
       // The bag itself must be an object first (a string/array env is refused
@@ -184,7 +330,7 @@ function saveUnlocked(cfg) {
         if (isSecretRef(v) || typeof v !== 'string' || !v) continue;
         loadVault();
         const key = name + ':' + kind + ':' + k;
-        vault[key] = v; noteSecret(v, k); s[kind][k] = {$secret: key}; dirty = true;
+        vault[key] = v; noteVaultSecret(v, k); s[kind][k] = {$secret: key}; dirty = true;
       }
     }
   }
@@ -220,7 +366,7 @@ function discover() {
     for (const [name, s] of Object.entries(j.mcpServers || {})) {
       // A server the user disabled in Claude Code stays disabled here: the Codex branch
       // below already honours enabled:false, the Claude branch imported them anyway (#236).
-      if (s?.disabled === true || s?.enabled === false) continue;
+      if (s?.disabled === true || s?.enabled === false || (typeof s?.enabled === 'string' && s.enabled.trim().toLowerCase() === 'false')) continue;
       found.push({name, from: 'Claude Code', server: s});
     }
   } catch {}
@@ -257,7 +403,10 @@ function setEnabled(name, enabled, hub = activeHub) {
   let cfg, serverCfg;
   require('./config').withLock(FILE, () => {
     cfg = load();
-    if (cfg.mcpServers?.[name]) {
+    if (cfg.mcpServers && Object.prototype.hasOwnProperty.call(cfg.mcpServers, name)) {
+      // A non-object entry cannot take an "enabled" flag: in strict mode the
+      // assignment itself threw a bare TypeError on a string entry.
+      if (!isBag(cfg.mcpServers[name])) throw invalidEntryError(name);
       cfg.mcpServers[name].enabled = enabled; saveUnlocked(cfg);
       serverCfg = cfg.mcpServers[name];
     }
@@ -333,14 +482,40 @@ async function listAllTools(client, stale = () => false, timeoutMs = CONNECT_TIM
 }
 
 class McpHub {
-  constructor() { this.servers = new Map(); this.commands = new Map(); this.gens = new Map(); this.started = false; this.onChange = null; this._log = () => {}; }
+  constructor() { this.servers = new Map(); this.commands = new Map(); this.gens = new Map(); this.started = false; this.onChange = null; this._log = () => {}; this._connecting = new Map(); this.configError = ''; }
   get config() { return load(); }
   // Connect every enabled server (in parallel, each bounded); failures are kept as status.
   async start(log = () => {}) {
     this._log = typeof log === 'function' ? log : () => {};
     this.started = true; activeHub = this;
     const cfg = load();
-    await Promise.all(Object.entries(cfg.mcpServers || {}).filter(([, s]) => s.enabled).map(([name, s]) => this.connect(name, s).catch(e => log(name + ': ' + e.message))));
+    // A malformed top-level "mcpServers" (load() recorded it instead of
+    // throwing, wave15) is this start's error record: a named error entry in
+    // the same shape a failed connect leaves, plus a log line. No server can
+    // come from the dropped value, and the rest of the app is unaffected.
+    if (lastConfigError) {
+      this.configError = lastConfigError;
+      this.servers.set('mcpServers', {name: 'mcpServers', status: 'error', tools: [], error: lastConfigError, stderrTail: ''});
+      log('mcpServers: ' + lastConfigError);
+      this._notify('mcpServers');
+    } else this.configError = '';
+    // A non-object entry is that entry's error, not the whole start()'s: it is
+    // recorded as an 'error' entry naming the entry (the same shape a failed
+    // connect() leaves, so /mcp shows it) and logged, and the healthy servers
+    // still connect. Reading ".enabled" of a null entry here used to throw a
+    // bare TypeError out of start() and no server started at all.
+    const jobs = [];
+    for (const [name, s] of Object.entries(cfg.mcpServers || {})) {
+      if (!isBag(s)) {
+        const msg = invalidEntryError(name).message;
+        this.servers.set(name, {name, status: 'error', tools: [], error: msg, stderrTail: ''});
+        log(name + ': ' + msg);
+        this._notify(name);
+        continue;
+      }
+      if (s.enabled) jobs.push(this.connect(name, s).catch(e => log(name + ': ' + e.message)));
+    }
+    await Promise.all(jobs);
     this.index();
   }
   _notify(name) { try { this.onChange?.(name, this.servers.get(name)); } catch {} }
@@ -351,7 +526,12 @@ class McpHub {
   _markDead(entry, reason) {
     if (this.servers.get(entry.name) !== entry || entry.status !== 'connected') return;
     entry.status = 'error';
-    entry.error = redact(reason?.message || String(reason || 'connection closed'));
+    // A server that dies mid-session leaves its reason on stderr just like one
+    // that fails to start, and connect()'s failure path appends that tail —
+    // do the same here (wave15): without it the user only saw the generic
+    // 'connection closed' and the actual reason sat unused in stderrTail.
+    const tail = typeof entry.stderrTail === 'string' ? entry.stderrTail.trim().slice(-500) : '';
+    entry.error = redact((reason?.message || String(reason || 'connection closed')) + (tail ? '\n[stderr] ' + tail : ''));
     // Capture the handles before clearing them and close them best-effort: dropping the
     // references alone leaked the transport (and, for stdio, the server process behind it).
     const client = entry.client, transport = entry.transport;
@@ -368,11 +548,38 @@ class McpHub {
   // server now, disabling disconnects it now. Fire-and-forget; outcomes surface on the
   // server entry's status/error (connect() records them) and via _log/_notify.
   applyEnabled(name, enabled, serverCfg) {
+    // Enabling is idempotent (wave15): a server that is already connected or
+    // mid-connect is not connected again. setEnabled() lands here, and the
+    // /mcp pick handler then ALSO calls connect() itself — connect() joins
+    // the in-flight attempt started here, so between the two paths the
+    // server process used to be spawned twice.
+    if (enabled) {
+      const cur = this.servers.get(name);
+      if (cur && (cur.status === 'connected' || cur.status === 'connecting')) { this.index(); this._notify(name); return; }
+    }
     const run = enabled ? this.connect(name, serverCfg).then(() => this.index()) : this.disconnect(name).then(() => this.index());
     run.catch(e => { this._log(name + ': ' + redact(e.message)); this._notify(name); });
     this._notify(name);
   }
+  // Idempotent front door for _connect() (wave15): a second enable for the
+  // same name — setEnabled()'s live apply followed by the caller's own
+  // connect(), or a repeated toggle — must not spawn the server twice. A
+  // connect already in flight is joined (the same promise is returned, so
+  // the caller still waits for the real outcome). Enabling an ALREADY
+  // connected server is stopped one level up, in applyEnabled(); a direct
+  // connect() on a connected entry keeps its old meaning (close the old
+  // entry and reconnect), which callers and tests rely on.
   async connect(name, s) {
+    if (!this._connecting) this._connecting = new Map();
+    const inFlight = this._connecting.get(name);
+    if (inFlight) return inFlight;
+    const p = this._connect(name, s);
+    this._connecting.set(name, p);
+    const done = () => { if (this._connecting.get(name) === p) this._connecting.delete(name); };
+    p.then(done, done);
+    return p;
+  }
+  async _connect(name, s) {
     // Reserve the generation synchronously, as the first statement: this used to await
     // disconnect() before minting it, so a disable/close (or a newer connect) that landed
     // during that await was overtaken by this connect when it resumed and minted a fresh
@@ -393,11 +600,19 @@ class McpHub {
     // a disconnect for the same name — must not mutate hub state; `stale()` detects that.
     const stale = () => this.gens.get(name) !== gen || this.servers.get(name) !== entry;
     let client;
+    // Set when the entry carries BOTH url and command (wave15): the url wins
+    // below, and that choice is said out loud — on the entry, in the log, and
+    // in the failure message — instead of the command being silently ignored.
+    let urlNote = '';
     try {
+      // A direct connect() with a non-object entry (hub.start() pre-filters
+      // these, but /mcp's toggle path connects directly) must fail with the
+      // named config error, not a TypeError from reading ".env" of null.
+      if (!isBag(s)) throw invalidEntryError(name);
       // A $secret reference the vault no longer has must not reach the server as an
       // empty string (audit #233): fail here, where the reason can be said plainly.
       const missing = missingSecrets(name);
-      if (missing.length) throw new Error('Secret(s) not found in the secure store (' + SECRETS_FILE + '): ' + missing.join(', ') + '. The server was not started with an empty value; save its config again to store the secret.');
+      if (missing.length) throw new Error(t('秘密情報が安全な保管場所に見つかりませんでした: {missing}。空の値ではサーバーを起動しませんでした。秘密情報を保存し直すには、設定を保存し直してください。', {missing: missing.join(', ')}));
       // Shape (deep c14 #5): validate here too — a config that never went
       // through save() (hand-edited, or straight from discover()) reaches this
       // point directly, and a string "args" used to hang the SDK for the full
@@ -405,8 +620,16 @@ class McpHub {
       const env = stringBag(name, 'env', s.env), headers = stringBag(name, 'headers', s.headers);
       if (s.args !== undefined && s.args !== null && (!Array.isArray(s.args) || s.args.some(a => typeof a !== 'string')))
         throw new Error('Invalid MCP server config for "' + name + '": "args" must be an array of strings.');
-      for (const [k, v] of Object.entries(env)) noteSecret(v, k);
-      for (const [k, v] of Object.entries(headers)) noteSecret(v, k);
+      // Noted with the vault rule, not the plaintext one: this env is about to
+      // be handed to a live server, whose stderr / errors / results echo it —
+      // the exact path a token-shaped value under an ordinary key leaked by.
+      for (const [k, v] of Object.entries(env)) noteVaultSecret(v, k);
+      for (const [k, v] of Object.entries(headers)) noteVaultSecret(v, k);
+      if (s.url && s.command) {
+        urlNote = t('url と command の両方が設定されているため、url を優先して接続します');
+        entry.warning = urlNote;
+        this._log(name + ': ' + urlNote);
+      }
       const {Client} = require('@modelcontextprotocol/sdk/client/index.js');
       let transport;
       if (s.type === 'sse') {
@@ -421,11 +644,36 @@ class McpHub {
         transport = new StreamableHTTPClientTransport(checkRemoteUrl(s.url), {requestInit: {headers}});
       } else {
         if (typeof s.command !== 'string' || !s.command) throw new Error('Invalid MCP server config for "' + name + '": "command" must be a non-empty string for a stdio server.');
+        // A cwd that does not exist makes spawn fail with a bare ENOENT that
+        // reads as if the COMMAND were missing (wave15): check it here, where
+        // the failure can name the cwd and its path for what they are.
+        if (s.cwd !== undefined && s.cwd !== null && s.cwd !== '') {
+          let isDir = false;
+          try { isDir = typeof s.cwd === 'string' && fs.statSync(s.cwd).isDirectory(); } catch { isDir = false; }
+          if (!isDir) throw new Error(t('作業フォルダー (cwd) が見つかりません: {cwd}', {cwd: String(s.cwd)}));
+        }
         const {StdioClientTransport, getDefaultEnvironment} = require('@modelcontextprotocol/sdk/client/stdio.js');
         transport = new StdioClientTransport({command: s.command, args: s.args || [], env: {...getDefaultEnvironment(), ...env}, cwd: s.cwd, stderr: 'pipe'});
         // Keep the server's stderr (bounded tail) so startup failures are diagnosable.
         const errStream = transport.stderr;
         if (errStream) errStream.on('data', d => { entry.stderrTail = (entry.stderrTail + d.toString()).slice(-2000); });
+        // Record how the child process ends (wave15): a server that exits at
+        // once surfaced only as 'Connection closed', with no sign of its exit
+        // code. The transport owns the process and nulls its handle on close,
+        // so hook start() and attach to the process the moment it exists;
+        // prepend so the record lands before the close propagates.
+        try {
+          const startOrig = transport.start.bind(transport);
+          transport.start = async (...a) => {
+            const started = startOrig(...a);
+            const proc = transport._process;
+            if (proc && typeof proc.on === 'function') {
+              const rec = (code, signal) => { entry.exitCode = code; entry.exitSignal = signal; };
+              if (typeof proc.prependListener === 'function') proc.prependListener('close', rec); else proc.on('close', rec);
+            }
+            return started;
+          };
+        } catch {}
       }
       client = new Client({name: 'muser', version: require('../package.json').version});
       await withTimeout(client.connect(transport), CONNECT_TIMEOUT, t('接続がタイムアウトしました'));
@@ -444,7 +692,13 @@ class McpHub {
       client.onerror = e => { if (!stale()) this._log(name + ': ' + redact(e?.message || String(e || 'error'))); };
     } catch (e) {
       const tail = entry.stderrTail ? entry.stderrTail.trim().slice(-500) : '';
-      const msg = redact(e.message + (tail ? '\n[stderr] ' + tail : ''));
+      // Say how the process ended when that is known (wave15), and repeat the
+      // url-over-command choice on the failure itself, not only in the log.
+      let extra = '';
+      if (entry.exitCode !== undefined && entry.exitCode !== null) extra += '\n' + t('サーバープロセスが終了コード {code} で終了しました', {code: entry.exitCode});
+      else if (entry.exitSignal) extra += '\n' + t('サーバープロセスがシグナル {signal} で終了しました', {signal: entry.exitSignal});
+      if (urlNote) extra += '\n' + urlNote;
+      const msg = redact(e.message + extra + (tail ? '\n[stderr] ' + tail : ''));
       if (!stale()) Object.assign(entry, {status: 'error', error: msg});
       try { await client?.close(); } catch {}
       throw new Error(msg);
@@ -559,4 +813,4 @@ class McpHub {
 
 function withTimeout(p, ms, msg) { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(msg)), ms); })]).finally(() => clearTimeout(t)); }
 
-module.exports = {McpHub, load, save, discover, importServers, setEnabled, FILE, redact, params, checkRemoteUrl, missingSecrets, listAllTools};
+module.exports = {McpHub, load, save, discover, importServers, setEnabled, FILE, redact, params, checkRemoteUrl, missingSecrets, listAllTools, configError};

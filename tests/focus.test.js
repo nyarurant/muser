@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {EventEmitter} = require('node:events');
-const {Focus} = require('../src/focus');
+const {Focus, INSTRUCTION} = require('../src/focus');
 const {Agent} = require('../src/agent');
 const sessions = require('../src/sessions');
 
@@ -31,7 +31,22 @@ test('a question answered with several reads and searches is not turned into a t
   assert.equal(focus.endRound().status, 'inactive');
   const edit = new Focus('Fix it'); edit.beginRound();
   edit.observe({command: 'code.edit', kind: 'edit', params: {path: 'a.js'}, summary: 'a.js'}, {ok: true});
-  assert.equal(edit.endRound().continue, true, 'a change still starts completion tracking');
+  assert.equal(edit.endRound().status, 'inactive', 'broad fix: a change alone no longer starts tracking without criteria');
+});
+
+test('a state-changing turn with no criteria stops inactive, but workers and questions still wait', () => {
+  const bg = new Focus('bg1 completed'); bg.beginRound();
+  bg.observe(command('node scripts/heap-summary.mjs x --top 15'), result(0));
+  assert.equal(bg.endRound().status, 'inactive', 'the hung bg-notification case: no plan, no second round');
+  const waiting = new Focus('Task'); waiting.beginRound();
+  waiting.observe(command('node scripts/heap-summary.mjs x --top 15'), result(0));
+  assert.equal(waiting.endRound({workersPending: true}).continue, true, 'waiting workers still continue');
+  const asking = new Focus('Task'); asking.beginRound();
+  asking.observe(command('node scripts/heap-summary.mjs x --top 15'), result(0));
+  asking.askUser('Which file?');
+  assert.equal(asking.endRound().status, 'needs_input', 'a question still waits even with no criteria');
+  const capped = new Focus('Task', {maxRounds: 1, automatic: false}); capped.beginRound();
+  assert.equal(capped.endRound().status, 'limit', 'the round cap still applies before the empty-criteria stop');
 });
 
 test('two command criteria (build + publish) can both be current; other commands still expire evidence', () => {
@@ -100,6 +115,53 @@ test('claims require real successful current verification evidence, not edits or
   assert.throws(() => focus.checkpoint(check('met', [edit])), /evidence/);
   const proof = focus.observe(read, {ok: true}); focus.checkpoint(check('met', [proof]));
   assert.equal(focus.endRound().status, 'complete');
+});
+
+test("weakness 8: a read of the task's own notes cannot prove an implementation criterion, but the code read can", () => {
+  const focus = new Focus('Implement X'); focus.beginRound();
+  focus.plan([{text: 'a.js に X を実装する', kind: 'inspection'}]);
+  focus.observe({command: 'code.write', kind: 'edit', params: {path: 'notes.md'}, summary: 'notes.md'}, {ok: true});
+  const notes = focus.observe({command: 'code.read', kind: 'read', params: {path: 'notes.md'}, summary: 'notes.md'}, {ok: true});
+  assert.throws(() => focus.checkpoint(check('met', [notes])), /code, a test, or a command result/);
+  // Reading code the task itself wrote is still proof: only memo/ledger text is self-authored.
+  focus.observe({command: 'code.edit', kind: 'edit', params: {path: 'a.js'}, summary: 'a.js'}, {ok: true});
+  const code = focus.observe({command: 'code.read', kind: 'read', params: {path: 'a.js'}, summary: 'a.js'}, {ok: true});
+  focus.checkpoint(check('met', [code]));
+  assert.equal(focus.endRound().status, 'complete');
+});
+
+test('weakness 8: a criterion about the notes file itself accepts a read of that file', () => {
+  const focus = new Focus('Write up the issues'); focus.beginRound();
+  focus.plan([{text: 'notes.md に問題点を書く', kind: 'inspection'}]);
+  focus.observe({command: 'code.write', kind: 'edit', params: {path: 'notes.md'}, summary: 'notes.md'}, {ok: true});
+  const notes = focus.observe({command: 'code.read', kind: 'read', params: {path: 'notes.md'}, summary: 'notes.md'}, {ok: true});
+  focus.checkpoint(check('met', [notes]));
+  assert.equal(focus.endRound().status, 'complete');
+});
+
+test('weakness 8: one read cannot mark three inspection criteria met, but two is allowed', () => {
+  const focus = new Focus('Check three things'); focus.beginRound();
+  focus.plan([{text: 'First thing holds', kind: 'inspection'}, {text: 'Second thing holds', kind: 'inspection'}, {text: 'Third thing holds', kind: 'inspection'}]);
+  const proof = focus.observe(read, {ok: true});
+  const all = ['c1', 'c2', 'c3'].map(id => ({id, status: 'met', evidence: [proof], reason: 'ok'}));
+  assert.throws(() => focus.checkpoint(all), /give each criterion its own evidence/);
+  // Each criterion with its own read is accepted.
+  const e1 = focus.observe(read, {ok: true}), e2 = focus.observe(read, {ok: true}), e3 = focus.observe(read, {ok: true});
+  focus.checkpoint([{id: 'c1', status: 'met', evidence: [e1], reason: 'ok'}, {id: 'c2', status: 'met', evidence: [e2], reason: 'ok'}, {id: 'c3', status: 'met', evidence: [e3], reason: 'ok'}]);
+  assert.equal(focus.endRound().status, 'complete');
+  const pair = new Focus('Check two things'); pair.beginRound();
+  pair.plan([{text: 'First thing holds', kind: 'inspection'}, {text: 'Second thing holds', kind: 'inspection'}]);
+  const shared = pair.observe(read, {ok: true});
+  pair.checkpoint([{id: 'c1', status: 'met', evidence: [shared], reason: 'ok'}, {id: 'c2', status: 'met', evidence: [shared], reason: 'ok'}]);
+  assert.equal(pair.endRound().status, 'complete');
+});
+
+test('weakness 8: INSTRUCTION bans escape-hatch criteria and self-written proof', () => {
+  assert.match(INSTRUCTION, /escape hatch/);
+  assert.match(INSTRUCTION, /Report deferred items as unmet or blocked/);
+  assert.match(INSTRUCTION, /counting command, not by reading the ledger/);
+  assert.match(INSTRUCTION, /prove those with the code, a test, or a command result/);
+  assert.match(INSTRUCTION, /One piece of evidence cannot by itself mark three or more inspection criteria met/);
 });
 
 test('command checks reject failed/background/unrelated commands and reruns invalidate an old pass', () => {
@@ -228,7 +290,39 @@ test('a user send does not end at the round limit: the next leg starts by itself
   assert.equal(answer.focus.status, 'complete');
   assert.equal(fixture.sends.length, 4, 'three capped rounds, then one automatic leg round — no user message in between');
   assert.ok(fixture.sends[3].body.includes('automatic continuation'));
+  // Weakness 6 (2026-11-06): the continuation must not forbid focus.plan —
+  // existing criteria stay fixed, appending is allowed.
+  assert.ok(fixture.sends[3].body.includes('focus.plan(append=true)'), 'the leg may append criteria');
+  assert.ok(!fixture.sends[3].body.includes('do not call focus.plan again'), 'the old ban is gone');
+  assert.ok(fixture.sends[3].body.includes('do not remove, reorder or weaken'), 'existing criteria still do not change');
   assert.equal(ends, 1, 'one turn-end for the whole user turn, however many legs it took (audit #29: per-leg turn-ends double-counted the queue continuation, the daily tally and usage; direct sendFocused calls — /goal legs — still close their own run)');
+  clearTimeout(fixture.ctrl.flashTimer);
+});
+
+test('weakness 7: focus.plan and focus.checkpoint calls — including rejections — are recorded in the transcript tools', async t => {
+  const fixture = await harness(t, async (a, round) => {
+    if (round === 1) {
+      assert.equal((await a.execute('focus.plan', {agent: 'main', criteria: JSON.stringify([{text: 'Bad', kind: 'nope'}])})).ok, false, 'a plan with a bad kind is refused');
+      assert.equal((await a.execute('focus.plan', {agent: 'main', criteria: JSON.stringify(plan)})).ok, true);
+      assert.equal((await a.execute('focus.checkpoint', {agent: 'main', checks: JSON.stringify([{id: 'c1', status: 'unmet'}])})).ok, false, 'a checkpoint without a reason is refused');
+      assert.equal((await a.execute('focus.checkpoint', {agent: 'main', checks: JSON.stringify(check('unmet'))})).ok, true);
+    } else {
+      const readResult = await a.execute('code.read', {agent: 'main', path: 'probe.txt'}, 1000, 'read-final');
+      assert.equal((await a.execute('focus.checkpoint', {agent: 'main', checks: JSON.stringify(check('met', [readResult.payload.muser_evidence_id]))})).ok, true);
+    }
+  });
+  const answer = await fixture.agent.send('Recorded task');
+  assert.equal(answer.focus.status, 'complete');
+  const turns = sessions.transcript(fixture.agent.session.id);
+  assert.equal(turns.length, 2);
+  const first = turns[0].tools.filter(x => x.command.startsWith('focus.'));
+  assert.deepEqual(first.map(x => [x.command, x.ok]), [['focus.plan', false], ['focus.plan', true], ['focus.checkpoint', false], ['focus.checkpoint', true]]);
+  assert.match(first[0].error, /kind/);
+  assert.match(first[2].error, /reason/);
+  assert.equal(first[1].summary, 'plan 1 criterion');
+  const second = turns[1].tools.filter(x => x.command.startsWith('focus.'));
+  assert.deepEqual(second.map(x => [x.command, x.ok]), [['focus.checkpoint', true]]);
+  assert.equal(second[0].summary, 'checkpoint 1 criterion');
   clearTimeout(fixture.ctrl.flashTimer);
 });
 
@@ -392,20 +486,28 @@ test('a run that ends at its round limit does not stop the task agents it spawne
 });
 
 test('the Focus time limit does not bite while task agents are still running', async t => {
+  // Weakness 2 (2026-11-06): the wait now happens inside the round that ended
+  // with workers pending, so the worker finishes on its own timer — not in the
+  // next round — and the collection round starts only after it is done. The
+  // time limit still bounds continuous waiting (see focus-worker-wait.test.js:
+  // a never-finishing worker stops at the limit in one round), so this test
+  // uses a limit far above the wait instead of 1 ms.
   let worker;
   const fixture = await harness(t, async (a, round) => {
     if (round === 1) {
       await a.execute('focus.plan', {agent: 'main', criteria: JSON.stringify(plan)});
       await a.execute('focus.checkpoint', {agent: 'main', checks: JSON.stringify(check('unmet'))});
       worker = fakeWorker(a);
+      setTimeout(() => { worker.turn = null; worker.state = 'done'; worker.result = 'worker result'; }, 50);
     } else if (round === 2) {
-      worker.turn = null; worker.state = 'done'; worker.result = 'worker result';
+      assert.equal(worker.turn, null, 'the worker finished during the wait, before round 2 started');
       const readResult = await a.execute('code.read', {agent: 'main', path: 'probe.txt'}, 1000, 'read-time-limit');
       await a.execute('focus.checkpoint', {agent: 'main', checks: JSON.stringify(check('met', [readResult.payload.muser_evidence_id]))});
     }
   });
-  const answer = await fixture.agent.sendFocused('Long task', {maxRounds: 5, timeoutMs: 1});
+  const answer = await fixture.agent.sendFocused('Long task', {maxRounds: 5, timeoutMs: 60000});
   assert.equal(answer.focus.status, 'complete', 'the round spent waiting on the agent did not consume the time limit');
+  assert.equal(answer.focus.round, 2, 'no waiting round was started while the agent worked');
 });
 
 test('a task that spends its time budget on its own work stops at the time limit (t3 #3)', async t => {
@@ -419,7 +521,7 @@ test('a task that spends its time budget on its own work stops at the time limit
   });
   const answer = await fixture.agent.sendFocused('Long task', {maxRounds: 5, timeoutMs: 5});
   assert.equal(answer.focus.status, 'limit');
-  assert.match(answer.focus.reason, /Focus time limit/);
+  assert.match(answer.focus.reason, /時間上限/);
   assert.equal(fixture.sends.length, 1, 'no continuation round was sent after the limit');
 });
 

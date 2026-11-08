@@ -33,12 +33,40 @@ function decodeText(buf) {
 }
 // Some tools can only write strings, so a switch saved as "false" / "0" used to be read as
 // "not a boolean", fall back to the default (usually on) and run the opposite of what the
-// file said (fourth audit M16). Top-level string spellings of a boolean are read as the
-// boolean they name; no string setting muser keeps can legitimately be "true"/"false"/
-// "0"/"1", and the nested values (skills, future keys' objects) are left untouched.
+// file said (fourth audit M16). Wave 14 widened the rescue, key by key: a known switch
+// (BOOL_KEYS) reads every common spelling — on/off, yes/no, true/false, 0/1 as a string,
+// and the numbers 0/1 — as the value it names, so "off" can no longer come back on; a
+// known number (NUMERIC_KEYS) reads a string number ("100") as that number. The rescue
+// is keyed because string settings CAN legitimately hold some of these words
+// (focusLogLevel / expectMode can be "off"), so unknown keys keep only the older
+// true/false/0/1 string rescue, and nested values are left untouched. A value no
+// spelling covers is left as-is; the reader for that key falls back to its default.
+const BOOL_KEYS = new Set(['focus', 'worklog', 'bangAutoSend', 'bgAutoResume', 'bell', 'updateCheck', 'motion', 'codeWrap', 'footerDevice', 'footerSlot', 'footerName', 'footerUsage', 'footerCwd', 'footerSession', 'footerVersion', 'footerClock', 'color', 'kitty', 'fullscreen', 'lore', 'accountAuto']);
+const NUMERIC_KEYS = new Set(['maxToolCallsPerTurn', 'dailyTurnLimit', 'focusRounds', 'worklogDays', 'focusMinutes', 'maxNodeSlots', 'overnightTokenCap', 'overnightMaxTasks', 'maxAgents', 'maxAgentsTotal', 'accountThreshold']);
+const BOOL_WORDS = {true: true, 1: true, yes: true, on: true, false: false, 0: false, no: false, off: false};
+// The environment's boolean spellings, one set for every settings surface (wave 14):
+// 1/true/yes/on turn an override on, 0/false/no/off turn it off; anything else is "not a
+// boolean" (null), so each caller can fall back to the saved value instead of guessing.
+function envBool(v) {
+  if (v === undefined || v === null) return null;
+  const low = String(v).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(low)) return true;
+  if (['0', 'false', 'no', 'off'].includes(low)) return false;
+  return null;
+}
 function normalizeConfig(v) {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
   for (const k of Object.keys(v)) {
+    if (NUMERIC_KEYS.has(k)) {
+      if (typeof v[k] === 'string' && v[k].trim() !== '' && Number.isFinite(Number(v[k]))) v[k] = Number(v[k]);
+      continue;
+    }
+    if (BOOL_KEYS.has(k)) {
+      if (typeof v[k] === 'string' && Object.prototype.hasOwnProperty.call(BOOL_WORDS, v[k].trim().toLowerCase())) v[k] = BOOL_WORDS[v[k].trim().toLowerCase()];
+      else if (v[k] === 0) v[k] = false;
+      else if (v[k] === 1) v[k] = true;
+      continue;
+    }
     if (typeof v[k] !== 'string') continue;
     const low = v[k].trim().toLowerCase();
     if (low === 'false' || low === '0') v[k] = false;
@@ -48,8 +76,29 @@ function normalizeConfig(v) {
 }
 function readJson(f) { return normalizeConfig(parseJson(decodeText(fs.readFileSync(f)))); }
 
+// Wave 14 (D12): a config.json that cannot be read as settings used to surface
+// nowhere — reads quietly returned the defaults and the first save quietly moved the
+// broken file aside. The fact is remembered here (once per distinct broken content;
+// a move-aside is its own fact) and /settings takes it with takeCorruptNotice() to
+// show it once when the settings are opened.
+let corruptNotice = null, corruptNoticeTakenFor = null;
+function flagCorrupt(sig, dest) {
+  if (!dest && sig === corruptNoticeTakenFor) return;
+  corruptNotice = {file: file(), dest: dest || null, sig};
+}
+function takeCorruptNotice() { const n = corruptNotice; corruptNotice = null; if (n) corruptNoticeTakenFor = n.sig; return n; }
+
 function read() {
-  try { const v = readJson(file()); return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; } catch { return {}; }
+  const f = file();
+  let buf;
+  try { buf = fs.readFileSync(f); } catch { return {}; }
+  const text = decodeText(buf);
+  if (!text.trim()) return {};
+  let v = null;
+  try { v = normalizeConfig(parseJson(text)); } catch {}
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v;
+  flagCorrupt(crypto.createHash('sha256').update(buf).digest('hex'), null);
+  return {};
 }
 
 // Small lock around a read-modify-write (same shape as sessions.locked): config.json is
@@ -119,7 +168,7 @@ function updateUnlocked(fn) {
     // Fourth audit M15 (deep c24 #11): the move-aside guarantee covered only a parse
     // FAILURE. Valid JSON that is not an object ([...], "ja", 42, null) parsed fine, read
     // as {} and was overwritten with no backup anywhere. Both shapes are moved aside.
-    else { try { fs.renameSync(f, f + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} }
+    else { const dest = f + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-'); try { fs.renameSync(f, dest); flagCorrupt(dest, dest); } catch {} }
   }
   fn(cfg);
   fs.mkdirSync(path.dirname(f), {recursive: true});
@@ -141,4 +190,4 @@ function renameRetry(from, to) {
   }
 }
 
-module.exports = {file, read, update, parseJson, readJson, withLock, renameRetry};
+module.exports = {file, read, update, parseJson, readJson, withLock, renameRetry, envBool, takeCorruptNotice};

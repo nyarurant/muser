@@ -94,6 +94,39 @@ test('host: cap closes the least recently used idle conversation; the default is
   assert.ok(host.get(def.id) && host.get(e2.id) && host.get(e3.id));
 });
 
+test('host: the default cap is 16, the same as the node slots', async t => {
+  const {host} = makeHost(t);
+  assert.equal(host.maxOpen, 16, 'every open conversation has a node slot of its own');
+  const dir = tmpDir(t);
+  host.addPrepared({...makePair('C:\\a'), isDefault: true});
+  const opened = [];
+  for (let i = 0; i < 15; i++) opened.push(await host.openNew({cwd: dir}));
+  assert.equal(host.size, 16);
+  const first = opened[0];
+  host.touch(opened[1].id); // the first non-default is now the LRU
+  await host.openNew({cwd: dir});
+  assert.equal(host.size, 16, 'still at the cap');
+  assert.equal(host.get(first.id), null, 'the 17th conversation closed the LRU one');
+});
+
+test('host: closing a conversation unpairs its node id first when the agent knows how', async t => {
+  const {host, made} = makeHost(t, {maxOpen: 2});
+  const dir = tmpDir(t);
+  const e = await host.openNew({cwd: dir});
+  const agent = made[0].agent;
+  const order = [];
+  agent.closeGracefully = async () => { order.push('unpair'); await new Promise(r => setTimeout(r, 5)); order.push('closed'); agent.closed = true; };
+  const closing = host.closeSync(e.id, 'test');
+  assert.equal(host.get(e.id), null, 'the entry is gone right away');
+  await closing;
+  assert.deepStrictEqual(order, ['unpair', 'closed']);
+  // An agent without closeGracefully is still closed the plain way.
+  const e2 = await host.openNew({cwd: dir});
+  const agent2 = made[1].agent;
+  host.closeSync(e2.id, 'test');
+  assert.equal(agent2.closed, true);
+});
+
 test('host: cap with every non-default conversation busy is a 409, and closing a busy one is a 409', async t => {
   const {host} = makeHost(t, {maxOpen: 2});
   host.addPrepared({...makePair('C:\\a'), isDefault: true});
@@ -328,7 +361,7 @@ test('v5: /api/sessions lists stored conversations with open/busy; open and clos
   const {server} = makeServer(t, host, {recentProvider: () => storedList});
   await server.start();
   let list = await (await call(server, 'GET', '/api/sessions', {headers: AUTH})).json();
-  assert.deepEqual(list.sessions, [{id: 'past-1', cwd: 'C:\\old', title: 'old chat', turns: 3, created: 1, updated: 2, account: 'default', open: false, busy: false}]);
+  assert.deepEqual(list.sessions, [{id: 'past-1', cwd: 'C:\\old', title: 'old chat', turns: 3, created: 1, updated: 2, account: 'default', origin: null, open: false, busy: false}]);
   const opened = await call(server, 'POST', '/api/sessions/past-1/open', {headers: AUTH, body: {}});
   assert.equal(opened.status, 200);
   assert.deepEqual(await opened.json(), {id: 'past-1'});
@@ -338,6 +371,36 @@ test('v5: /api/sessions lists stored conversations with open/busy; open and clos
   assert.equal(host.get('past-1'), null);
   assert.equal((await call(server, 'POST', '/api/sessions/past-1/close', {headers: AUTH, body: {}})).status, 404);
   assert.equal((await call(server, 'POST', '/api/sessions/ghost/open', {headers: AUTH, body: {}})).status, 404);
+});
+
+test('v5: /api/sessions reports origin — "exec" for an exec-made conversation, null without a mark', async t => {
+  const storedList = [
+    {id: 'exec-1', cwd: 'C:\\agent-work', title: 'exec chat', turns: 1, created: 1, updated: 3, account: 'default', origin: 'exec'},
+    {id: 'plain-1', cwd: 'C:\\project', title: 'interactive chat', turns: 2, created: 1, updated: 2, account: 'default'},
+    {id: 'junk-1', cwd: 'C:\\project', title: 'hand-edited', turns: 0, created: 1, updated: 1, account: 'default', origin: 42},
+  ];
+  const {host} = makeHost(t);
+  host.addPrepared({...makePair('C:\\a'), isDefault: true});
+  const {server} = makeServer(t, host, {recentProvider: () => storedList});
+  await server.start();
+  const list = await (await call(server, 'GET', '/api/sessions', {headers: AUTH})).json();
+  assert.equal(list.sessions.find(s => s.id === 'exec-1').origin, 'exec');
+  assert.equal(list.sessions.find(s => s.id === 'plain-1').origin, null, 'no mark reads as null, never undefined');
+  assert.equal(list.sessions.find(s => s.id === 'junk-1').origin, null, 'a non-string mark reads as null');
+});
+
+test('/api/sessions: an unmarked conversation an exec run on record names reads origin "exec"', async t => {
+  const storedList = [
+    {id: 'old-exec', cwd: 'C:\agent-work', title: 'made before the mark', turns: 1, created: 1, updated: 3, account: 'default'},
+    {id: 'plain-1', cwd: 'C:\project', title: 'interactive chat', turns: 2, created: 1, updated: 2, account: 'default'},
+  ];
+  const {host} = makeHost(t);
+  host.addPrepared({...makePair('C:\a'), isDefault: true});
+  const {server} = makeServer(t, host, {recentProvider: () => storedList, execSessionIds: () => new Set(['old-exec'])});
+  await server.start();
+  const list = await (await call(server, 'GET', '/api/sessions', {headers: AUTH})).json();
+  assert.equal(list.sessions.find(s => s.id === 'old-exec').origin, 'exec');
+  assert.equal(list.sessions.find(s => s.id === 'plain-1').origin, null);
 });
 
 test('v5: /api/server/events streams session and approval events', {timeout: 30000}, async t => {

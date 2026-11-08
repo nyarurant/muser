@@ -1,7 +1,7 @@
 // Line-at-a-time Markdown for streamed replies. Each completed source line becomes one row
 // {prefix, text}; the view gives the text a hanging indent after the prefix and lets Ink wrap.
 import {createRequire} from 'node:module';
-const {c, width, pad} = createRequire(import.meta.url)('../tui/term.js');
+const {c, width, pad, truncate} = createRequire(import.meta.url)('../tui/term.js');
 
 // Tables. Rows printed one source line at a time could not line up: each row had its own cell
 // widths and the rule under the header matched none of them. A table is now set as a whole —
@@ -32,24 +32,40 @@ const isRuleLine = (l, i, total) => {
   if (!TABLE_RULE.test(l) || !l.includes('-')) return false;
   return cellsOf(l).every(x => /^:?-+:?$/.test(x));
 };
-export function tableRows(lines) {
-  const parsed = lines.map((l, i) => isRuleLine(l, i, lines.length)
-    ? {rule: cellsOf(l).map(x => x.startsWith(':') && x.endsWith(':') ? 'center' : x.endsWith(':') ? 'right' : 'left')}
-    : {cells: cellsOf(l).map(x => inline(x))});
+const parseTable = lines => lines.map((l, i) => isRuleLine(l, i, lines.length)
+  ? {rule: cellsOf(l).map(x => x.startsWith(':') && x.endsWith(':') ? 'center' : x.endsWith(':') ? 'right' : 'left')}
+  : {cells: cellsOf(l).map(x => inline(x))});
+const widthsOf = parsed => {
   // No spread into Math.max (recovery scan): feed() accumulates a whole streamed
   // table before flushing, and a very large one (200k rows, verified) blew the
   // call stack with a RangeError. Fold instead.
   const n = parsed.reduce((m, p) => Math.max(m, (p.cells || p.rule).length), 1);
   const widths = Array.from({length: n}, () => 1);
   for (const p of parsed) if (p.cells) for (let j = 0; j < n; j++) widths[j] = Math.max(widths[j], width(p.cells[j] || ''));
+  return widths;
+};
+// The column widths a whole table would be set at (its widest cells). The live
+// preview freezes the widths of the lines it first showed (see Controller.
+// previewRow) and passes them back as tableRows' `frozen`, so later, wider
+// rows cannot re-align the rows already on screen.
+export function tableWidths(lines) { return widthsOf(parseTable(lines)); }
+export function tableRows(lines, frozen = null) {
+  const parsed = parseTable(lines);
+  // Frozen preview widths: exactly those columns at exactly those widths for
+  // the whole table; a cell that outgrows its frozen column is cut to it (the
+  // finished table is set again at its true widths when it is printed).
+  const fz = Array.isArray(frozen) && frozen.length ? frozen.map(w => Math.max(1, Math.floor(w) || 1)) : null;
+  const widths = fz || widthsOf(parsed);
+  const n = widths.length;
   const ruleAt = parsed.findIndex(p => p.rule), align = ruleAt >= 0 ? parsed[ruleAt].rule : [];
   const fit = (s, j) => {
-    const room = widths[j] - width(s);
-    if (align[j] === 'right') return ' '.repeat(room) + s;
-    if (align[j] === 'center') return ' '.repeat(Math.floor(room / 2)) + s + ' '.repeat(Math.ceil(room / 2));
-    return pad(s, widths[j]);
+    const v = fz && width(s) > widths[j] ? truncate(s, widths[j]) : s;
+    const room = widths[j] - width(v);
+    if (align[j] === 'right') return ' '.repeat(room) + v;
+    if (align[j] === 'center') return ' '.repeat(Math.floor(room / 2)) + v + ' '.repeat(Math.ceil(room / 2));
+    return pad(v, widths[j]);
   };
-  const ruleRow = () => ({prefix: '', text: c.faint(n === 1 ? '─'.repeat(widths[0] + 4) : widths.map(w => '─'.repeat(w + 2)).join('┼')), code: true});
+  const ruleRow = () => ({prefix: '', text: c.faint(n === 1 ? '─'.repeat(widths[0] + 4) : widths.map(w => '─'.repeat(w + 2)).join('┼')), code: true, table: true});
   const out = [];
   parsed.forEach((p, i) => {
     if (p.rule) { out.push(ruleRow()); return; }
@@ -59,7 +75,7 @@ export function tableRows(lines) {
     const seg = widths.map((_, j) => ' ' + (head ? c.bold(fit(p.cells[j] || '', j)) : fit(p.cells[j] || '', j)) + ' ').join(c.faint('│'));
     // A one-column table has no join, so without explicit end borders it reads
     // as plain lines under a rule (r1-15).
-    out.push({prefix: '', text: n === 1 ? c.faint('│') + seg + c.faint('│') : seg, code: true});
+    out.push({prefix: '', text: n === 1 ? c.faint('│') + seg + c.faint('│') : seg, code: true, table: true});
     if (head && ruleAt < 0) out.push(ruleRow());
   });
   return out;
@@ -130,11 +146,52 @@ function format(s) {
 // off a narrow screen (r1-14). (Module level: createMd's own `width`
 // parameter shadows the term.js width this needs.)
 const expandTabs = s => { let out = '', col = 0; for (const ch of s) { if (ch === '\t') { const n = 2 - (col % 2); out += ' '.repeat(n); col += n; } else { out += ch; col += width(ch); } } return out; };
+// A list indent cut to `room` cells (the prefix cap minus the marker): past
+// the room the indent stops growing and a '…' marks the deeper nesting.
+// (Module level for the same shadowing reason as expandTabs.)
+const capIndentTo = (indent, room) => {
+  if (width(indent) <= room) return indent;
+  if (room <= 0) return '';
+  if (room === 1) return '…';
+  return ' '.repeat(room - 1) + '…';
+};
+// A list line (task / bullet / numbered) split into its parts, with the
+// marker already rendered as row() renders it. Used only to spot a list
+// nested one level inside a quote (or carrying a quote) below; ordinary
+// list lines still go through row()'s own branches.
+const parseListLine = s => {
+  let m;
+  if ((m = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(s))) return {indent: m[1], markerW: 2, marker: m[2] === ' ' ? c.gray('☐ ') : c.green('☒ '), content: m[3]};
+  if ((m = /^(\s*)[-*+]\s+(.*)$/.exec(s))) return {indent: m[1], markerW: 2, marker: c.gray('• '), content: m[2]};
+  if ((m = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(s))) return {indent: m[1], markerW: m[2].length + 2, marker: c.gray(m[2] + '. '), content: m[3]};
+  return null;
+};
+const QUOTE_LINE = /^((?:>\s?)+)(.*)$/;
 
 export function createMd(width) {
   // No explicit width: follow the terminal, as the call sites (controller/view)
   // construct a renderer without knowing the current column count.
   const effWidth = width === undefined ? (process.stdout.columns || 40) : width;
+  // Nested lists and quotes grow their prefix without bound (one indent level
+  // or one '▎' per source level): deep enough, the prefix ate most of the row
+  // and the text collapsed into a one-cell column on both screens (the classic
+  // Row keeps the prefix unshrunk; the fs hanging() gives the body
+  // max(1, W - prefix)). The prefix is capped here, in the one place both
+  // screens read it from, at a quarter of the row (at least 8 cells): past the
+  // cap the indent / bars stop growing and a '…' marks that the nesting goes
+  // deeper than shown, so the depth is still readable as 'more'.
+  const prefixCap = Math.max(8, Math.floor((effWidth || 40) / 4));
+  const capIndent = (indent, markerW) => capIndentTo(indent, prefixCap - markerW);
+  // The bars-plus-space segment for a quote of `depth`, fitted into `room`
+  // cells: past the room the bars give way to a '…' like the deep-quote
+  // branch below, so a combined quote/list prefix still fits the cap and
+  // leaves room for the other marker.
+  const quotePart = (depth, room) => {
+    if (room <= 0) return '';
+    if (depth + 1 <= room) return '▎'.repeat(depth) + ' ';
+    if (room >= 3) return '▎'.repeat(room - 2) + '… ';
+    return room === 2 ? '▎…' : '▎';
+  };
   // Streaming re-renders the same source line repeatedly; cache the last inline() result.
   let lastSrc = null, lastResult = null;
   const inlineCached = src => { if (src === lastSrc) return lastResult; const r = inline(src); lastSrc = src; lastResult = r; return r; };
@@ -154,12 +211,36 @@ export function createMd(width) {
       let m;
       if ((m = /^(#{1,6})\s+(.*)$/.exec(src))) { const inner = inlineCached(m[2]); return {prefix: '', text: c.bold(m[1].length <= 2 ? c.accent(inner) : inner)}; }
       if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(src)) return {prefix: '', text: c.faint('─'.repeat(Math.max(8, effWidth || 40)))};
-      if ((m = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(src))) return {prefix: m[1] + (m[2] === ' ' ? c.gray('☐ ') : c.green('☒ ')), text: inlineCached(m[3])};
-      if ((m = /^(\s*)[-*+]\s+(.*)$/.exec(src))) return {prefix: m[1] + c.gray('• '), text: inlineCached(m[2])};
-      if ((m = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(src))) return {prefix: m[1] + c.gray(m[2] + '. '), text: inlineCached(m[3])};
+      // One level of quote/list nesting (W13-13): '> - x' is a list inside
+      // a quote and '- > x' is a quote inside a list item, so the inner
+      // marker becomes a real prefix segment instead of staying raw in
+      // the text. Only this one inner level is interpreted — the inner
+      // content is not re-parsed ('> - > x' keeps its inner '>'). Lines
+      // that are not exactly one of these shapes fall through to the
+      // ordinary branches below, unchanged.
+      let qn;
+      if ((qn = QUOTE_LINE.exec(src))) {
+        const inner = parseListLine(qn[2]);
+        if (inner) {
+          const qp = quotePart(qn[1].split('>').length - 1, prefixCap - inner.markerW);
+          return {prefix: c.faint(qp) + capIndentTo(inner.indent, prefixCap - [...qp].length - inner.markerW) + inner.marker, text: c.italic(inlineCached(inner.content))};
+        }
+      }
+      const outer = parseListLine(src);
+      if (outer) {
+        const iq = QUOTE_LINE.exec(outer.content);
+        if (iq) {
+          const qp = quotePart(iq[1].split('>').length - 1, prefixCap - outer.markerW);
+          return {prefix: capIndentTo(outer.indent, prefixCap - outer.markerW - [...qp].length) + outer.marker + c.faint(qp), text: c.italic(inlineCached(iq[2]))};
+        }
+      }
+      if ((m = /^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(src))) return {prefix: capIndent(m[1], 2) + (m[2] === ' ' ? c.gray('☐ ') : c.green('☒ ')), text: inlineCached(m[3])};
+      if ((m = /^(\s*)[-*+]\s+(.*)$/.exec(src))) return {prefix: capIndent(m[1], 2) + c.gray('• '), text: inlineCached(m[2])};
+      if ((m = /^(\s*)(\d+)[.)]\s+(.*)$/.exec(src))) return {prefix: capIndent(m[1], m[2].length + 2) + c.gray(m[2] + '. '), text: inlineCached(m[3])};
       // Nested quotes repeat the bar per level instead of leaving a raw '>'
-      // in the text (r1-19).
-      if ((m = /^((?:>\s?)+)(.*)$/.exec(src))) { const depth = m[1].split('>').length - 1; return {prefix: c.faint('▎'.repeat(depth) + ' '), text: c.italic(inlineCached(m[2]))}; }
+      // in the text (r1-19), capped like the list indent above: past the cap
+      // the bars give way to a '…' that says the quote goes deeper.
+      if ((m = /^((?:>\s?)+)(.*)$/.exec(src))) { const depth = m[1].split('>').length - 1; return {prefix: c.faint(depth + 1 <= prefixCap ? '▎'.repeat(depth) + ' ' : '▎'.repeat(Math.max(1, prefixCap - 2)) + '… '), text: c.italic(inlineCached(m[2]))}; }
       // One table line on its own (the unfinished line's preview); whole tables go through feed().
       if (isTableLine(src)) return tableRows([src])[0];
       return {prefix: '', text: inlineCached(src)};

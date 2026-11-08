@@ -13,7 +13,7 @@
 // and its wording must stay byte-identical regardless of the display language; the
 // integrator can revisit this if the note ever becomes user-facing UI.
 
-const MAX_TOTAL = 4000;      // the whole note is capped near this many characters
+const MAX_TOTAL = 4000;      // the whole note is capped near this many code points
 const MAX_TURNS = 6;         // transcript turns kept (the newest ones)
 const MAX_TURN_CHARS = 300;  // per speaker text inside one transcript turn
 const MAX_GIT_LINES = 30;    // `git status --porcelain` lines kept
@@ -26,6 +26,8 @@ const MAX_TODOS = 30;        // todo items kept
 const MAX_ITEM_CHARS = 200;  // per focus criterion / todo item / git line
 const MAX_GOAL_CHARS = 300;  // the focus goal line
 const MAX_FIELD_CHARS = 500; // one-line fields: cwd, session title, labels, record path
+const MAX_AGENTS = 10;       // finished, uncollected sub-agents summarised (wave11 (2))
+const MAX_AGENT_HEAD = 200;  // per sub-agent result/error head kept
 
 function str(v) { return typeof v === 'string' ? v.trim() : v == null ? '' : String(v).trim(); }
 
@@ -34,17 +36,47 @@ function str(v) { return typeof v === 'string' ? v.trim() : v == null ? '' : Str
 // embedded verbatim and could open a fake `■ …` section (even a fake record pointer)
 // inside a note the new account's Muse reads as trusted first context. Collapse every
 // run of line breaks (with surrounding space) to a single space.
+// Budgets in this module count code points, not UTF-16 units (the same
+// counting as src/tell.js): a unit count charges an astral character twice,
+// so a 300-emoji turn used to be cut to 150 emoji against its 300 budget.
+const cpLength = s => [...s].length;
+
 // t7 #19: a cut at a fixed UTF-16 length can land between a surrogate pair and
 // leave a lone high surrogate in the note. Cut one unit earlier instead.
+// wave17: n is a code-point budget and the cut is grapheme-aware. Slicing by
+// code points never splits a surrogate pair, and when Intl.Segmenter is
+// available the cut backs off to a grapheme-cluster boundary, so it cannot
+// sever a ZWJ sequence (leaving a dangling U+200D), a skin-tone modifier, a
+// flag pair, or a base letter from its combining marks. Without a segmenter,
+// keep the surrogate-safe code-point slice and additionally back off a
+// trailing ZWJ, trailing combining marks (Unicode category M), and a final
+// code point whose ZWJ / combining continuation was cut away.
 function safeCut(s, n) {
-  if (s.length <= n) return s;
-  const c = s.charCodeAt(n - 1);
-  return s.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+  const cps = [...s];
+  if (cps.length <= n) return s;
+  const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, {granularity: 'grapheme'}) : null;
+  if (segmenter) {
+    let out = '', used = 0;
+    for (const {segment} of segmenter.segment(s)) {
+      const len = cpLength(segment);
+      if (used + len > n) break;
+      out += segment; used += len;
+    }
+    return out;
+  }
+  const out = cps.slice(0, n);
+  while (out.length) {
+    const last = out[out.length - 1], next = cps[out.length];
+    if (last === '\u200d' || /\p{M}/u.test(last)) { out.pop(); continue; }
+    if (next === '\u200d' || (next !== undefined && /\p{M}/u.test(next))) { out.pop(); continue; }
+    break;
+  }
+  return out.join('');
 }
 
 function oneLine(v, n = MAX_FIELD_CHARS) {
   const s = str(v).replace(/\s*[\r\n]+\s*/g, ' ');
-  return s.length > n ? safeCut(s, n) + '…' : s;
+  return cpLength(s) > n ? safeCut(s, n) + '…' : s;
 }
 
 // Transcript prose keeps its line breaks (it is quoted conversation), but a line that
@@ -55,7 +87,7 @@ function defangSections(s) { return s.replace(/^■/gm, ' ■'); }
 // One speaker's text, cut to the per-turn budget with an ellipsis when it was longer.
 function clip(text, n = MAX_TURN_CHARS) {
   const s = defangSections(str(text));
-  return s.length > n ? safeCut(s, n) + '…' : s;
+  return cpLength(s) > n ? safeCut(s, n) + '…' : s;
 }
 
 // Todo statuses arrive as pending / in_progress / completed (see todo.write in src/tools.js,
@@ -104,7 +136,7 @@ function normGit(gitLines) {
   // a file name can itself contain a newline, which must not become a fake section.
   return gitLines.map(l => {
     const s = String(l ?? '').replace(/\s+$/, '').replace(/\s*[\r\n]+\s*/g, ' ');
-    return s.length > MAX_ITEM_CHARS ? s.slice(0, MAX_ITEM_CHARS) + '…' : s;
+    return cpLength(s) > MAX_ITEM_CHARS ? safeCut(s, MAX_ITEM_CHARS) + '…' : s;
   }).filter(l => l.trim());
 }
 
@@ -132,8 +164,28 @@ function renderTurn(t) {
   return lines.join('\n');
 }
 
+// Wave11 (2): sub-agents that finished on the old account but whose result was never
+// collected (agent.wait) are dropped by the switch itself. Their outcome must not
+// vanish silently: keep id, state and the head of the result (or error) as one line
+// each. Tolerates snapshots ({tag, state, result, error, title}) and plain strings.
+function normAgents(agents) {
+  if (!Array.isArray(agents)) return [];
+  const out = [];
+  for (const a of agents) {
+    if (!a || typeof a !== 'object') continue;
+    const tag = oneLine(a.tag ?? a.id, 60);
+    if (!tag) continue;
+    const state = oneLine(a.state, 40) || 'done';
+    const title = oneLine(a.title, MAX_ITEM_CHARS);
+    const head = oneLine(a.result || a.error || a.text, MAX_AGENT_HEAD);
+    out.push({tag, state, title, head});
+    if (out.length >= MAX_AGENTS) break;
+  }
+  return out;
+}
+
 function buildHandoff(input) {
-  const {fromLabel, toLabel, cwd, sessionTitle, turns, todos, focus, gitLines, recordPath} = input || {};
+  const {fromLabel, toLabel, cwd, sessionTitle, turns, todos, focus, gitLines, recordPath, agents} = input || {};
   const from = oneLine(fromLabel, 100), to = oneLine(toLabel, 100);
   const head = from && to
     ? 'これは前のアカウント（' + from + '）から新しいアカウント（' + to + '）への引き継ぎメモです。ここまでの作業を、このアカウントで続けてください。'
@@ -165,6 +217,13 @@ function buildHandoff(input) {
     if (git.length > MAX_GIT_LINES) lines.push('… ほか ' + (git.length - MAX_GIT_LINES) + ' 件');
     blocks.push(lines.join('\n'));
   }
+  const agentList = normAgents(agents);
+  if (agentList.length) {
+    const lines = ['■ 終わったサブエージェント（未回収）', ...agentList.map(a => '- ' + a.tag + ' [' + a.state + ']' + (a.title ? ' ' + a.title : '') + (a.head ? ': ' + a.head : ''))];
+    const given = Array.isArray(agents) ? agents.filter(a => a && typeof a === 'object' && oneLine(a.tag ?? a.id, 60)).length : 0;
+    if (given > agentList.length) lines.push('… ほか ' + (given - agentList.length) + ' 件');
+    blocks.push(lines.join('\n'));
+  }
   // A pointer to the full transcript, not the transcript itself: the new account's Muse
   // runs on this same PC and can read the file, so it pays only for the parts it actually
   // needs instead of burning its fresh allowance on the whole history up front. It sits in
@@ -189,14 +248,14 @@ function buildHandoff(input) {
   };
   for (let keep = recent.length; keep >= 0; keep--) {
     const note = assemble(blocks, keep);
-    if (note.length <= MAX_TOTAL) return note;
+    if (cpLength(note) <= MAX_TOTAL) return note;
     if (!keep) {
       const kept = [...blocks];
-      while (kept.length > 1 && assemble(kept, 0).length > MAX_TOTAL) kept.pop();
+      while (kept.length > 1 && cpLength(assemble(kept, 0)) > MAX_TOTAL) kept.pop();
       const trimmed = assemble(kept, 0);
-      if (trimmed.length <= MAX_TOTAL) return trimmed;
+      if (cpLength(trimmed) <= MAX_TOTAL) return trimmed;
       if (recordBlock) {
-        const room = MAX_TOTAL - recordBlock.length - 2;
+        const room = MAX_TOTAL - cpLength(recordBlock) - 2;
         return (room > 0 ? safeCut(kept.join('\n\n'), Math.max(0, room - 1)) + '…' : '') + '\n\n' + safeCut(recordBlock, MAX_TOTAL);
       }
       return safeCut(trimmed, MAX_TOTAL - 1) + '…';

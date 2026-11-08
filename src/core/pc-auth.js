@@ -4,7 +4,41 @@ const {t}=require('../i18n');
 
 const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
 const isToken = v => typeof v === 'string' && !!v;
+// Two device copies are the same pair when they carry the same tokens. Compared by content:
+// the disk copy is a fresh object on every read, so an identity check (`!==`) always said
+// "another window saved a different pair" and start() could never drop a dead pair — after
+// the device was unlinked on muse.ai, muser re-asked the e-mail forever with "この PC は認証済み
+// です。" (Discord report, 2026-11-06).
+const samePair = (a, b) => isObj(a) && isObj(b) && a.access_token === b.access_token && a.refresh_token === b.refresh_token;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// OTP / 2FA codes are 6-digit numbers. A code in any other shape used to be
+// sent to the server as-is, where the rejection burned one of the caller's
+// few tries (audit wave 8 B: '12', 'abcdef', '12345678', fullwidth digits and
+// the empty string all reached confirm_otp). Normalize what is merely a
+// typing variant — fullwidth digits become halfwidth, spaces and hyphens
+// (common when copying a code) are dropped — and return null for anything
+// that is not exactly 6 digits, so callers can reject it locally, in words,
+// without spending a server try.
+const OTP_DIGITS = 6;
+function normalizeOtpCode(value) {
+  if (typeof value !== 'string') return null;
+  const half = value.replace(/[０-９]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xfee0)).replace(/[\s\-]+/g, '');
+  return new RegExp('^\\d{' + OTP_DIGITS + '}$').test(half) ? half : null;
+}
+// The local format rejection: marked `codeFormat` so pc-login can tell it
+// apart from a server wrong-code answer (which does spend a try).
+function otpFormatError() {
+  return Object.assign(new Error(t('認証コードは6桁の数字で入力してください。')), {codeFormat: true});
+}
+// An expired code is dead, not wrong: the server says so in its message
+// ('code expired' / 期限切れ). Callers point the user at resend for it
+// instead of asking them to re-enter the same code (audit wave 8 B).
+function isOtpExpiredError(e) {
+  if (!e) return false;
+  if (e.otpExpired || e.code === 'otp_expired') return true;
+  const msg = typeof e.message === 'string' ? e.message : '';
+  return /expir/i.test(msg) || msg.includes('期限切れ') || msg.includes('有効期限が切れ');
+}
 // Interval checks (the vm cache, the refresh suppression) use a monotonic clock
 // (c29 #6): with Date.now() a clock rollback made the age negative-or-small and
 // stretched a 60 s window by the whole rollback, serving an expired VM/token far
@@ -13,9 +47,24 @@ const monoNow = () => performance.now();
 const fresh = (at, ms) => { if (typeof at !== 'number') return false; const age = monoNow() - at; return age >= 0 && age < ms; };
 // Native authentication and device credentials are distinct from the website cookie.
 // Wire schemas: https://github.com/chaitanyarahalkar/muse-desktop-bridge/blob/main/docs/protocol.md
+// An sdkIssuePending flag is a crash guard, not a life sentence (audit-cli
+// wave 9, W1-26): it is stamped when set (sdkIssuePendingAt), and a flag that
+// is older than this AND already has its token saved next to it is a leftover
+// of a finished issue whose clearing save never landed — start() clears it
+// and proceeds instead of wedging every later login on it.
+const SDK_ISSUE_PENDING_STALE_MS = 10 * 60 * 1000;
+// The stamp may be epoch milliseconds, epoch seconds (the device pair's
+// access_token_saved_at convention) or an ISO string; a flag written before
+// stamps existed has none of them and reports null.
+function pendingStampMs(saved) {
+  const raw = saved?.sdkIssuePendingAt ?? (typeof saved?.sdkIssuePending === 'number' ? saved.sdkIssuePending : undefined) ?? saved?.sdkPendingAt;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw < 1e12 ? raw * 1000 : raw;
+  if (typeof raw === 'string' && raw) { const p = Date.parse(raw); if (!Number.isNaN(p)) return p; }
+  return null;
+}
 class PcAuth {
-  constructor({load,save,request,listSdk,issueSdk,expectedVm}) {
-    this.load=typeof load==='function'?load:null;this.saved=load()||{};this.save=save;this.request=request;this.listSdk=listSdk;this.issueSdk=issueSdk;this.expectedVm=expectedVm;
+  constructor({load,save,request,listSdk,issueSdk,expectedVm,deviceFile}) {
+    this.load=typeof load==='function'?load:null;this.saved=load()||{};this.save=save;this.request=request;this.listSdk=listSdk;this.issueSdk=issueSdk;this.expectedVm=expectedVm;this.deviceFile=typeof deviceFile==='string'&&deviceFile?deviceFile:null;
     this.phase=this.saved.device?'authenticated':this.saved.sdkToken?'contact':'start';
     this.login=null;this.pending=null;this.message='';this.active=false;this.generation=0;
   }
@@ -33,9 +82,15 @@ class PcAuth {
     // Re-read the disk state for EVERY persist, not only device updates (audit #194):
     // a whole-snapshot save from a stale window (a nodeId or sdkIssuePending persist)
     // used to overwrite a newer device pair another window had saved meanwhile.
+    // The layering is: this window's memory first, then the fresh disk state, then
+    // the caller's update — the disk wins over stale memory for EVERY key, not only
+    // the device pair (master-debug #13: a stale persist used to roll back another
+    // window's newer sdkToken / sdkTokenId and clear its sdkIssuePending). A key the
+    // disk does not hold still survives from memory (audit #195's failed-save case),
+    // and the device pair is refined by the stamp comparison below.
     let disk=null; try{disk=this.load?.()||null;}catch{}
     const fresh=isObj(disk)?disk:{};
-    const next={...fresh,...this.saved,...update};
+    const next={...this.saved,...fresh,...update};
     // For the device pair the newest copy wins, whichever side holds it: a pair is
     // stamped when saved, so compare stamps instead of blindly layering the stale
     // in-memory copy over a fresher one from disk (or vice versa).
@@ -56,7 +111,7 @@ class PcAuth {
       next.device={...(olderDev||{}),...(newestDev||{}),...update.device};
     } else if(newestDev&&(update===undefined||!('device' in (update||{})))){
       next.device=newestDev;
-    } else if(update&&'device' in update&&update.device===undefined&&newestDev&&newestDev===diskDev&&diskDev!==knownDev){
+    } else if(update&&'device' in update&&update.device===undefined&&newestDev&&newestDev===diskDev&&!samePair(diskDev,knownDev)){
       // An explicit pair deletion (start() dropping a dead pair) must not erase
       // a DIFFERENT pair another window has since saved to disk (c29 #4): this
       // window proved only its own pair dead. The delete is honoured when the
@@ -82,8 +137,28 @@ class PcAuth {
     finally {this.active=false;if(this.abortCtrl===ctrl)this.abortCtrl=null;if(generation!==this.generation)this.cancel();}
   }
   signal() {return this.abortCtrl?.signal;}
+  // True when the pending flag may be dropped: it is older than the stale
+  // window, or it carries no stamp at all (written before stamps existed) —
+  // in that case a token saved beside it is the only evidence available, and
+  // it proves the issue finished, because no issue runs in this process yet.
+  pendingStale() {
+    if(!this.saved.sdkIssuePending)return false;
+    const at=pendingStampMs(this.saved);
+    if(at!==null)return Date.now()-at>SDK_ISSUE_PENDING_STALE_MS;
+    return !!this.saved.sdkToken;
+  }
+  // The blocked-pending error: name the manual way out (audit-cli wave 9).
+  // Without it the old text was a dead end — it sent the user to the token
+  // page, but every retry hit this same check and nothing ever cleared it.
+  pendingError() {
+    return new Error(t('前回のトークン発行結果を確認できません。手動で回復するには、保存ファイル {file} を削除してから、もう一度実行してください。発行済みかどうか分からない場合は、先に SDK トークンのページで発行状況を確認してください。自動で再発行はしません。',{file:this.deviceFile||'device.enc'}));
+  }
   async start(acceptTerms=false) {
     return this.action(async check=>{
+      // A stale pending flag beside an already-saved SDK token is cleared,
+      // not obeyed (wave 9): the token is the finished issue's result, so
+      // there is nothing left to confirm and the flow proceeds with it.
+      if(this.saved.sdkIssuePending&&this.saved.sdkToken&&this.pendingStale()){this.persist({sdkIssuePending:false,sdkIssuePendingAt:undefined});check();}
       if(this.saved.device){
         try{await this.vm();check();this.phase='authenticated';this.message=t('PC 端末の認証は完了しています。');return;}
         catch(e){
@@ -108,15 +183,15 @@ class PcAuth {
       }
       if(!this.saved.sdkToken){
         if(acceptTerms!==true)throw new Error(t('SDK トークンの利用規約を確認してください。'));
-        if(this.saved.sdkIssuePending)throw new Error(t('前回のトークン発行結果を確認できません。SDK トークンのページで発行状況を確認してください。自動で再発行はしません。'));
+        if(this.saved.sdkIssuePending)throw this.pendingError();
         const list=await this.listSdk(this.signal());check();
         if(!isObj(list)||!Array.isArray(list.tokens)||!Number.isSafeInteger(list.maxActiveTokens))throw new Error(t('SDK トークンの発行状況を確認できません。'));
         if(list.tokens.length>=list.maxActiveTokens)throw new Error(t('SDK トークンの発行上限です。既存のトークンは変更していません。'));
-        this.persist({sdkIssuePending:true});
+        this.persist({sdkIssuePending:true,sdkIssuePendingAt:Date.now()});
         // Persist an issued token even if the user closes the dialog during this request.
         const issued=await this.issueSdk(this.signal());
         if(!isObj(issued)||typeof issued.token!=='string'||!issued.token.startsWith('mgst_'))throw new Error(t('SDK トークンの発行結果を確認できません。'));
-        this.persist({sdkToken:issued.token,sdkTokenId:issued.sdkToken?.id,sdkIssuePending:false});check();
+        this.persist({sdkToken:issued.token,sdkTokenId:issued.sdkToken?.id,sdkIssuePending:false,sdkIssuePendingAt:undefined});check();
       }
       if(!this.saved.nodeId)this.persist({nodeId:'homelink-'+crypto.randomBytes(3).toString('hex')});
       this.phase='contact';this.message=t('Muse で使っているメールアドレスまたは電話番号を入力してください。');
@@ -149,14 +224,16 @@ class PcAuth {
     });
   }
   async confirm(code) {
-    this.code(code);
+    const normalized=this.code(code);
     return this.action(async check=>{
       if(!this.login?.authState||this.phase!=='code')throw new Error(t('先に認証コードを送信してください。'));
-      const result=await this.auth('confirm_otp',{auth_state:this.login.authState,otp_code:code.trim(),supports_account_selection:true});check();
+      const result=await this.auth('confirm_otp',{auth_state:this.login.authState,otp_code:normalized,supports_account_selection:true});check();
       await this.accept(result,check);
     });
   }
-  code(value) {if(typeof value!=='string'||!value.trim()||value.length>128)throw new Error(t('認証コードを入力してください。'));}
+  // Validates AND normalizes: returns the 6-digit code to send, or throws the
+  // marked format error before any request is made (audit wave 8 B).
+  code(value) {const normalized=normalizeOtpCode(value);if(normalized===null)throw otpFormatError();return normalized;}
   choice(list,index) {if(!Number.isSafeInteger(index)||index<0||index>=list?.length)throw new Error(t('表示された認証項目を選択してください。'));return list[index];}
   async select(index) {
     return this.action(async check=>{
@@ -167,13 +244,13 @@ class PcAuth {
     });
   }
   async twoFactor(index,code) {
-    if(code!==undefined)this.code(code);
+    if(code!==undefined)code=this.code(code);
     return this.action(async check=>{
       if(this.phase!=='two_factor'||!this.pending?.two_factor_state)throw new Error(t('追加認証を最初から開始してください。'));
       const method=this.choice(this.pending.two_factor_methods,index);
-      if(!isObj(method))throw new Error(t('追加認証の方法を確認できません。'));
+      if(!isObj(method)||!isToken(method.method_id))throw new Error(t('追加認証の方法を確認できません。'));
       if(code===undefined&&/^(?:TOTP|AUTHENTICATOR)$/i.test(method.method_type||method.method_id||'')){this.message=t('認証アプリに表示されたコードを入力してください。');return;}
-      const result=await this.auth(code===undefined?'two_factor/send_code':'two_factor',{two_factor_state:this.pending.two_factor_state,method_id:method.method_id,...code!==undefined?{code:code.trim()}:{}});check();
+      const result=await this.auth(code===undefined?'two_factor/send_code':'two_factor',{two_factor_state:this.pending.two_factor_state,method_id:method.method_id,...code!==undefined?{code}:{}});check();
       if(code===undefined)this.message=t('追加認証コードを送信しました。');else await this.accept(result,check);
     });
   }
@@ -322,4 +399,4 @@ class PcAuth {
   }
   cancel() {this.generation++;this.abortCtrl?.abort();this.login=null;this.pending=null;this.checkpointUrl=undefined;this.phase=this.saved.device?'authenticated':this.saved.sdkToken?'contact':'start';this.message='';return this.snapshot();}
 }
-module.exports={PcAuth};
+module.exports={PcAuth,normalizeOtpCode,isOtpExpiredError,OTP_DIGITS,SDK_ISSUE_PENDING_STALE_MS};

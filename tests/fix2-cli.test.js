@@ -80,7 +80,12 @@ test('fix2-cli c2-3: exec --status --json with no run prints JSON, exit 5', () =
   const v = JSON.parse(r.stdout); // throws (failing the test) on the old plain text
   assert.equal(v.state, 'gone'); assert.equal(v.ok, false);
   const plain = runBin(['exec', '--status']);
-  assert.equal(plain.status, 5); assert.match(plain.stdout, /gone · no status file/);
+  // Wave 7 spec update (Japanese environment): bin words the no-file line
+  // through t() now — 'gone · 状態ファイルがありません（… 内）' — instead of
+  // the fixed English 'gone · no status file …' this used to match. (The
+  // 'gone ·' state word itself stays; the English form still appears under
+  // MUSER_LANG=en, as tests/exec-status.test.js pins.)
+  assert.equal(plain.status, 5); assert.match(plain.stdout, /gone · 状態ファイルがありません/);
   // A readable file still returns the status object itself, exit = its own code.
   const dirs = scratch();
   const file = path.join(dirs.data, 'run.json');
@@ -114,11 +119,11 @@ test('fix2-cli c3-2: exec refuses a stdin prompt over the cap', () => {
 });
 
 // --- deep c3 #4 + fourth M24: resume list strips terminal escapes; one empty wording
-test('fix2-cli c3-4/M24: resume list sanitizes titles and names the way forward when empty', () => {
+test('fix2-cli c3-4/M24: resume list sanitizes titles and says so when empty', () => {
   const dirs = scratch();
   const empty = runBin(['resume'], {dirs});
   assert.equal(empty.status, 0);
-  assert.match(empty.stdout, /再開できる会話はありません。新しい会話は `muser` を引数なしで実行すると始められます。/);
+  assert.match(empty.stdout, /再開できる会話はありません。/);
   const dir = path.join(dirs.data, 'muser');
   fs.mkdirSync(dir, {recursive: true});
   fs.writeFileSync(path.join(dir, 'sessions.json'), JSON.stringify([

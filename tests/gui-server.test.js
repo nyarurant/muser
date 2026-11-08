@@ -317,6 +317,16 @@ test('POST /api/approval resolves the pending ask with the TUI values; 409 when 
   assert.equal((await call(server, 'POST', '/api/approval', {headers: AUTH, body: {decision: {yes: true}}})).status, 400);
 });
 
+test('snapshot approval carries loreGrave and the call tellClaim (integrate-1108 seam)', async t => {
+  const {server, controller} = makeServer(t);
+  await server.start();
+  const grave = {path: 'src/x.js', how: 'deleted', score: 0.9};
+  controller.set({approval: {call: {command: 'code.write', agent: 'main', tellClaim: {name: 'peer-a', file: 'src/x.js', pid: 42}}, preview: null, index: 0, outside: false, loreGrave: grave, options: [{label: 'はい', allow: true}], resolve: () => {}}});
+  const snap = await (await call(server, 'GET', '/api/state', {headers: AUTH})).json();
+  assert.deepEqual(snap.approval.loreGrave, grave);
+  assert.equal(snap.approval.call.tellClaim.name, 'peer-a');
+});
+
 test('POST /api/approval translates always:true to the pending option (key or auto-edit)', async t => {
   const {server, controller, agent} = makeServer(t);
   await server.start();
@@ -394,6 +404,110 @@ test('GET /api/complete?kind=file returns the cached @ candidates', async t => {
   assert.deepEqual(items, [{text: 'alpha.txt'}, {text: 'alpine.md'}]);
   const one = await (await call(server, 'GET', '/api/complete?kind=file&q=beta', {headers: AUTH})).json();
   assert.deepEqual(one.items, [{text: 'beta.txt'}]);
+});
+
+test('GET /api/complete?kind=agent|skill|instructions answers the pickers a phone cannot read from the PC', async t => {
+  const {server, agent} = makeServer(t);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-gui-pick-'));
+  t.after(() => fs.rmSync(dir, {recursive: true, force: true}));
+  agent.cwd = dir;
+  agent.types = () => ({general: {description: 'any', readOnly: false}, explore: {description: 'read', readOnly: true}, review: {description: 'rev', readOnly: true}});
+  await server.start();
+  assert.equal((await call(server, 'GET', '/api/complete?kind=agent&q=')).status, 401, 'pickers keep the Bearer auth');
+  const types = await (await call(server, 'GET', '/api/complete?kind=agent&q=', {headers: AUTH})).json();
+  assert.deepEqual(types.items.map(i => i.text), ['general', 'explore', 'review']);
+  assert.deepEqual(types.items[1], {text: 'explore', desc: 'read', readOnly: true});
+  const ex = await (await call(server, 'GET', '/api/complete?kind=agent&q=ex', {headers: AUTH})).json();
+  assert.deepEqual(ex.items.map(i => i.text), ['explore']);
+  // No instruction file yet, then AGENTS.md written.
+  assert.deepEqual((await (await call(server, 'GET', '/api/complete?kind=instructions', {headers: AUTH})).json()).items, []);
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), '# x');
+  assert.deepEqual((await (await call(server, 'GET', '/api/complete?kind=instructions', {headers: AUTH})).json()).items, [{text: 'AGENTS.md'}]);
+  const sk = await call(server, 'GET', '/api/complete?kind=skill&q=', {headers: AUTH});
+  assert.equal(sk.status, 200);
+  assert.ok(Array.isArray((await sk.json()).items));
+});
+
+// app-ui: the account registry routes the phone uses (the GUI runs the CLI for these).
+function fakeAccountsAdmin() {
+  const reg = {list: [{id: 'default', label: 'main'}, {id: 'sub', label: 'sub'}, {id: 'gone', label: 'old'}], active: 'default', auto: true};
+  const accounts = {
+    DEFAULT_ID: 'default',
+    list: () => reg.list.map(a => ({...a})),
+    get: id => reg.list.find(a => a.id === id) || null,
+    activeId: () => reg.active,
+    setActive: id => { reg.active = id; },
+    rename: (id, label) => { if (reg.list.some(a => a.id !== id && a.label === label)) throw new Error('exists'); reg.list.find(a => a.id === id).label = label; },
+    remove: id => { reg.list = reg.list.filter(a => a.id !== id); return {leftover: null}; },
+    threshold: () => 90,
+  };
+  const pool = {
+    autoEnabled: () => reg.auto,
+    statuses: async () => reg.list.map(a => ({id: a.id, label: a.label, hasLogin: a.id !== 'gone', device: a.id === 'default', available: a.id === 'default', vm: a.id === 'gone' ? null : 'vm1',
+      percentUsed: a.id === 'default' ? 42 : null, quotaStatus: null, plan: a.id === 'default' ? {plan: 'Pro', percentUsed: 42, resetsAt: 1700000000000} : null})),
+  };
+  return {reg, admin: {accounts, pool, setAuto: on => { reg.auto = on; }}};
+}
+
+test('/api/accounts lists, sets the default, toggles auto, renames and removes (not in use, not the first)', async t => {
+  const agent = new FakeAgent(), controller = new FakeController(agent);
+  agent.accountId = 'sub';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-gui-acct-'));
+  const {reg, admin} = fakeAccountsAdmin();
+  const server = new GuiServer({controller, agent, token: 'test-token', port: 0, discoveryFile: path.join(dir, 'gui.json'), accountsAdmin: admin});
+  t.after(async () => { await server.close(); fs.rmSync(dir, {recursive: true, force: true}); });
+  await server.start();
+  assert.equal((await call(server, 'GET', '/api/accounts')).status, 401, 'accounts keep the Bearer auth');
+  const list = await (await call(server, 'GET', '/api/accounts', {headers: AUTH})).json();
+  assert.equal(list.auto, true);
+  assert.equal(list.defaultId, 'default');
+  assert.equal(list.threshold, 90);
+  assert.deepEqual(list.accounts.map(a => [a.id, a.isDefault, a.inUse, a.available, a.removable]), [['default', true, false, true, false], ['sub', false, true, false, true], ['gone', false, false, false, true]]);
+  assert.equal(list.accounts[0].percentUsed, 42);
+  assert.equal(list.accounts[0].planName, 'Pro');
+  assert.equal(list.accounts[0].sharedMuse, true, 'two logins on one VM share one allowance');
+  assert.equal(list.accounts[2].sharedMuse, false);
+  assert.equal((await call(server, 'POST', '/api/accounts/default', {headers: AUTH, body: {id: 'sub'}})).status, 200);
+  assert.equal(reg.active, 'sub');
+  assert.equal((await call(server, 'POST', '/api/accounts/default', {headers: AUTH, body: {id: 'nope'}})).status, 404);
+  assert.equal((await call(server, 'POST', '/api/accounts/auto', {headers: AUTH, body: {on: 'yes'}})).status, 400);
+  assert.equal((await call(server, 'POST', '/api/accounts/auto', {headers: AUTH, body: {on: false}})).status, 200);
+  assert.equal(reg.auto, false);
+  assert.equal((await call(server, 'POST', '/api/accounts/rename', {headers: AUTH, body: {id: 'gone', label: 'main'}})).status, 400, 'a duplicate name is refused');
+  assert.equal((await call(server, 'POST', '/api/accounts/rename', {headers: AUTH, body: {id: 'gone', label: 'spare'}})).status, 200);
+  assert.equal(reg.list.find(a => a.id === 'gone').label, 'spare');
+  assert.equal((await call(server, 'POST', '/api/accounts/remove', {headers: AUTH, body: {id: 'default'}})).status, 400, 'the first account stays');
+  assert.equal((await call(server, 'POST', '/api/accounts/remove', {headers: AUTH, body: {id: 'sub'}})).status, 409, 'an account a conversation uses stays');
+  assert.equal((await call(server, 'POST', '/api/accounts/remove', {headers: AUTH, body: {id: 'gone'}})).status, 200);
+  assert.deepEqual(reg.list.map(a => a.id), ['default', 'sub']);
+});
+
+test('POST /api/account switches or adds; state.prompt / addFlow carry the add flow and /api/prompt answers it', async t => {
+  const {server, controller} = makeServer(t);
+  const calls = [];
+  controller.accountCommand = async arg => { calls.push(['switch', arg]); };
+  controller.addAccountFlow = async label => { calls.push(['add', label]); };
+  let answered = null, cancelled = false;
+  controller.submitPrompt = v => { answered = v; };
+  controller.cancelPrompt = () => { cancelled = true; };
+  await server.start();
+  assert.equal((await call(server, 'POST', '/api/account', {headers: AUTH, body: {}})).status, 400);
+  assert.equal((await call(server, 'POST', '/api/account', {headers: AUTH, body: {id: 'sub'}})).status, 202);
+  assert.equal((await call(server, 'POST', '/api/account', {headers: AUTH, body: {add: ' work '}})).status, 202);
+  assert.deepEqual(calls, [['switch', 'sub'], ['add', 'work']]);
+  // No question waiting: the prompt route refuses.
+  assert.equal((await call(server, 'POST', '/api/prompt', {headers: AUTH, body: {value: 'x'}})).status, 409);
+  const st = controller.store?.s || controller.s;
+  st.promptFor = {message: '認証コード', resolve() {}, reject() {}};
+  st.addFlow = {lines: ['Edge でログインしてください'], busy: '登録しています'};
+  const snap = await (await call(server, 'GET', '/api/state', {headers: AUTH})).json();
+  assert.deepEqual(snap.prompt, {message: '認証コード'});
+  assert.deepEqual(snap.addFlow, {lines: ['Edge でログインしてください'], busy: '登録しています'});
+  assert.equal((await call(server, 'POST', '/api/prompt', {headers: AUTH, body: {value: 7}})).status, 400);
+  assert.equal((await call(server, 'POST', '/api/prompt', {headers: AUTH, body: {value: '123456'}})).status, 200);
+  assert.equal(answered, '123456');
+  assert.equal((await call(server, 'POST', '/api/prompt', {headers: AUTH, body: {cancel: true}})).status, 200);
+  assert.equal(cancelled, true);
 });
 
 test('POST /api/mode sets a TUI mode name and 400s anything else', async t => {
@@ -1020,7 +1134,10 @@ test('audit #65 (gui-server side): start() does not overwrite a live other serve
   // and only a server that answers /api/server with the file's own pid owns
   // the file. A bare sleeper process on a dead port is indistinguishable from
   // a reused pid and its file is (correctly) treated as stale now.
-  const childScript = "const http = require('http'); const s = http.createServer((req, res) => { res.writeHead(200, {'content-type': 'application/json'}); res.end(JSON.stringify({pid: process.pid})); }); s.listen(0, '127.0.0.1', () => console.log(s.address().port)); setTimeout(() => {}, 30000);";
+  // The fixture prints its port as a STRING on purpose: under FORCE_COLOR
+  // (which npm sets for scripts run in a terminal) console.log(number) wraps
+  // the port in ANSI colour and the reader below never matches it.
+  const childScript = "const http = require('http'); const s = http.createServer((req, res) => { res.writeHead(200, {'content-type': 'application/json'}); res.end(JSON.stringify({pid: process.pid})); }); s.listen(0, '127.0.0.1', () => console.log(String(s.address().port))); setTimeout(() => {}, 30000);";
   const child = spawn(process.execPath, ['-e', childScript], {stdio: ['ignore', 'pipe', 'pipe']});
   t.after(() => { try { child.kill(); } catch {} });
   const foreignPort = await new Promise((res, rej) => {
@@ -1050,4 +1167,47 @@ test('audit #65 (gui-server side): start() does not overwrite a live other serve
   const written = JSON.parse(fs.readFileSync(guiFile, 'utf8'));
   assert.equal(written.token, 'test-token', 'once the other pid is dead the file is stale and a start writes its own');
   assert.equal(written.pid, process.pid);
+});
+
+// app-md: GET /api/image serves one image from inside the conversation's
+// working folder, and nothing else.
+test('image route: workspace images only, sensitive and oversize refused', async t => {
+  const {agent, server} = makeServer(t);
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-gui-img-'));
+  t.after(() => fs.rmSync(work, {recursive: true, force: true}));
+  agent.cwd = work;
+  const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+  fs.writeFileSync(path.join(work, 'shot.png'), PNG);
+  fs.mkdirSync(path.join(work, 'sub'));
+  fs.writeFileSync(path.join(work, 'sub', 'pic.jpg'), Buffer.from([0xff, 0xd8, 0xff, 0xe0, 9]));
+  fs.writeFileSync(path.join(work, 'fake.png'), Buffer.from('not a png at all'));
+  fs.writeFileSync(path.join(work, '.env.png'), PNG); // sensitive basename with an image extension
+  fs.writeFileSync(path.join(work, 'big.png'), Buffer.concat([PNG, Buffer.alloc(8 * 1024 * 1024)]));
+  // app-debug #5: a file whose NAME starts with '..' but lives inside.
+  fs.writeFileSync(path.join(work, '..dots.png'), PNG);
+  // app-debug #6: a hardlink inside the folder pointing at a file outside it.
+  const outsidePng = path.join(path.dirname(work), 'outside-hard.png');
+  fs.writeFileSync(outsidePng, PNG);
+  t.after(() => fs.rmSync(outsidePng, {force: true}));
+  fs.linkSync(outsidePng, path.join(work, 'hard.png'));
+  await server.start();
+  const get = p => call(server, 'GET', '/api/image?path=' + encodeURIComponent(p), {headers: AUTH});
+  const ok = await get('shot.png');
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get('content-type'), 'image/png');
+  assert.deepEqual(Buffer.from(await ok.arrayBuffer()), PNG);
+  const nested = await get('sub/pic.jpg');
+  assert.equal(nested.status, 200);
+  const abs = await get(path.join(work, 'shot.png'));
+  assert.equal(abs.status, 200, 'an absolute path inside the folder also serves');
+  assert.equal((await get('../outside.png')).status, 404, 'outside the folder is not served');
+  assert.equal((await get(path.join(path.dirname(work), 'outside.png'))).status, 404);
+  assert.equal((await get('.env.png')).status, 403, 'sensitive paths are refused');
+  assert.equal((await get('fake.png')).status, 400, 'magic bytes must match the extension');
+  assert.equal((await get('big.png')).status, 413, 'over the 8 MB cap');
+  assert.equal((await get('missing.png')).status, 404);
+  assert.equal((await get('..dots.png')).status, 200, 'app-debug #5: a name starting with .. inside the folder serves');
+  assert.equal((await get('hard.png')).status, 404, 'app-debug #6: a hardlink to outside the folder is not served');
+  assert.equal((await get('notes.txt')).status, 400, 'non-image extensions are refused');
+  assert.equal((await call(server, 'GET', '/api/image', {headers: AUTH})).status, 400, 'path is required');
 });

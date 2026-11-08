@@ -138,11 +138,14 @@ test('turn-end usage lands in lastTurn and in the muser status detail line; noth
   agent.emit('turn-end', {ok: true, ms: 12000, usage: {inputTokens: 130841, outputTokens: 395, source: 'provider', formatted: '130.8k in / 395 out'}});
   w.write();
   const v = read();
-  assert.equal(v.lastTurn.usage.formatted, '130.8k in / 395 out');
+  assert.equal(v.lastTurn.usage.formatted, '130.8k in / 395 out', 'the window file keeps the event\'s formatted text verbatim — only the detail line below re-formats it');
   assert.equal(v.lastTurn.usage.source, 'provider');
   const now = Date.parse(v.lastTurn.endedAt) + 60000;
   const detail = status.formatDetail({kind: 'window', item: v}, now).join('\n');
-  assert.match(detail, /前のターン: 完了.*130\.8k in \/ 395 out/);
+  // Wave 7 spec update: the detail line re-formats from the numbers via
+  // usageText/formatUsage, so its in/out words are the UI language's
+  // （入 / 出） now, not the stored English text asserted above.
+  assert.match(detail, /前のターン: 完了.*130\.8k 入 \/ 395 出/);
   agent.emit('turn-end', {ok: true, ms: 1000});
   w.write();
   assert.equal(read().lastTurn.usage, undefined, 'no usage on the next turn, no stale numbers');

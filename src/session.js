@@ -14,13 +14,35 @@ const PINS = store.file('gateway-pins.json');
 // (deep audit c18 #15).
 function asPins(v) { return v && typeof v === 'object' && !Array.isArray(v) ? v : {}; }
 
+// muse.ai suspends an idle VM; the gateway then answers 502 until something wakes it.
+// The page does it with POST /api/hatch/vm/wake {vm_id, retry_count}; do the same and wait
+// for RUNNING (UPDATING is waited out without a wake). True when the VM came up.
+const WAKE_WAIT_MS = 60000, WAKE_POLL_MS = 3000;
+async function wakeVm(web, {waitMs = WAKE_WAIT_MS, pollMs = WAKE_POLL_MS, sleep = ms => new Promise(r => setTimeout(r, ms))} = {}) {
+  if (!web || typeof web.fetchJson !== 'function') return false;
+  const read = async () => { try { return await web.fetchJson('/api/session?vm_state=true'); } catch { return null; } };
+  let s = await read();
+  if (!s || !s.vm_id) return false;
+  if (s.vm_state === 'RUNNING') return true;
+  if (s.vm_state === 'SUSPENDED') {
+    if (typeof web.postJson !== 'function') return false;
+    try { await web.postJson('/api/hatch/vm/wake', {vm_id: s.vm_id, retry_count: 0}); } catch { return false; }
+  } else if (s.vm_state !== 'UPDATING') return false;
+  for (let waited = 0; waited < waitMs; waited += pollMs) {
+    await sleep(pollMs);
+    s = await read();
+    if (s && s.vm_state === 'RUNNING') return true;
+  }
+  return false;
+}
+
 // The client, not yet connected: the TUI is drawn first and connects behind it.
 // file: the store name of this account's gateway credentials (src/accounts.js).
 function createChat(web, {file = 'session.enc'} = {}) {
   let pins = {};
   try { pins = asPins(JSON.parse(fs.readFileSync(PINS, 'utf8'))); } catch {}
   const client = new MuseClient({
-    credentials: store.load(file), fetchJson: web.fetchJson, requireLogin: true,
+    credentials: store.load(file), fetchJson: web.fetchJson, requireLogin: true, wakeVm: () => wakeVm(web),
     locale: Intl.DateTimeFormat().resolvedOptions().locale,
     // The VM key changes whenever the VM restarts (the pin file was rewritten twice on
     // 2026-10-31 alone) and the web client trusts the authenticated gateway, so a change is
@@ -47,4 +69,4 @@ async function connectChat(web, opts) {
   return client;
 }
 
-module.exports = {connectChat, createChat};
+module.exports = {connectChat, createChat, wakeVm};

@@ -84,7 +84,7 @@ test('read-only MCP tools are not changes; others still are', () => {
   const q = new Focus('Find an item'); q.beginRound();
   for (let i = 0; i < 3; i++) q.observe({command: 'mcp.booth.search', kind: 'mcp', mcp: {readOnly: true}, summary: 'search'}, {ok: true, payload: {}});
   assert.equal(q.endRound().status, 'inactive');
-  const w = new Focus('Buy it'); w.beginRound();
+  const w = new Focus('Buy it'); w.beginRound(); w.plan([{text: 'Works', kind: 'inspection'}]);
   const proof = w.observe(run('npm test'), exit(0));
   w.observe({command: 'mcp.booth.cart', kind: 'mcp', mcp: {readOnly: false}, summary: 'cart'}, {ok: true, payload: {}});
   assert.equal(w.endRound().continue, true);
@@ -281,4 +281,42 @@ test('controller: /focus off drops the unfinished task so a later message does n
   ctrl.slash('/focus off');
   assert.equal(agent.resumeFocus, null);
   ctrl.slash('/focus on');
+});
+
+// ---------- 2026-11-06: "keep finding until I say OK" parked after every leg ----------
+// The overnight muser-gui task: only a manual "the user checks it all" criterion was
+// left, so each leg the user reopened ("私がいいよって言うまで見つけて") stopped as
+// needs_input after one round, though Muse itself said it would keep going.
+
+test('append=true adds a requirement without repeating the existing criteria', () => {
+  const f = new Focus('Fix the GUI'); f.beginRound(); f.observe(edit('a.cs'), {ok: true});
+  f.plan([{text: 'Batch 1 fixed', kind: 'inspection'}, {text: 'User checks it on the device', kind: 'manual'}]);
+  const r = f.observe(read('a.cs'), {ok: true});
+  f.checkpoint([met('c1', [r]), {id: 'c2', status: 'unknown', reason: 'user'}]);
+  assert.equal(f.endRound().status, 'needs_input');
+  f.resumeLeg('私がいいよって言うまで見つけて'); f.beginRound();
+  assert.match(f.resumeNote(), /append=true/);
+  f.plan([{text: 'Keep finding issues until the user says OK', kind: 'inspection'}], {append: true});
+  assert.deepEqual(f.criteria.map(c => c.id + ' ' + c.status), ['c1 met', 'c2 unknown', 'c3 pending']);
+  const r2 = f.observe(read('b.cs'), {ok: true});
+  f.checkpoint([met('c1', [r2]), {id: 'c2', status: 'unknown', reason: 'user'}, {id: 'c3', status: 'unmet', reason: 'more to look at'}]);
+  assert.equal(f.endRound().continue, true, 'the open-ended request keeps the task going');
+  assert.throws(() => f.plan([{text: 'Something weaker', kind: 'inspection'}]), /fixed/, 'without append the old rule stands');
+});
+
+test('continuation rounds of a reopened task restate the user\'s follow-up', () => {
+  const f = new Focus('Original request'); f.beginRound(); f.observe(edit('a.js'), {ok: true});
+  f.plan([{text: 'User checks', kind: 'manual'}]); f.checkpoint([{id: 'c1', status: 'unknown', reason: 'u'}]); f.endRound();
+  assert.ok(!f.prompt().includes('latest message'), 'a task nobody reopened has no follow-up to restate');
+  f.resumeLeg('keep finding until I say OK'); f.beginRound();
+  assert.match(f.prompt(), /Original request[\s\S]*latest message in this task[\s\S]*keep finding until I say OK/);
+  f.resumeLeg('[muser: automatic continuation]', {fromUser: false}); f.beginRound();
+  assert.ok(!f.prompt().includes('automatic continuation'), 'an automatic leg is not a user follow-up');
+});
+
+test('Focus tells Muse that a manual criterion alone does not keep the task going', () => {
+  const {INSTRUCTION, DEFINITIONS} = require('../src/focus');
+  assert.match(INSTRUCTION, /manual or unknown criterion never keeps the task going/);
+  assert.match(INSTRUCTION, /append=true/);
+  assert.ok(DEFINITIONS['focus.plan'].optional.append, 'focus.plan offers append');
 });

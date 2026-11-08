@@ -230,7 +230,7 @@ test('the stream fast path does not leak a bare token line inside a delta (deep 
   assert.ok(clean.includes('hello') && clean.includes('more'), 'the surrounding text is intact');
 });
 
-test('history saves wait for another window, and never overwrite an unreadable file (deep c1 #13)', {timeout: 60000}, async () => {
+test('history saves wait for another window, and a corrupt file is backed up aside, not stuck (deep c1 #13, wave 13)', {timeout: 60000}, async () => {
   const fs = require('node:fs'); const path = require('node:path');
   const {spawn} = require('node:child_process');
   const dir = tmpDir();
@@ -273,12 +273,18 @@ test('history saves wait for another window, and never overwrite an unreadable f
   assert.equal(r1.code, 0, r1.err);
   const saved = JSON.parse(fs.readFileSync(hist, 'utf8'));
   assert.ok(saved.includes('seed-entry') && saved.includes('child-entry'), 'both windows keep their entries');
-  // An unreadable history file is left exactly as it is (fifth f1-3, the read-side twin).
+  // Wave 13: a corrupt history file is moved aside to a .corrupt-<time>
+  // backup (its bytes survive) and recording starts over, instead of the
+  // old fifth f1-3 guard refusing every save forever — that guard now
+  // covers only a file that cannot be READ at all.
   const hist2 = path.join(dir, 'history2.json');
   fs.writeFileSync(hist2, 'not json{');
   const r2 = await run(hist2, path.join(dir, 'marker2')).done;
   assert.equal(r2.code, 0, r2.err);
-  assert.equal(fs.readFileSync(hist2, 'utf8'), 'not json{', 'a corrupt history is never replaced by the newest entry alone');
+  assert.deepEqual(JSON.parse(fs.readFileSync(hist2, 'utf8')), ['child-entry'], 'the new entry is recorded in a fresh history');
+  const backups2 = fs.readdirSync(dir).filter(f => f.startsWith('history2.json.corrupt-'));
+  assert.equal(backups2.length, 1, 'exactly one corrupt backup');
+  assert.equal(fs.readFileSync(path.join(dir, backups2[0]), 'utf8'), 'not json{', 'the corrupt bytes survive in the backup');
 });
 
 test('picker edit: ctrl+shift+v pastes text and ctrl+v looks for an image (first #23)', async () => {

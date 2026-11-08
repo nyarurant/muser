@@ -29,7 +29,7 @@ function resolve(ctx, p) {
 }
 // rg globs use '/' (a backslash escapes the next character there).
 function globSlashes(g) { return String(g ?? '').replace(/\\/g, '/'); }
-function inside(root, file) { const r = path.relative(root, file); return !r.startsWith('..') && !path.isAbsolute(r); }
+function inside(root, file) { const r = path.relative(root, file); return !(r === '..' || r.startsWith('..' + path.sep) || path.isAbsolute(r)); }
 // ---- Sensitive-file guard (code.read / code.grep / code.glob and every read path below) ----
 // muser's coding tools must never read secrets back to the model: env files, private keys,
 // credential/secret files, SSH/AWS/GPG homes, .netrc, and muser's own encrypted store.
@@ -97,6 +97,27 @@ function baseSensitive(base, lower) {
   if (base === 'hosts.yml' && (lower.includes('github cli') || lower.includes('gh'))) return true;
   if (base === 'config.json' && lower.includes('.docker')) return true;
   if (base === 'config' && lower.includes('.kube')) return true;
+  // kubectl's conventional KUBECONFIG names outside a .kube folder (audit wave5 B):
+  // ~/kubeconfig, proj/kubeconfig.yaml. A kubeconfig_<tool>.js source file is not one.
+  if (base === 'kubeconfig' || /^kubeconfig\.(ya?ml|json|toml|ini|conf|config)$/.test(base)) return true;
+  // Terraform's canonical names (wave5 B): the CLI config is .terraformrc (home) or
+  // terraform.rc (%APPDATA%) — the *.tfrc rule below misses both spellings — and state /
+  // variable files hold plaintext secrets. *.tfstate.backup reaches *.tfstate through
+  // baseVariants' see-through .backup suffix.
+  if (base === '.terraformrc' || base === 'terraform.rc') return true;
+  if (/\.(tfstate|tfvars)(\.json)?$/.test(base)) return true;
+  // Browser credential stores (wave5 B): Chromium's 'Login Data' (passwords) and
+  // 'Local State' (the DPAPI key that decrypts it) have distinctive names with a space;
+  // Firefox's key4.db is the decryption key for the already-blocked logins.json, and
+  // cookies.sqlite is its cookie store.
+  if (/^login data($| )/.test(base) || base === 'local state') return true;
+  if (base === 'key4.db' || base === 'cookies.sqlite') return true;
+  // A file named plain 'Cookies' is a browser cookie store only in a browser-shaped
+  // location (a Chrome/Edge 'User Data' tree, its 'Network' subfolder, a Firefox tree):
+  // a project file that merely happens to be named Cookies stays readable.
+  if (base === 'cookies' && lower.some(s => s === 'user data' || s === 'network' || s === 'edge' || s === 'safari' ||
+    s.includes('chrome') || s.includes('chromium') || s.includes('brave') || s.includes('firefox') || s.includes('mozilla') || s.includes('opera') || s.includes('vivaldi'))) return true;
+  if (base === 'wallet.dat') return true; // Bitcoin Core's wallet (wave5 B)
   // A repo's .git/config holds its remote URLs, and those URLs often embed a plain
   // access token (https://x-access-token:<PAT>@github.com/…) (deep audit c6 #3).
   if (base === 'config' && lower.includes('.git')) return true;
@@ -106,6 +127,13 @@ function baseSensitive(base, lower) {
     if (/^\.env\.(example|sample)(\.|$)/.test(base) || base === '.env.example' || base === '.env.sample') return false;
     return true;
   }
+  // The *.env extension form (wave5 B): app.env / prod.env / docker.env are the
+  // standard env-file names for docker, systemd and python-dotenv, but the rule
+  // above only sees the .env* prefix form. The bare stem 'env' counts too, so a
+  // backup copy env.backup (whose .backup suffix baseVariants strips to 'env')
+  // is judged by this same rule. A document about env files (app.env.md) is not
+  // one: its outer suffix is not see-through, so only the full name reaches here.
+  if (base === 'env' || base.endsWith('.env')) return true;
   if (base.endsWith('.pem') || base.endsWith('.key')) return true;
   // SSH private keys by their usual names: id_rsa, id_dsa, id_ecdsa, id_ed25519, id_xmss, …
   // (any id_<name> with no extension; the .pub half is public and stays readable).
@@ -126,7 +154,10 @@ function isSensitivePath(p) {
   const parts = norm.split('/').filter(Boolean).map(winName);
   const base = (parts[parts.length - 1] || '').toLowerCase();
   const lower = parts.map(s => s.toLowerCase());
-  if (lower.some(s => s === '.ssh' || s === '.aws' || s === '.gnupg' || s === '.azure')) return true;
+  // Whole credential-home folders: every file under .kube is cluster credentials
+  // in some form (config.yaml, per-cluster files, cache), like .ssh/.aws (wave5 B:
+  // .kube was previously only its exact 'config' basename).
+  if (lower.some(s => s === '.ssh' || s === '.aws' || s === '.gnupg' || s === '.azure' || s === '.kube')) return true;
   // Google Cloud SDK credentials: ~/.config/gcloud on POSIX, but the Windows standard
   // layout is %APPDATA%\gcloud (parent 'Roaming') with no .config parent —
   // application_default_credentials.json and legacy_credentials\<account>\adc.json matched
@@ -256,6 +287,20 @@ function decodeText(buf) {
   return buf.toString('utf8');
 }
 function readText(file) { return decodeText(readBytes(file)); }
+// A UTF-8 decode that does not round-trip has replaced bytes that are not valid
+// UTF-8 with U+FFFD. Writing that text back (an edit touching an unrelated line
+// is enough) permanently replaces the original bytes with EF BF BD, the UTF-8
+// encoding of U+FFFD — silent data destruction. Such a file is marked in the
+// read state (recordRead) and code.edit / code.apply_patch refuse it; the file
+// can still be read (with a warning) and rewritten whole with code.write, or
+// fixed outside these tools. UTF-16 files are exempt: their decode is kept
+// and restored by writeText, so an edit does not lose their bytes.
+function isLossyUtf8(buf, text) {
+  if (bomOf(buf)) return false;
+  return !Buffer.from(text, 'utf8').equals(buf);
+}
+function lossyError(file) { return new Error('File contains bytes that are not valid UTF-8 (shown as � when read): ' + file + ' — code.edit / code.apply_patch are refused for this file, because writing the read text back would permanently replace those bytes with EF BF BD (the UTF-8 encoding of U+FFFD). Fix the file\'s encoding first (e.g. with system.run) and re-read it, or rewrite it whole with code.write.'); }
+function assertNotLossy(ctx, file) { if (statsMap(ctx)?.get(file)?.lossy) throw lossyError(file); }
 function staleError(file) { return new Error(t('File changed on disk since it was read（読み取り後にファイルが変更されています）: {file} — re-read it with code.read before writing/editing', {file})); }
 function bomOf(buf) { return buf[0] === 0xff && buf[1] === 0xfe ? 'le' : buf[0] === 0xfe && buf[1] === 0xff ? 'be' : null; }
 function utf16Of(buf) {
@@ -278,7 +323,7 @@ function recordRead(ctx, file) {
   // The hash is taken only up to the read cap: a file past it was never readable through
   // code.read, and hashing it whole re-read gigabytes just to remember it (audit #222).
   // An over-cap file is remembered by size/mtime only (hash null).
-  try { const st = fs.statSync(file); m.set(file, {mtimeMs: st.mtimeMs, size: st.size, hash: st.size <= MAX_READ_BYTES ? crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') : null}); } catch { m.delete(file); }
+  try { const st = fs.statSync(file); let hash = null, lossy = false; if (st.size <= MAX_READ_BYTES) { const buf = fs.readFileSync(file); hash = crypto.createHash('sha256').update(buf).digest('hex'); try { lossy = isLossyUtf8(buf, decodeText(buf)); } catch { lossy = false; } } m.set(file, {mtimeMs: st.mtimeMs, size: st.size, hash, lossy}); } catch { m.delete(file); }
 }
 function forgetRead(ctx, file) { statsMap(ctx)?.delete(file); }
 // A parallel agent starts from main's reads: what each file looked like goes with them, or the
@@ -309,6 +354,36 @@ function readVerified(ctx, file) {
 // Edits keep the file's own line endings; Muse always works in \n.
 function eol(text) { return text.includes('\r\n') ? '\r\n' : '\n'; }
 function toLf(text) { return text.replace(/\r\n/g, '\n'); }
+// A UTF-8 BOM decodes to a leading U+FEFF: that is the file's BOM, not its first
+// character. Edits work on the body and writeText puts the BOM back, so an
+// old_string copied from code.read (whose first shown line carries the U+FEFF)
+// still matches the body, and the BOM survives an edit that replaces line 1.
+function splitBom(text) { return text.startsWith('\uFEFF') ? {bom: true, body: text.slice(1)} : {bom: false, body: text}; }
+// Restore each line's own ending in a mixed-ending file. The old rule (any CRLF
+// in the file -> every line CRLF on write) rewrote the endings of lines the edit
+// never touched. Unchanged prefix/suffix lines keep their original ending; a
+// changed region paired line-for-line with the original region (same line
+// count) inherits those endings too; genuinely new lines take `fallback`.
+function restoreEndings(orig, lf, fallback) {
+  const oParts = orig.split('\n'), nParts = lf.split('\n');
+  const oEnds = oParts.map((p, i) => i === oParts.length - 1 ? '' : p.endsWith('\r') ? '\r\n' : '\n');
+  const oText = oParts.map(p => p.endsWith('\r') ? p.slice(0, -1) : p);
+  let pre = 0;
+  while (pre < oText.length && pre < nParts.length && oText[pre] === nParts[pre]) pre++;
+  let suf = 0;
+  while (suf < oText.length - pre && suf < nParts.length - pre && oText[oText.length - 1 - suf] === nParts[nParts.length - 1 - suf]) suf++;
+  const paired = oText.length - pre - suf === nParts.length - pre - suf;
+  const fb = fallback === '\r\n' ? '\r\n' : '\n';
+  return nParts.map((p, i) => {
+    if (i === nParts.length - 1) return p; // the last part carries no terminator of its own
+    let end;
+    if (i < pre) end = oEnds[i];
+    else if (i >= nParts.length - suf) end = oEnds[i - (nParts.length - oParts.length)];
+    else if (paired) end = oEnds[i];
+    else end = fb;
+    return p + end;
+  }).join('');
+}
 // Writes get the same ceiling as reads (audit #217): an unbounded content filled the
 // disk or blew up the diff's memory. Checked before any diff is computed, and again in
 // writeText as the backstop for every write path.
@@ -318,11 +393,21 @@ function checkWriteSize(text) {
 }
 function writeText(file, lf, ending) {
   fs.mkdirSync(path.dirname(file), {recursive: true});
-  let mode = null; try { mode = fs.statSync(file).mode; } catch {}
+  let mode = null, size = null; try { const st = fs.statSync(file); mode = st.mode; size = st.size; } catch {}
   const temp = file + '.muser-' + process.pid + '-' + crypto.randomBytes(8).toString('hex') + '.tmp';
   // An existing UTF-16 file stays UTF-16 (with its BOM); everything else is written as UTF-8.
-  let bom = null; try { const fd = fs.openSync(file, 'r'), head = Buffer.alloc(2); fs.readSync(fd, head, 0, 2, 0); fs.closeSync(fd); bom = bomOf(head); } catch {}
-  const text = ending === '\r\n' ? lf.replace(/\n/g, '\r\n') : lf;
+  let bom = null, utf8Bom = false; try { const fd = fs.openSync(file, 'r'), head = Buffer.alloc(3); const n = fs.readSync(fd, head, 0, 3, 0); fs.closeSync(fd); bom = bomOf(head); utf8Bom = n >= 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf; } catch {}
+  // The BOM is not body text: a leading U+FEFF in the new text is the BOM marker,
+  // held aside here and put back below (the UTF-16 branch re-adds its own BOM
+  // bytes), so a file that had a UTF-8 BOM keeps it even when the edit consumed
+  // the marker, and no path writes it twice.
+  const split = splitBom(String(lf ?? ''));
+  // An existing file's own line endings win, line by line (restoreEndings);
+  // `ending` is only the fallback for new lines — and for new files, where it
+  // keeps the old whole-file conversion.
+  let orig = null; try { if (size !== null && size <= MAX_READ_BYTES) orig = decodeText(fs.readFileSync(file)); } catch {}
+  let text = orig !== null ? restoreEndings(splitBom(orig).body, split.body, ending) : ending === '\r\n' ? split.body.replace(/\n/g, '\r\n') : split.body;
+  if (!bom && (utf8Bom || split.bom)) text = '\uFEFF' + text;
   let data = text;
   if (bom) { const body = Buffer.from(text, 'utf16le'); if (bom === 'be') body.swap16(); data = Buffer.concat([Buffer.from(bom === 'le' ? [0xff, 0xfe] : [0xfe, 0xff]), body]); }
   const bytes = Buffer.isBuffer(data) ? data.length : Buffer.byteLength(data, 'utf8');
@@ -337,7 +422,22 @@ function writeText(file, lf, ending) {
   }
 }
 function clip(s, n = MAX_OUT) { return s.length > n ? s.slice(0, n / 2) + '\n… (' + (s.length - n) + ' chars omitted) …\n' + s.slice(-n / 2) : s; }
+// Cut a line for display at MAX_LINE without splitting a surrogate pair: a
+// plain slice(0, MAX_LINE) can end on a high surrogate whose low half was cut
+// away, handing the model a lone surrogate.
+function cutLine(s) {
+  if (s.length <= MAX_LINE) return s;
+  let n = MAX_LINE;
+  const hi = s.charCodeAt(n - 1), lo = s.charCodeAt(n);
+  if (hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff) n--;
+  return s.slice(0, n) + '…';
+}
 
+// Total -/+ lines the all-removed/all-added fallback below may emit before
+// it switches to a summary entry: on two large, wholly different files the
+// fallback used to materialise every line of both sides (hundreds of
+// thousands of entries) into the view, the history and the work log.
+const DIFF_FALLBACK_MAX = 10000;
 // Minimal line diff (LCS) for showing changes; inputs are bounded by the caller.
 function lineDiff(a, b) {
   const x = a.split('\n'), y = b.split('\n');
@@ -345,7 +445,21 @@ function lineDiff(a, b) {
   let e = 0; while (e < x.length - s && e < y.length - s && x[x.length - 1 - e] === y[y.length - 1 - e]) e++;
   const xm = x.slice(s, x.length - e), ym = y.slice(s, y.length - e);
   const out = [];
-  if (xm.length * ym.length > 4e6) { xm.forEach((l, i) => out.push({t: '-', n: s + i + 1, l})); ym.forEach((l, i) => out.push({t: '+', n: s + i + 1, l})); }
+  if (xm.length * ym.length > 4e6) {
+    if (xm.length + ym.length <= DIFF_FALLBACK_MAX) { xm.forEach((l, i) => out.push({t: '-', n: s + i + 1, l})); ym.forEach((l, i) => out.push({t: '+', n: s + i + 1, l})); }
+    else {
+      // Summary form: a head sample of each side plus one '…' entry that
+      // carries the omitted counts (stats() and slim-call add them back in,
+      // so the + / - totals stay true even though the lines are not shown).
+      let kx = Math.min(xm.length, Math.floor(DIFF_FALLBACK_MAX / 2));
+      const ky = Math.min(ym.length, DIFF_FALLBACK_MAX - kx);
+      kx = Math.min(xm.length, DIFF_FALLBACK_MAX - ky);
+      xm.slice(0, kx).forEach((l, i) => out.push({t: '-', n: s + i + 1, l}));
+      ym.slice(0, ky).forEach((l, i) => out.push({t: '+', n: s + i + 1, l}));
+      const remOmitted = xm.length - kx, addOmitted = ym.length - ky;
+      out.push({t: '…', removed: remOmitted, added: addOmitted, l: '… (' + remOmitted + ' removed and ' + addOmitted + ' added lines omitted: the changed region is too large to show line by line)'});
+    }
+  }
   else {
     const L = Array.from({length: xm.length + 1}, () => new Int32Array(ym.length + 1));
     for (let i = xm.length - 1; i >= 0; i--) for (let j = ym.length - 1; j >= 0; j--) L[i][j] = xm[i] === ym[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
@@ -360,7 +474,12 @@ function lineDiff(a, b) {
   // Three lines of context around changes, like a unified diff.
   const before = x.slice(Math.max(0, s - 3), s).map((l, k) => ({t: ' ', n: Math.max(0, s - 3) + k + 1, l}));
   const after = y.slice(y.length - e, y.length - e + 3).map((l, k) => ({t: ' ', n: y.length - e + k + 1, l}));
-  return [...before, ...trimContext(out), ...after];
+  // Every line the diff carries — context lines included — is cut at
+  // MAX_LINE (cutLine appends '…', so the cut is visible): the line COUNT
+  // was capped elsewhere, but one 5MB line otherwise stayed whole in the
+  // view, the slimmed history and the outputs store. slim-call cuts again
+  // on its side, for diffs that did not come through here.
+  return [...before, ...trimContext(out), ...after].map(d => d && typeof d.l === 'string' ? {...d, l: cutLine(d.l)} : d);
 }
 function trimContext(lines) {
   const keep = lines.map((l, i) => l.t !== ' ' || lines.slice(Math.max(0, i - 3), i + 4).some(m => m.t !== ' '));
@@ -368,7 +487,17 @@ function trimContext(lines) {
   lines.forEach((l, i) => { if (keep[i]) { out.push(l); gap = false; } else if (!gap) { out.push({t: '…'}); gap = true; } });
   return out;
 }
-function stats(diff) { return {added: diff.filter(d => d.t === '+').length, removed: diff.filter(d => d.t === '-').length}; }
+function stats(diff) {
+  let added = 0, removed = 0;
+  for (const d of diff) {
+    if (d.t === '+') added++;
+    else if (d.t === '-') removed++;
+    // A lineDiff summary entry ('…', from the fallback cap) carries the counts
+    // of the lines it stands for; a trimContext gap marker carries none.
+    else if (d.t === '…') { if (Number.isFinite(d.added)) added += d.added; if (Number.isFinite(d.removed)) removed += d.removed; }
+  }
+  return {added, removed};
+}
 
 // ---- apply_patch (the Codex patch format) ----
 function parsePatch(text) {
@@ -422,6 +551,12 @@ function applyHunks(text, hunks, name) {
     // followed by only '+' lines landed after the LAST function instead (deep audit
     // c6 #6). With an anchor, the new lines go right after the anchor line; without
     // one they still append at the end, as before.
+    // A pure-addition hunk has no context to check for uniqueness (the check
+    // below needs old lines), so a duplicated anchor silently picked the first
+    // match and inserted there. The anchor is the only position information an
+    // add-only hunk has: when it fits more than one place, refuse, as a
+    // non-unique context is refused below.
+    if (!old.length && anchorAt >= 0 && findBlock(lines, [h.anchor], anchorAt + 1) >= 0) throw new Error('Patch anchor in ' + name + ' fits more than one place: ' + h.anchor.slice(0, 80) + '; use a more specific @@ anchor line');
     const pos = old.length ? findBlock(lines, old, at) : anchorAt >= 0 ? anchorAt + 1 : lines.length - (lines[lines.length - 1] === '' ? 1 : 0);
     if (pos < 0) throw new Error('Patch context not found in ' + name + ' near: ' + (old.find(l => l.trim()) || '').slice(0, 120));
     // A context that fits more than one place was applied at the first one, silently, as code.edit
@@ -443,30 +578,51 @@ function encodingWarning(text) {
     ? {warning: 'This text looks double-encoded (UTF-8 read as Shift-JIS/CP932: e.g. "' + String.fromCharCode(0x7ab6, 0x30fb) + '" for an em dash, "' + String.fromCharCode(0x8b4c, 0xff65, 0x8b5b, 0xff6c, 0x96b1, 0x30fb) + '" for the word Japanese written in kanji). Fix the file before going on; write files with code.write / code.edit, not PowerShell.'}
     : {};
 }
+// Same warning slot as encodingWarning, for a file whose bytes are not valid
+// UTF-8 (isLossyUtf8): the read shows those bytes as U+FFFD and the originals
+// cannot be recovered from the text, so edit/patch refuse the file outright.
+function invalidUtf8Warning() {
+  return {warning: 'This file contains bytes that are not valid UTF-8; they are shown as \uFFFD and the original bytes cannot be recovered from this text. code.edit / code.apply_patch are refused for this file: writing the read text back would permanently replace those bytes with EF BF BD. Fix the encoding first (e.g. with system.run), or rewrite the file whole with code.write.'};
+}
 
 // ripgrep runs as a child process, never synchronously: a search over the whole home folder
 // (OneDrive placeholders download when read, and Defender scans each one) once froze muser —
 // the device link and the keyboard — for ten minutes. A search is stopped after RG_TIMEOUT_MS
 // and reported, so Muse narrows it.
 const RG_TIMEOUT_MS = 30000, RG_MAX_OUT = 32 * 1024 * 1024;
+// Resolves {text, truncated}: when the output passes RG_MAX_OUT the child is
+// killed and `text` is only the part that arrived, so callers must say the
+// result was cut (truncated) and treat any count from it as a lower bound —
+// the partial buffer used to be returned as if it were the whole output, so
+// code.grep reported that partial count as the true number of matches.
 function rg(args, cwd, {timeoutMs = RG_TIMEOUT_MS} = {}) {
   return new Promise((done, fail) => {
     let child, out = '', err = '', size = 0, settled = false, timer = null;
     const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); error ? fail(error) : done(value); };
-    try { child = spawn('rg', args, {cwd, windowsHide: true}); } catch { return finish(new Error('ripgrep (rg) is not available')); }
+    // A spawn failure (a cwd too long for the OS, a missing rg, ...) is a
+    // worded error the caller can show, never an unhandled 'error' event:
+    // the child AND each of its stdio streams can emit one, and a stream
+    // 'error' with no listener took the whole process down.
+    const spawnError = e => new Error('ripgrep (rg) could not run: ' + (e && e.message ? e.message : String(e || 'unknown error')).slice(0, 300));
+    try { child = spawn('rg', args, {cwd, windowsHide: true}); } catch (e) { return finish(spawnError(e)); }
     timer = setTimeout(() => {
       try { child.kill(); } catch {}
       finish(new Error(t('検索が {seconds} 秒で終わらなかったので止めました。path や glob で範囲を絞ってください（search timed out: narrow path / glob）。', {seconds: timeoutMs / 1000})));
     }, timeoutMs);
+    child.on('error', e => finish(spawnError(e)));
+    for (const stream of [child.stdin, child.stdout, child.stderr]) {
+      if (!stream || typeof stream.on !== 'function') continue;
+      stream.on('error', e => finish(spawnError(e)));
+    }
+    if (!child.stdout || !child.stderr) return finish(spawnError(new Error('rg stdio is not available')));
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', d => {
       size += d.length;
-      if (size > RG_MAX_OUT) { try { child.kill(); } catch {} return finish(null, out); }
+      if (size > RG_MAX_OUT) { try { child.kill(); } catch {} return finish(null, {text: out, truncated: true}); }
       out += d;
     });
     child.stderr.on('data', d => { if (err.length < 4000) err += d; });
-    child.on('error', () => finish(new Error('ripgrep (rg) is not available')));
-    child.on('close', code => code > 1 ? finish(new Error((err || 'rg failed').slice(0, 500))) : finish(null, out));
+    child.on('close', code => code > 1 ? finish(new Error((err || 'rg failed').slice(0, 500))) : finish(null, {text: out, truncated: false}));
   });
 }
 // Folders a search does not walk unless it is aimed inside them: OneDrive (see rg above) and,
@@ -478,9 +634,17 @@ function heavyGlobs(root) {
   if (norm === os.homedir().replace(/\\/g, '/').toLowerCase()) globs.push('!AppData/**');
   return globs;
 }
-const SENSITIVE_GLOBS = ['!**/.env', '!**/.env.*', '!**/.envrc', '!**/*.pem', '!**/*.key', '!**/id_*', '!**/credentials', '!**/credentials.*', '!**/logins.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.azure/**', '!**/.config/gcloud/**', '!**/Roaming/gcloud/**', '!**/application_default_credentials.json', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/*codex*/auth.json', '!**/.claude.json', '!**/.pgpass', '!**/.my.cnf', '!**/.s3cfg', '!**/.boto', '!**/*.tfrc', '!**/*.tfrc.json', '!**/gh/hosts.yml', '!**/.docker/config.json', '!**/.kube/config', '!**/.git/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx',
+// NOTE: there is deliberately no '!**/.env.*' here (wave5 B): it also hid the
+// intentionally readable .env.example/.env.sample from directory grep, and rg globs
+// have no exception syntax — a positive '**/.env.example' glob would switch rg to
+// allowlist mode and hide everything else. The .env.* files are instead dropped by
+// the canonical dropSensitiveLines post-filter through isSensitivePath below.
+const SENSITIVE_GLOBS = ['!**/.env', '!**/.envrc', '!**/*.pem', '!**/*.key', '!**/id_*', '!**/credentials', '!**/credentials.*', '!**/logins.json', '!**/secret.*', '!**/secrets.*', '!**/.secrets', '!**/.ssh/**', '!**/.aws/**', '!**/.gnupg/**', '!**/.azure/**', '!**/.config/gcloud/**', '!**/Roaming/gcloud/**', '!**/application_default_credentials.json', '!**/.netrc', '!**/.muser/*.enc', '!**/web.enc', '!**/muser/*.enc', '!**/muser-release/*.enc', '!**/.npmrc', '!**/.yarnrc', '!**/.yarnrc.yml', '!**/.pypirc', '!**/.git-credentials', '!**/.credentials.json', '!**/.codex/auth.json', '!**/*codex*/auth.json', '!**/.claude.json', '!**/.pgpass', '!**/.my.cnf', '!**/.s3cfg', '!**/.boto', '!**/*.tfrc', '!**/*.tfrc.json', '!**/gh/hosts.yml', '!**/.docker/config.json', '!**/.kube/config', '!**/.git/config', '!**/*.p12', '!**/*.pfx', '!**/*.ppk', '!**/*.jks', '!**/*.keystore', '!**/*.kdbx',
   '!**/.muser/permissions.json', '!**/.muser/config.json', '!**/.muser/mcp.json', '!**/.muser/gui.json', '!**/.muser/server.json',
-  '!**/Local/muser/permissions.json', '!**/Local/muser/config.json', '!**/Local/muser/mcp.json', '!**/Local/muser/gui.json', '!**/Local/muser/server.json'];
+  '!**/Local/muser/permissions.json', '!**/Local/muser/config.json', '!**/Local/muser/mcp.json', '!**/Local/muser/gui.json', '!**/Local/muser/server.json',
+  // Wave5 B additions, mirroring isSensitivePath (the post-filter below is still canonical):
+  '!**/*.env', '!**/env.backup', '!**/.terraformrc', '!**/terraform.rc', '!**/*.tfstate', '!**/*.tfstate.backup', '!**/*.tfvars', '!**/.kube/**', '!**/kubeconfig', '!**/kubeconfig.yaml', '!**/kubeconfig.yml', '!**/kubeconfig.json',
+  '!**/Login Data', '!**/Login Data *', '!**/Local State', '!**/key4.db', '!**/cookies.sqlite', '!**/wallet.dat', '!**/User Data/**/Cookies', '!**/Network/Cookies'];
 
 // The path an rg output line names, or null when the line carries none (a context
 // separator, or a hit in the single explicit file target, which was already vetted).
@@ -489,7 +653,16 @@ function grepLinePath(line, filesOnly) {
   if (filesOnly) return line || null;
   const bin = /^Binary file (.+) matches$/.exec(line); if (bin) return bin[1];
   const m = /[:-]\d+[:-]/.exec(line);
-  return m ? line.slice(0, m.index) : null;
+  if (!m) return null;
+  const named = line.slice(0, m.index);
+  // A hit in the single explicit file target is printed as '12:text' (context as
+  // '12-text') with NO path — that file was already vetted by the caller. When
+  // such a line's text itself contains a ':30:'-like sequence (a time, as in
+  // '1:meet at 10:30:00'), the first match lands inside the text and the slice
+  // before it ('1:meet at 10') is hit text, not a path. A real path never starts
+  // with '<digits>:' (a drive letter is a letter), so that slice names nothing.
+  if (/^\d+:/.test(named)) return null;
+  return named;
 }
 // The -g exclusions above are a first pass only: they are a hand-kept copy of
 // isSensitivePath and the two diverged (.envrc, id_ecdsa, credentials.yaml all
@@ -524,20 +697,37 @@ function dropSensitiveLines(lines, ctx, filesOnly) {
   };
   return lines.filter(line => {
     const named = grepLinePath(line, filesOnly);
-    if (named) {
-      // A hit line's text can itself contain ':12:' sequences; if any prefix
-      // of the line reads as a sensitive path, the line goes (fail closed).
-      const prefixes = filesOnly || line.startsWith('Binary file ') ? [named] : [...line.matchAll(/[:-]\d+[:-]/g)].map(m => line.slice(0, m.index));
-      return !prefixes.some(sensitive);
-    }
-    return true;
+    if (!named) return true;
+    if (sensitive(named)) return false;
+    if (filesOnly || line.startsWith('Binary file ')) return true;
+    // Later '[:-]12[:-]' matches in the line are normally hit TEXT (a time, as
+    // in 'a.txt:2:meet at 10:30:00 …'): the slice before them spans the whole
+    // 'file:line:' prefix, so it is not a path — the old fail-closed check of
+    // every such slice dropped ordinary lines wholesale, because the slice
+    // 'a.txt:2:meet at 10' trips the alternate-data-stream rule on its ':'.
+    // A later slice still counts as a path candidate while it stays
+    // path-shaped — no ':' past a drive letter (a Windows path has none; the
+    // ':' of ':2:' is the line-number separator, already consumed) — which
+    // keeps catching a sensitive path whose own name holds a '-12-' segment
+    // before the line number ('x-1-y/.ssh/id_rsa:5:…').
+    const later = [...line.matchAll(/[:-]\d+[:-]/g)].slice(1).map(m => line.slice(0, m.index))
+      .filter(cand => { const rest = /^[a-z]:/i.test(cand) ? cand.slice(2) : cand; return !rest.includes(':'); });
+    return !later.some(sensitive);
   });
 }
 
 function computeEdit(p, ctx) {
   const file = resolve(ctx, p.path);
   if (!ctx.readFiles.has(file)) throw new Error('Read the file with code.read before editing it');
-  const raw = readVerified(ctx, file), text = toLf(raw), old = toLf(String(p.old_string ?? '')), neu = toLf(String(p.new_string ?? ''));
+  const raw = readVerified(ctx, file);
+  assertNotLossy(ctx, file);
+  // The file's BOM (a leading U+FEFF) is not body text: matching runs on the
+  // body, and a leading U+FEFF on old/new (copied from code.read's first line)
+  // is the marker, not a character to find or write — writeText restores the
+  // BOM on the way out, so replacing line 1 no longer deletes it.
+  const bomSplit = splitBom(raw), text = toLf(bomSplit.body);
+  const strip = s => bomSplit.bom && s.startsWith('\uFEFF') ? s.slice(1) : s;
+  const old = toLf(strip(String(p.old_string ?? ''))), neu = toLf(strip(String(p.new_string ?? '')));
   checkWriteSize(neu);
   if (!old) throw new Error('old_string is empty');
   if (old === neu) throw new Error('old_string and new_string are the same');
@@ -581,7 +771,8 @@ function planPatch(p, ctx) {
     // Update / Delete must have been read first, like code.edit (Add of a new file is the only exception).
     if (!ctx.readFiles.has(file)) throw new Error('Read the file with code.read before patching it: ' + o.path);
     seen.add(destKey(file));
-    const raw = readVerified(ctx, file), before = toLf(raw);
+    const raw = readVerified(ctx, file); assertNotLossy(ctx, file);
+    const before = toLf(raw);
     if (o.op === 'delete') return {...o, file, before, after: ''};
     const after = applyHunks(before, o.hunks, o.path);
     checkWriteSize(after);
@@ -620,7 +811,7 @@ const TOOLS = {
       // with offset reads the rest exactly where this stopped.
       const shown = []; let used = 0;
       for (let i = 0; i < slice.length; i++) {
-        const line = String(start + i).padStart(6) + '\t' + (slice[i].length > MAX_LINE ? slice[i].slice(0, MAX_LINE) + '…' : slice[i]);
+        const line = String(start + i).padStart(6) + '\t' + cutLine(slice[i]);
         if (shown.length && used + line.length + 1 > MAX_OUT) break;
         shown.push(line); used += line.length + 1;
       }
@@ -630,7 +821,7 @@ const TOOLS = {
       const cut = slice.slice(0, shown.length).map((l, i) => l.length > MAX_LINE ? start + i : 0).filter(Boolean);
       const longNote = cut.length ? {long_lines: cut.slice(0, 20), note: cut.length + ' line(s) longer than ' + MAX_LINE + ' characters are cut here (ending in …). To see one whole, use system.run, e.g. (Get-Content -LiteralPath <file>)[<line - 1>].Substring(<from>, 4000), or code.grep with a pattern from it.'} : {};
       const shownEnd = start - 1 + shown.length;
-      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(shownEnd < all.length ? {next_offset: start + shown.length} : {}), ...(shown.length < slice.length ? {truncated: true} : {}), ...longNote, ...encodingWarning(text)}, view: {lines: shown.length}};
+      return {payload: {path: file, total_lines: all.length, content: shown.join('\n'), ...(shownEnd < all.length ? {next_offset: start + shown.length} : {}), ...(shown.length < slice.length ? {truncated: true} : {}), ...longNote, ...(statsMap(ctx)?.get(file)?.lossy ? invalidUtf8Warning() : encodingWarning(text))}, view: {lines: shown.length}};
     },
   },
   'code.write': {
@@ -653,7 +844,10 @@ const TOOLS = {
       writeText(file, toLf(p.content), exists ? eol(rawBefore) : (os.EOL === '\r\n' && /\r\n/.test(p.content) ? '\r\n' : '\n'));
       ctx.readFiles.add(file); recordRead(ctx, file);
       const diff = lineDiff(before, toLf(p.content));
-      return {payload: {path: file, created: !exists, ...stats(diff), ...encodingWarning(p.content)}, view: {diff, created: !exists}};
+      // edits: the before/after texts this run already held, for the work
+      // log's edit event (src/worklog.js). Internal — agent.js forwards it
+      // non-enumerably, so it reaches neither the screen nor Muse.
+      return {payload: {path: file, created: !exists, ...stats(diff), ...encodingWarning(p.content)}, view: {diff, created: !exists}, edits: [{file, op: exists ? 'write' : 'create', before, after: toLf(p.content)}]};
     },
   },
   'code.edit': {
@@ -668,7 +862,7 @@ const TOOLS = {
       const e = computeEdit(p, ctx);
       writeText(e.file, e.after, eol(e.raw)); recordRead(ctx, e.file);
       const diff = lineDiff(e.text, e.after);
-      return {payload: {path: e.file, replacements: e.count, ...stats(diff), ...encodingWarning(e.after)}, view: {diff}};
+      return {payload: {path: e.file, replacements: e.count, ...stats(diff), ...encodingWarning(e.after)}, view: {diff}, edits: [{file: e.file, op: 'edit', before: e.text, after: e.after}]};
     },
   },
   'code.apply_patch': {
@@ -703,7 +897,7 @@ const TOOLS = {
         if (c.op === 'delete') { ctx.readFiles.delete(c.file); forgetRead(ctx, c.file); }
         else { ctx.readFiles.add(c.dest || c.file); recordRead(ctx, c.dest || c.file); if (c.dest && c.dest !== c.file) { ctx.readFiles.delete(c.file); forgetRead(ctx, c.file); } }
       }
-      return {payload: {files: files.map(({diff, ...f}) => f), ...encodingWarning(plan.map(c => c.after || '').join('\n'))}, view: {files}};
+      return {payload: {files: files.map(({diff, ...f}) => f), ...encodingWarning(plan.map(c => c.after || '').join('\n'))}, view: {files}, edits: plan.map(c => ({file: c.dest || c.file, op: c.op, before: c.before, after: c.after}))};
     },
   },
   'code.grep': {
@@ -736,11 +930,15 @@ const TOOLS = {
       args.push('-e', String(p.pattern), p.path ? resolve(ctx, p.path) : '.');
       // With context, rg also prints the lines around a hit (file-12-text) and "--" between groups;
       // counting every line reported 10 matches for 2. Hits are file:12:text (12:text for one file).
-      const raw = (await rg(args, ctx.cwd)).trimEnd();
+      const res = await rg(args, ctx.cwd);
+      const raw = res.text.trimEnd();
       const lines = dropSensitiveLines(raw ? raw.split('\n') : [], ctx, !!p.files_only);
       const out = lines.join('\n');
       const n = p.context && !p.files_only ? lines.filter(l => /^(?:(?:[A-Za-z]:)?[^:\r\n]*:)?\d+:/.test(l)).length : lines.length;
-      return {payload: {matches: n, output: clip(out) || '(no matches)'}, view: {count: n}};
+      // When rg was killed at the output cap, n counts only the part that
+      // arrived: it is a lower bound, not the total, and the payload says so
+      // (truncated + matches_at_least) instead of presenting it as exact.
+      return {payload: {matches: n, ...(res.truncated ? {truncated: true, matches_at_least: n} : {}), output: clip(out) || '(no matches)'}, view: {count: n}};
     },
   },
   'code.glob': {
@@ -763,14 +961,17 @@ const TOOLS = {
       // --hidden for the same reason as code.grep (c6 #7): '**/*.yml' used to miss
       // .github/workflows entirely. .git internals stay excluded, and every result
       // is re-filtered through isSensitivePath below.
-      const raw = (await rg(['--hidden', '--files', '-g', pattern, '-g', '!**/.git/**', ...heavyGlobs(root).flatMap(g => ['-g', g])], root)).split('\n').filter(Boolean);
+      const rgRes = await rg(['--hidden', '--files', '-g', pattern, '-g', '!**/.git/**', ...heavyGlobs(root).flatMap(g => ['-g', g])], root);
+      const raw = rgRes.text.split('\n').filter(Boolean);
       // The result used to be cut to the first MAX_GLOB_RESULTS rg lines BEFORE
       // sorting by age, and count reported that cut size: on a 100k-file tree the
       // answer was count=2000 with the newest 500 OF AN ARBITRARY SUBSET, and the
       // other 98k files existed in neither count nor files, with no way to page
-      // (fourth audit M13). Now every match is counted and age-sorted (rg's own
-      // 32MB output cap still bounds the list), count is the true number of
-      // non-sensitive matches, and files are the newest 500 of ALL of them. The
+      // (fourth audit M13). Now every match is counted and age-sorted, count is
+      // the true number of non-sensitive matches, and files are the newest 500
+      // of ALL of them — unless rg itself was killed at its 32MB output cap, in
+      // which case count is only a lower bound and the payload says so
+      // (truncated + count_at_least), as in code.grep. The
       // expensive checks (realpath, hardlink listing) run only for the candidates
       // actually returned, newest first, backfilling past any they drop.
       const listed = raw.filter(f => !isSensitivePath(f) && !isSensitivePath(path.join(root, f)));
@@ -787,15 +988,15 @@ const TOOLS = {
         files.push(inside(ctx.cwd, abs) ? path.relative(ctx.cwd, abs) : abs);
       }
       const count = listed.length - dropped;
-      const truncated = count > files.length;
-      return {payload: {count, files, ...(truncated ? {truncated: true} : {})}, view: {count}};
+      const truncated = rgRes.truncated || count > files.length;
+      return {payload: {count, files, ...(truncated ? {truncated: true} : {}), ...(rgRes.truncated ? {count_at_least: count} : {})}, view: {count}};
     },
   },
   'system.run': {
     kind: 'exec',
     def: {description: 'Run a shell command on this Windows PC and return stdout, stderr and exit code. shell is powershell (default) or cmd. Use for builds, tests, git and anything the code tools do not cover. For dev servers, watchers and other long-running processes set background=true: it returns a shell id at once; read output with shell.output, stop with shell.kill.',
       required: {command: {type: 'string', description: 'The command.'}},
-      optional: {shell: {type: 'string', description: 'powershell or cmd; default powershell.'}, cwd: {type: 'string', description: 'Working directory; default the session working directory.'}, timeout_ms: {type: 'integer', description: 'Default 120000, max 600000 (not for background).'}, background: {type: 'boolean', description: 'Keep running in the background and return immediately.'}},
+      optional: {shell: {type: 'string', description: 'powershell or cmd; default powershell.'}, cwd: {type: 'string', description: 'Working directory; default the session working directory.'}, timeout_ms: {type: 'integer', description: 'Default 120000, max 600000 (not for background).'}, background: {type: 'boolean', description: 'Keep running in the background and return immediately.'}, expect: {type: 'string', description: 'What you expect this run to do, in one fixed shape only: {"exit": 0}, {"exit": "nonzero"}, {"contains": "..."}, {"notContains": "..."} or {"tests": "pass"|"fail"} (as JSON text or an object). Attach it to tests and builds. If the result differs, the result says so ([muser: 想定外]) and, in stop mode, your next write is held once while you rethink.'}},
       timeout_ms: 605000},
     summary: p => p.command,
     async run(p, ctx, signal, onOutput) {
@@ -867,7 +1068,7 @@ const TOOLS = {
     // mode and to read-only agents, while the preamble asks Muse to use it for multi-step work.
     kind: 'read',
     def: {description: 'Keep the task list for this coding session, shown to the user. Send the whole list each time. Use it for work with 3+ steps; mark exactly one item in_progress.',
-      required: {todos: {type: 'string', description: 'JSON array of {"content": string, "status": "pending"|"in_progress"|"completed"}.'}}, optional: {}},
+      required: {todos: {type: 'string', description: 'JSON array of {"content": string, "status": "pending"|"in_progress"|"completed"|"blocked"}.'}}, optional: {}},
     summary: () => '',
     run(p, ctx) {
       // The gateway may hand over the array itself instead of its JSON text (JSON.parse of an array
@@ -876,13 +1077,18 @@ const TOOLS = {
       if (typeof todos === 'string') { try { todos = JSON.parse(todos); } catch { throw new Error('todos must be a JSON array string'); } }
       if (!Array.isArray(todos)) throw new Error('todos must be a JSON array');
       // "done" / "in-progress" and the like showed as pending: the common spellings are understood.
-      const status = s => { const k = String(s || '').toLowerCase().replace(/[\s-]+/g, '_'); return ['completed', 'complete', 'done', 'finished'].includes(k) ? 'completed' : ['in_progress', 'inprogress', 'active', 'doing', 'started', 'working'].includes(k) ? 'in_progress' : 'pending'; };
-      ctx.todos = todos.filter(x => x && typeof x === 'object').slice(0, 50).map(t => ({content: String(t.content || '').slice(0, 300), status: status(t.status)}));
-      return {payload: {ok: true, count: ctx.todos.length}, view: {todos: ctx.todos}};
+      // 'blocked' is kept as itself: it used to fall through to 'pending', so a task
+      // waiting on something read as merely not started. (Unknown spellings still
+      // fall back to 'pending', as before.)
+      const status = s => { const k = String(s || '').toLowerCase().replace(/[\s-]+/g, '_'); return ['completed', 'complete', 'done', 'finished'].includes(k) ? 'completed' : ['in_progress', 'inprogress', 'active', 'doing', 'started', 'working'].includes(k) ? 'in_progress' : k === 'blocked' ? 'blocked' : 'pending'; };
+      const valid = todos.filter(x => x && typeof x === 'object');
+      ctx.todos = valid.slice(0, 50).map(t => ({content: String(t.content || '').slice(0, 300), status: status(t.status)}));
+      // The 50-item cut used to be silent; say so, the way code.glob does.
+      return {payload: {ok: true, count: ctx.todos.length, ...(valid.length > ctx.todos.length ? {truncated: true} : {})}, view: {todos: ctx.todos}};
     },
   },
 };
 
 function commandsV2() { return Object.fromEntries(Object.entries(TOOLS).map(([k, t]) => [k, t.def])); }
 
-module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of, dropSensitiveLines, hardlinkVerdict, setHardlinkLister, clearHardlinkCache};
+module.exports = {TOOLS, commandsV2, lineDiff, parsePatch, applyHunks, inside, isSensitivePath, realOf, heavyGlobs, copyReads, recordRead, utf16Of, dropSensitiveLines, hardlinkVerdict, setHardlinkLister, clearHardlinkCache, cutLine, stats, DIFF_FALLBACK_MAX, RG_MAX_OUT};

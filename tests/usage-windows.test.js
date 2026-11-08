@@ -44,8 +44,10 @@ test('7 days and all time say since when real counting began', () => {
   assert.equal(s.realSince, today);
   assert.equal(s.realSince7, today, 'counting began inside the 7 days');
   const text = usage.formatSummary();
-  assert.match(text, new RegExp('直近7日の実績: 1\\.2M in / 3k out（Muse の実測値）（' + label + ' から記録）'));
-  assert.match(text, new RegExp('累計の実績: 1\\.2M in / 3k out（Muse の実測値）（' + label + ' から記録）'));
+  // Wave 7 spec update: the real lines are formatted via formatUsage, so
+  // the counts read 入 / 出 in Japanese, not the old fixed 'in / out'.
+  assert.match(text, new RegExp('直近7日の実績: 1\\.2M 入 / 3k 出（Muse の実測値）（' + label + ' から記録）'));
+  assert.match(text, new RegExp('累計の実績: 1\\.2M 入 / 3k 出（Muse の実測値）（' + label + ' から記録）'));
   // The window lines carry no characters ÷ 4 estimate once real numbers exist.
   assert.match(text, /^直近7日: ターン 4 \/ ツール 1 回$/m);
   assert.ok(!/約 .* tokens/.test(text.split('\n').filter(l => l.startsWith('直近7日') || l.startsWith('今日')).join('\n')));

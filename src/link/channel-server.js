@@ -30,9 +30,11 @@ const MAX_QUEUED_BYTES = 16 * 1024 * 1024;
 // phone reconnects and resyncs, instead of replies/events piling up in PC
 // memory without limit.
 const MAX_SEND_BUFFER_BYTES = 8 * 1024 * 1024;
-// How long a finished-but-never-delivered request outcome is replayed to a
-// reconnecting phone that resends the same request, instead of executing it
-// a second time (audit #108). Matches the proxy/phone request timeout.
+// How long a finished request outcome is replayed to a reconnecting phone
+// that resends the same request, instead of executing it a second time
+// (audit #108; wave18: delivery is never confirmed — the protocol has no
+// acknowledgement — so a reply merely handed to a socket still counts as
+// undelivered once its channel dies). Matches the proxy/phone request timeout.
 const REQ_REPLAY_WINDOW_MS = 30000;
 const MAX_LEDGER_ENTRIES = 256;
 // An in-flight ledger entry whose proxy request ignores the abort signal
@@ -76,9 +78,14 @@ function classifyProxyError(err, method) {
 // the ordinary serve API the phone actually uses — per-conversation routes
 // (bare or under /api/s/:id/) and the session list/open/close routes. Server
 // administration is NEVER reachable through a channel: everything under
-// /api/server (info, events, stop, link pair/revoke) is denied, as is any
-// other path or method, so a stolen phone cannot mint a new pairing, stop
-// the server, or revoke other devices through the tunnel.
+// /api/server/ (events, stop, link pair/revoke) is denied, as is any other
+// path or method, so a stolen phone cannot mint a new pairing, stop the
+// server, or revoke other devices through the tunnel.
+// The one server-level exception is GET /api/server itself (android-ui):
+// a read-only standing view the GUI also uses — version, the open
+// conversations and the accounts — whose link section is already sanitised
+// by gui-server (no pairing code, no device static keys). Only the exact
+// GET passes; every sub-path and every other method stays denied.
 function channelPathname(rawPath) {
   if (typeof rawPath !== 'string' || !rawPath.startsWith('/') || rawPath.startsWith('//') || rawPath.includes('\\')) return null;
   // Dot segments in ANY encoding are refused outright: URL parsing silently
@@ -95,16 +102,23 @@ function channelPathname(rawPath) {
   return p;
 }
 const CHANNEL_REQ_RULES = [
-  ['GET', /^\/api\/(?:s\/[^/]+\/)?(?:state|events|complete|changes|muse-avatar|outputs|entries)$/],
-  ['POST', /^\/api\/(?:s\/[^/]+\/)?(?:send|approval|mode|menu|limit|interrupt|shell-kill)$/],
+  ['GET', /^\/api\/(?:s\/[^/]+\/)?(?:state|events|complete|changes|muse-avatar|outputs|entries|image)$/],
+  ['POST', /^\/api\/(?:s\/[^/]+\/)?(?:send|approval|mode|menu|limit|interrupt|shell-kill|account|prompt)$/],
+  // app-ui: account management from the phone (the GUI runs the CLI for these).
+  ['GET', /^\/api\/accounts$/],
+  ['POST', /^\/api\/accounts\/(?:default|auto|rename|remove)$/],
   ['GET', /^\/api\/sessions$/],
   ['POST', /^\/api\/sessions$/],
+  ['GET', /^\/api\/server$/],
+  ['GET', /^\/api\/ui-config$/], // app-ux: the GUI theme, read-only like /api/server
   ['POST', /^\/api\/sessions\/[^/]+\/(?:open|close)$/],
 ];
 function isAllowedChannelRequest(method, rawPath) {
   const p = channelPathname(rawPath);
   if (!p) return false;
-  if (p === '/api/server' || p.startsWith('/api/server/')) return false;
+  // Everything UNDER /api/server/ is administration and always denied;
+  // the exact path falls through to the rules (GET only, see above).
+  if (p.startsWith('/api/server/')) return false;
   // The allowlist governs the serve API namespace: gui-server routes ONLY
   // /api/* (anything else falls through to its 404), so a path outside /api/
   // names no serve capability at all and the proxy's 404 is the whole story.
@@ -127,9 +141,14 @@ function isAllowedChannelSubscription(rawPath) {
 // dies mid-request reconnects with a fresh id counter, so the id alone
 // cannot identify a resend — method+path+body can. An identical request
 // joins the original while it runs, and replays its outcome if the original
-// finished but its reply never reached a live channel; once a reply HAS
-// been delivered, the entry goes away and an identical later request is a
-// new, intentional one.
+// finished but its reply never reached a live channel. A reply handed to a
+// socket is NOT known to have been delivered — the protocol carries no
+// acknowledgement — so the entry survives its send for the replay window
+// (wave18): if every channel it was sent on dies, the delivery is treated
+// as unknown (deliveryUnknown, like the outcome:'unknown' classification
+// below) and a resend replays the stored outcome instead of executing a
+// second time. Only a repeat on the very channel that received the reply,
+// while that channel lives, counts as a new, intentional request.
 const reqLedgers = new WeakMap();
 function ledgerFor(proxy) {
   if (!proxy || (typeof proxy !== 'object' && typeof proxy !== 'function')) return new Map();
@@ -143,8 +162,12 @@ function requestFingerprint(method, path, body) {
   return crypto.createHash('sha256').update(String(method || 'GET') + ' ' + String(path || '') + '\n' + bodyText).digest('hex');
 }
 // Ledger eviction (deep audit c23 #2): only an entry whose loss cannot
-// cause a second execution may be evicted — an aborted/delivered leftover,
-// or a settled entry whose replay window has already closed. An in-flight
+// cause a second execution may be evicted — an aborted leftover, or a
+// settled entry whose replay window has already closed. A merely SENT
+// entry is not evictable either (wave18): with no acknowledgement its
+// delivery is unconfirmed, so inside its window it is exactly like an
+// undelivered entry — dropping it reopens the double execution if the
+// channel died before the flush. An in-flight
 // entry, and a settled-but-undelivered entry still inside its replay
 // window, are never dropped to make room: a resend that found them gone
 // would execute the same non-idempotent request a second time, which is
@@ -155,7 +178,7 @@ function evictLedgerEntries(ledger, replayWindowMs) {
   while (ledger.size > MAX_LEDGER_ENTRIES) {
     let victim = null;
     for (const [k, e] of ledger) {
-      if (e.aborted || e.delivered || (e.settled && Date.now() - e.settledAt > replayWindowMs)) { victim = k; break; }
+      if (e.aborted || (e.settled && Date.now() - e.settledAt > replayWindowMs)) { victim = k; break; }
     }
     if (victim === null) break;
     ledger.delete(victim);
@@ -260,13 +283,28 @@ async function handleChannelSocket(ws, ctx) {
   // the running original instead of executing it a second time.
   let channelClosed = false;
   const aborters = new Set();
+  // Delivery bookkeeping for the request ledger (wave18): sendApp success
+  // only proves a reply was handed to this socket — the tunnel protocol
+  // has no receipt acknowledgement, so a reply sent on a channel that then
+  // dies is UNCONFIRMED, however clean the send looked. channelRef lets a
+  // ledger entry ask later whether a channel it was sent on is still
+  // alive; deliveredEntries lets this handler flip its own entries to
+  // deliveryUnknown the moment the socket goes away.
+  const channelRef = {isClosed: () => channelClosed};
+  const deliveredEntries = new Set();
+  const markDeliveriesUnknown = () => {
+    for (const e of deliveredEntries) {
+      if ([...e.deliveredTo].every(ref => ref.isClosed())) e.deliveryUnknown = true;
+    }
+  };
   ws.on('close', () => {
     channelClosed = true;
+    markDeliveriesUnknown();
     closeSubs();
     for (const a of aborters) { try { a.abort(); } catch {} }
     aborters.clear();
   });
-  const close = (code = 1008) => { channelClosed = true; closeSubs(); try { ws.close(code); } catch {} };
+  const close = (code = 1008) => { channelClosed = true; markDeliveriesUnknown(); closeSubs(); try { ws.close(code); } catch {} };
 
   const pairing = pairingActive(ctx.pairing) ? ctx.pairing : null;
   if (pairing) notePairAttempt(pairing); // a Wi-Fi attempt is spent by arriving, not by failing
@@ -421,7 +459,7 @@ async function handleChannelSocket(ws, ctx) {
     sendApp({t: 'paired', device: {id: device.id, name: device.name}, pc: {name: os.hostname(), pcId: pcIdOf(ctx), relay: ctx.relayUrl || null, lan: ctx.lanAddresses || []}});
   } else {
     device = ctx.remoteStore.findByStatic(remoteStatic);
-    if (!device) { close(4403); return {ok: false, reason: 'unpaired'}; }
+    if (!device) { try { sendApp({t: 'revoked'}); } catch {} close(4403); return {ok: false, reason: 'unpaired'}; }
   }
   try { ctx.remoteStore.touch(device.id); } catch {} // lastSeen, on connect
 
@@ -447,7 +485,7 @@ async function handleChannelSocket(ws, ctx) {
     const msg = await nextApp(idleTimeoutMs || undefined);
     if (msg === APP_TIMEOUT) { close(); return {ok: false, reason: 'idle-timeout', device}; }
     if (!msg) break;
-    if (deviceRevoked()) { close(4403); return {ok: false, reason: 'revoked', device}; }
+    if (deviceRevoked()) { try { sendApp({t: 'revoked'}); } catch {} close(4403); return {ok: false, reason: 'revoked', device}; }
     if (msg.t === 'ping') { sendApp({t: 'pong'}); continue; }
     if (msg.t === 'req') {
       // An id that cannot correlate a reply, or one this channel is already
@@ -467,15 +505,25 @@ async function handleChannelSocket(ws, ctx) {
         // Dedupe across channels (audit #108): an identical request from the
         // same device joins the outcome already in flight in the shared
         // ledger, and replays it when the original finished but its reply
-        // never reached a live channel — it is never executed twice. Once a
-        // reply HAS been delivered the entry is gone, so a later identical
-        // request is a new, intentional one.
+        // never reached a live channel — it is never executed twice. A
+        // reply merely handed to a socket does not retire the entry either
+        // (wave18, below): only a repeat on that same live channel does.
         const ledger = ledgerFor(ctx.proxy);
         const key = (device?.id || '') + '|' + requestFingerprint(msg.method, msg.path, msg.body);
         const replayWindowMs = ctx.reqReplayWindowMs ?? REQ_REPLAY_WINDOW_MS;
         const inFlightTimeoutMs = ctx.reqInFlightTimeoutMs ?? REQ_IN_FLIGHT_TIMEOUT_MS;
         let entry = ledger.get(key);
-        if (entry && (entry.aborted || entry.delivered || (entry.settled && Date.now() - entry.settledAt > replayWindowMs) || (!entry.settled && Date.now() - entry.createdAt > inFlightTimeoutMs))) {
+        if (entry && entry.settled && entry.deliveredTo.has(channelRef)) {
+          // The reply was handed to THIS channel and the phone repeats the
+          // request on that same live channel: the delivery stands (audit
+          // #108) and the repeat is a new, intentional request. Any other
+          // resend — above all one arriving after the channel a reply was
+          // sent on has died — finds the entry below and replays it,
+          // because that delivery was never confirmed (wave18).
+          ledger.delete(key);
+          entry = null;
+        }
+        if (entry && (entry.aborted || (entry.settled && Date.now() - entry.settledAt > replayWindowMs) || (!entry.settled && Date.now() - entry.createdAt > inFlightTimeoutMs))) {
           // A stuck in-flight entry expires like a settled one (deep audit
           // c23 #3): abort it so a proxy that honours the signal frees the
           // request, and let this resend execute fresh instead of joining
@@ -485,13 +533,20 @@ async function handleChannelSocket(ws, ctx) {
           entry = null;
         }
         if (!entry) {
-          entry = {settled: false, delivered: false, aborted: false, settledAt: 0, createdAt: Date.now(), result: null, listeners: new Set(), controller: null, promise: null};
+          entry = {settled: false, delivered: false, aborted: false, settledAt: 0, createdAt: Date.now(), result: null, listeners: new Set(), controller: null, promise: null, deliveredTo: new Set(), deliveryUnknown: false};
           const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
           entry.controller = controller;
           entry.promise = (async () => {
             try {
               const out = await ctx.proxy.request({method: msg.method, path: msg.path, body: msg.body, ...(controller ? {signal: controller.signal} : {})});
-              return {status: typeof out?.status === 'number' ? out.status : 502, body: out?.body ?? null};
+              const result = {status: typeof out?.status === 'number' ? out.status : 502, body: out?.body ?? null};
+              // Binary replies keep their encoding metadata (wave18): the
+              // proxy returns base64 bodies with bodyEncoding/contentType,
+              // and rounding them away here left the phone unable to tell
+              // a base64 media body from plain text.
+              if (out?.bodyEncoding) result.bodyEncoding = out.bodyEncoding;
+              if (out?.contentType) result.contentType = out.contentType;
+              return result;
             } catch (e) {
               // A request cancelled because its last interested channel went
               // away (below) has no outcome worth replaying: a resend must
@@ -527,10 +582,24 @@ async function handleChannelSocket(ws, ctx) {
         let out;
         try { out = await entry.promise; } finally { aborters.delete(orphanCheck); }
         if (entry.aborted || out === null) return; // cancelled: no reply, no replay
-        const delivered = sendApp({t: 'res', id: msg.id, status: out.status, body: out.body ?? null});
+        const resMsg = {t: 'res', id: msg.id, status: out.status, body: out.body ?? null};
+        if (out.bodyEncoding) resMsg.bodyEncoding = out.bodyEncoding;
+        if (out.contentType) resMsg.contentType = out.contentType;
+        const delivered = sendApp(resMsg);
         if (delivered) {
           entry.delivered = true;
-          if (ledger.get(key) === entry) ledger.delete(key);
+          entry.deliveredTo.add(channelRef);
+          deliveredEntries.add(entry);
+          // The entry is NOT deleted (wave18): sendApp returning true only
+          // means the reply entered this socket's buffer — the protocol has
+          // no acknowledgement, so a disconnect before the flush loses the
+          // reply invisibly, and deleting the entry here let a reconnecting
+          // phone's resend execute the same non-idempotent request a
+          // second time. The entry stays for the replay window: when every
+          // channel it was sent on has died, its delivery is marked
+          // unknown (deliveryUnknown) and a resend replays this outcome
+          // instead of executing again; a repeat on a channel that already
+          // received it is still a new request (see the lookup above).
         }
       })();
       pendingReqs.add(run);

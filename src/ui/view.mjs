@@ -2,15 +2,16 @@
 // redrawn); the live part below is diffed line by line (incrementalRendering), so streaming,
 // spinners and typing do not flicker. The caret is placed with useCursor so IME composes in place.
 import React, {useEffect, useRef, useState, useSyncExternalStore} from 'react';
-import {render, Box, Text, Static, useInput, usePaste, useCursor, useWindowSize} from 'ink';
+import {render, renderToString, Box, Text, Static, useInput, usePaste, useCursor, useWindowSize} from 'ink';
+import {bootSession} from './boot.mjs';
 import chalk from 'chalk';
 import {createRequire} from 'node:module';
 import path from 'node:path';
-import {Controller, COMMANDS} from './controller.mjs';
+import {COMMANDS} from './controller.mjs';
 import {createMd} from './md.mjs';
 import {sanitizeEmbeds} from './sanitize.mjs';
 const require = createRequire(import.meta.url);
-const {c, width, truncate, pad, wrap: wrapText} = require('../tui/term.js');
+const {c, width, truncate, pad, strip, wrap: wrapText} = require('../tui/term.js');
 const {logo} = require('../tui/logo.js');
 const {LABELS} = require('../policy.js');
 const {fragmentAt: mentionAt, complete: mentionComplete, listDiag: mentionDiag, loading: mentionLoading, COMPLETE_LIMIT} = require('../mentions.js');
@@ -46,21 +47,133 @@ export const glyphFor = call => {
     default: return call.command?.startsWith('shell.') ? '▶' : '⏺';
   }
 };
-const elapsed = ms => { const n = Number(ms); const s = Math.floor((Number.isFinite(n) && n > 0 ? n : 0) / 1000); return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's'; };
+const elapsed = ms => { const n = Number(ms); const s = Math.floor((Number.isFinite(n) && n > 0 ? n : 0) / 1000); return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : Math.floor(s / 3600) + 'h ' + Math.floor(s % 3600 / 60) + 'm ' + (s % 60) + 's'; };
 // A record read back from disk (resume, a remote snapshot from another version) can be
 // missing fields the producers always set today; renderers take what is there instead of
 // throwing, because a throw in render takes the whole screen down (deep c5 #1).
 const safeDiff = d => Array.isArray(d) ? d : [];
-// Keep the END of a string that is too wide (a file name, a changed diff tail, the text
-// being typed): the identifying part of a path or line is usually at its end.
+// --- styled-string tokens (the fullscreen primitives' tokens() walk, same
+// single-pass shape as term.js's own): cuts below walk these instead of raw
+// graphemes, so an ANSI escape is never split in half. A grapheme walk cut
+// the escapes inside STYLED values (the /status rows carry c.faint / c.green
+// spans), printing escape fragments as garbage and losing the style
+// (audit wave 6, following the fs side).
+const ANSI_SRC = '\\x1b\\[[0-?]*[ -/]*[@-~]' +
+  '|\\x1b\\][^\\x07\\x1b]*(?:\\x07|\\x1b\\\\|$)' +
+  '|\\x1b[PX^_][^\\x1b]*(?:\\x1b\\\\|$)' +
+  '|\\x1b[ -/]*[0-~]';
+const ANSI_AT = new RegExp(ANSI_SRC, 'y');
+const TABW = 8;
+const tabWidthAt = col => TABW - (col % TABW);
+function styledTokens(s) {
+  const out = []; const str = String(s);
+  const pushRun = run => {
+    if (!run) return;
+    if (graphemeSegmenter && /[\u0300-\u036f\u200d\u20e3\ufe00-\ufe0f\u{1f1e6}-\u{1f1ff}\u{1f3fb}-\u{1f3ff}\u{e0020}-\u{e007f}]/u.test(run)) {
+      for (const {segment} of graphemeSegmenter.segment(run)) out.push(segment === '\t' ? {ch: segment, w: 0, tab: true} : {ch: segment, w: width(segment)});
+    } else {
+      for (const ch of run) out.push(ch === '\t' ? {ch, w: 0, tab: true} : {ch, w: width(ch)});
+    }
+  };
+  let i = 0, runStart = 0;
+  while (i < str.length) {
+    if (str[i] === '\x1b') {
+      ANSI_AT.lastIndex = i; const m = ANSI_AT.exec(str);
+      if (m) { pushRun(str.slice(runStart, i)); out.push({esc: m[0]}); i += m[0].length; runStart = i; continue; }
+    }
+    i++;
+  }
+  pushRun(str.slice(runStart));
+  return out;
+}
+const styledTokenW = (t, col) => t.tab ? tabWidthAt(col) : t.w;
+// Keep the END of a string that is too wide (a file name, the text being
+// typed): the identifying part of a path is usually at its end. Style-safe
+// (wave 6): every escape before the kept tail is replayed in order, so the
+// tail renders in exactly the state the original string had there. For
+// plain text the result is what the old grapheme walk produced.
 const tailText = (str, max) => {
   const s = String(str ?? '');
   if (width(s) <= max) return s;
   if (max <= 1) return '…';
+  const toks = styledTokens(s);
+  let w = 0, start = toks.length;
+  for (let i = toks.length - 1; i >= 0; i--) {
+    const t = toks[i];
+    if (t.esc) continue;
+    const tw = t.tab ? tabWidthAt(w) : t.w;
+    if (w + tw > max - 1) break;
+    w += tw; start = i;
+  }
+  const pre = toks.slice(0, start).filter(t => t.esc).map(t => t.esc).join('');
+  return '…' + pre + toks.slice(start).map(t => t.esc ?? (t.tab ? '\t' : t.ch)).join('');
+};
+// Cut keeping the HEAD (the fs primitives' truncateEnd): the '…' keeps the
+// style of the last kept character — term.js truncate() inserts a reset
+// before its '…', which would strip the span the cut text sits inside.
+const truncateEnd = (s, max) => {
+  const str = String(s ?? '');
+  if (width(str) <= max) return str;
+  if (max <= 1) return '…';
   let w = 0, out = '';
-  const gs = graphemesOf(s);
-  for (let i = gs.length - 1; i >= 0; i--) { const gw = width(gs[i]); if (w + gw > max - 1) break; out = gs[i] + out; w += gw; }
-  return '…' + out;
+  const pending = [];
+  for (const t of styledTokens(str)) {
+    if (t.esc) { pending.push(t.esc); continue; }
+    const tw = styledTokenW(t, w);
+    if (w + tw > max - 1) break;
+    out += pending.join('') + t.ch; pending.length = 0; w += tw;
+  }
+  return out + '…';
+};
+// Cut the MIDDLE of a string that is too wide, keeping the head and the
+// tail (the fs primitives' truncateMiddle, wave 6): for texts whose meaning
+// sits at both ends — a flash whose last word is a negation — an end cut
+// silently drops the part that changes the meaning. Style-safe like
+// tailText: the escapes before the kept tail are replayed.
+function truncateMiddle(s, max) {
+  const str = String(s ?? '');
+  if (width(str) <= max) return str;
+  if (max <= 2) return truncateEnd(str, max);
+  // The tail gets slightly more than half: the suffix is usually the part
+  // that changes the meaning, and a wide character stopping the head
+  // early hands its leftover over anyway (below).
+  const budget = max - 1, headB = Math.ceil(budget * 0.45);
+  const toks = styledTokens(str);
+  let out = '', w = 0; const pending = [];
+  let headNext = toks.length;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t.esc) { pending.push(t.esc); continue; }
+    const tw = styledTokenW(t, w);
+    if (w + tw > headB) { headNext = i; break; }
+    out += pending.join('') + (t.tab ? '\t' : t.ch); pending.length = 0; w += tw; headNext = i + 1;
+  }
+  // The tail gets whatever the head did not use (a wide character can
+  // leave the head a cell short of its half).
+  const tailB = budget - w;
+  let tw2 = 0, tailStart = toks.length;
+  for (let i = toks.length - 1; i >= headNext; i--) {
+    const t = toks[i];
+    if (t.esc) continue;
+    const twd = t.tab ? 1 : t.w;
+    if (tw2 + twd > tailB) break;
+    tw2 += twd; tailStart = i;
+  }
+  if (tailStart >= toks.length) return out + '…';
+  const pre = toks.slice(0, tailStart).filter(t => t.esc).map(t => t.esc).join('');
+  return out + '…' + pre + toks.slice(tailStart).map(t => t.esc ?? (t.tab ? '\t' : t.ch)).join('');
+}
+// Expand tabs to spaces as the terminal renders them from `startCol`
+// (tab stops are every 8 cells from the line's start, prefix included) —
+// the fs diff's expandTabs, same code.
+const expandTabs = (s, startCol) => {
+  if (!s.includes('\t')) return s;
+  let col = startCol, out = '';
+  for (const g of graphemesOf(s)) {
+    if (g === '\t') { const n = 8 - (col % 8); out += ' '.repeat(n); col += n; continue; }
+    out += g; col += width(g);
+  }
+  return out;
 };
 // A path inside the working folder is shown relative; one outside it is shown as the
 // absolute path it is, not as a chain of ..\..\.. that has to be counted (deep r1 R1-6).
@@ -73,16 +186,47 @@ const T = (props, ...kids) => h(Text, props, ...kids);
 const Line = ({children, ...p}) => h(Text, {wrap: 'truncate-end', ...p}, children);
 
 // ---------- pieces ----------
-function Row({prefix, text, code}) {
-  // Opt-in ("wrap long code lines" in /settings, or MUSER_CODE_WRAP=1): long code/table rows wrap
-  // instead of being cut.
-  const wrap = code && !switchValue('codeWrap') ? 'truncate-end' : 'wrap';
+// Characters (graphemes of the plain text) that drawing `text` truncated
+// to a body of `bodyW` cells hides: everything truncateEnd does not keep
+// (its trailing '…' is not part of the text, so it is not counted). The
+// same counting as the fs side (fs/draw/entries/md.mjs hiddenChars), so
+// the classic and fullscreen screens report the same loss (wave 14,
+// W13-12).
+const hiddenChars = (text, bodyW) => {
+  const body = String(text ?? ' ');
+  if (width(body) <= bodyW) return 0;
+  const kept = Math.max(0, graphemesOf(strip(truncateEnd(body, bodyW))).length - 1);
+  return Math.max(0, graphemesOf(strip(body)).length - kept);
+};
+function Row({prefix, text, code, table}) {
+  // Opt-in ("wrap long code lines" in /settings, or MUSER_CODE_WRAP=1): long code rows wrap
+  // instead of being cut. Table rows never wrap, even with codeWrap on: a wrapped
+  // table row breaks its column borders and the rule under the header (wave 13),
+  // so tables always take the truncate side.
+  const wrap = table ? 'truncate-end' : code && !switchValue('codeWrap') ? 'truncate-end' : 'wrap';
   // The prefix (list marker, fence header) never shrinks: at narrow widths it was squeezed
   // into the text and the marker vanished (deep r1 R1-4, view side).
   return h(Box, null, h(Box, {flexShrink: 0}, h(Text, null, prefix)), h(Box, {flexShrink: 1}, h(Text, {wrap}, text || ' ')));
 }
-function Md({rows, first}) {
-  return h(Box, {flexDirection: 'column'}, rows.map((r, i) => h(Row, {key: i, prefix: (first && i === 0 ? '⏺ ' : '  ') + r.prefix, text: r.text, code: r.code})));
+function Md({rows, first, W}) {
+  // Wave 14 (W13-12), following the fs side (fs/draw/entries/md.mjs): a
+  // truncated row used to show only the bare '…' truncate-end appends, so
+  // the scale of the loss was invisible. When any table / truncated-code
+  // row of the entry is cut, ONE final line counts the characters the
+  // drawn lines hide (' … ほか {n} 文字'). The Md root has no explicit
+  // width, so it lays out at the terminal columns (W + 1, like the fs
+  // side's ctx.cols): each counted row's body is that minus its prefix,
+  // the width Row's text box actually gets. Table rows always count;
+  // code rows only when codeWrap is off (the rows Row truncates).
+  const cols = (W ?? 99) + 1, codeWrap = switchValue('codeWrap');
+  let hidden = 0;
+  const kids = (rows || []).map((r, i) => {
+    const prefix = (first && i === 0 ? '⏺ ' : '  ') + (r.prefix ?? '');
+    if (r.table || (r.code && !codeWrap)) hidden += hiddenChars(r.text || ' ', Math.max(1, cols - width(prefix)));
+    return h(Row, {key: i, prefix, text: r.text, code: r.code, table: r.table});
+  });
+  if (hidden > 0) kids.push(h(Text, {key: 'more', wrap: 'truncate-end'}, ' ' + c.faint(t(' … ほか {n} 文字', {n: hidden}))));
+  return h(Box, {flexDirection: 'column'}, kids);
 }
 function todoLine(t) {
   const content = String(t?.content ?? '');
@@ -98,22 +242,32 @@ function TodoRow({td}) {
   const text = td.status === 'completed' ? c.faint(c.strike(content)) : td.status === 'in_progress' ? c.bold(content) : content;
   return h(Box, null, h(Text, null, '  '), h(Box, {flexShrink: 0}, h(Text, null, mark)), h(Box, {flexShrink: 1}, h(Text, {wrap: 'wrap'}, text || ' ')));
 }
-function Diff({diff, W, max = 30}) {
+function Diff({diff, W, max = 30, omitted = 0}) {
   diff = safeDiff(diff);
   // Only the rows shown count: Math.max(...all rows) threw a RangeError past ~150,000 rows (a new
   // 200,000-line file), and a throw in render takes the whole screen down.
   const numW = Math.max(3, String(diff.slice(0, max).reduce((m, d) => Math.max(m, d.n || 0), 0)).length), bodyW = W - numW - 12;
   const lines = diff.slice(0, max).map((d, i) => {
     if (d.t === '…') return h(Line, {key: i, color: DIM}, '      ' + ' '.repeat(numW) + ' ⋮');
-    // A changed line is cut at its END, where the change usually is: cutting the head made an
-    // old and a new line that differ only at the end look identical (deep r1 R1-2).
-    const raw = String(d.l ?? ''), cut = (d.t === '+' || d.t === '-') && width(raw) > bodyW ? tailText(raw, bodyW) : truncate(raw, bodyW);
+    // A changed line that is too wide is cut keeping its HEAD (wave 6, following
+    // the fs side; it used to keep the tail, which hid what the line starts
+    // with — the change itself usually reads from the start); a context line
+    // keeps the term.js truncate cut. Tabs are expanded to spaces BEFORE
+    // measuring, at the column the body actually starts (after the indent +
+    // number + sign prefix): width() measures a tab from column 0, so a tabbed
+    // line's measured width was short of its rendered width and the +/-
+    // background band (pad to bodyW) ended early (wave 6).
+    const raw = expandTabs(String(d.l ?? ''), numW + 9); // 6 spaces + num + ' + ' / '   '
+    const cut = (d.t === '+' || d.t === '-') ? truncateEnd(raw, bodyW) : truncate(raw, bodyW);
     const num = String(d.n || '').padStart(numW), body = pad(cut, bodyW);
     if (d.t === '+') return h(Box, {key: i}, h(Text, null, '      '), h(Line, {backgroundColor: '#193c23', color: '#aaebaa'}, num + ' + ' + body));
     if (d.t === '-') return h(Box, {key: i}, h(Text, null, '      '), h(Line, {backgroundColor: '#461c20', color: '#f5aaaa'}, num + ' - ' + body));
     return h(Line, {key: i}, '      ' + c.faint(num) + '   ' + c.gray(truncate(raw, bodyW)));
   });
-  if (diff.length > max) lines.push(h(Line, {key: 'more', color: DIM}, '      ' + t('… ほか {n} 行', {n: diff.length - max})));
+  // History entries keep only the first DIFF_KEEP lines plus an omitted count (src/slim-call.js):
+  // the hidden total is the same number the full array used to produce.
+  const hidden = (diff.length > max ? diff.length - max : 0) + (omitted || 0);
+  if (hidden > 0) lines.push(h(Line, {key: 'more', color: DIM}, '      ' + t('… ほか {n} 行', {n: hidden})));
   return h(Box, {flexDirection: 'column'}, lines);
 }
 function Tool({call, cwd, W}) {
@@ -124,9 +278,11 @@ function Tool({call, cwd, W}) {
   // The marker's colour says how it went: a command that ran but exited non-zero is not green, and
   // a step the user declined is their choice (yellow), not a failure (red).
   const mark = call.declined ? c.yellow : !call.ok || (call.command === 'system.run' && v.exit) ? c.red : c.green;
-  // The summary is usually a path: cut it at the START so the file name (its end) survives
-  // at ordinary widths (deep r1 R1-5).
-  const sumText = String(call.summary || ''), sumShown = tailText(sumText, Math.max(8, W - width(title(call)) - 5));
+  // The summary is cut at its END (wave 6, following the fs side): keeping
+  // the tail hid the command's verb — 'npm test' read as '…test' — which is
+  // the part that says what the call does. The header Line truncates at the
+  // screen width anyway.
+  const sumText = String(call.summary || ''), sumShown = truncateEnd(sumText, Math.max(8, W - width(title(call)) - 5));
   const kids = [h(Line, {key: 'h'}, mark(glyphFor(call) + ' ') + c.bold(title(call)) + c.gray('(' + sumShown + ')'))];
   if (!call.ok) {
     const errText = String(call.error || '');
@@ -143,14 +299,17 @@ function Tool({call, cwd, W}) {
   else if (call.kind === 'mcp') { const lines = String(v.text || '').trim().split('\n').filter(l => l.trim()); kids.push(res(h(Box, {flexDirection: 'column'}, ...(lines.length ? lines.slice(0, 4) : [t('(結果なし)')]).map((l, i) => h(Line, {key: i, color: GRAY}, l)), ...(lines.length > 4 ? [h(Line, {key: 'm', color: DIM}, t('… ほか {n} 行', {n: lines.length - 4}))] : [])))); }
   else if (call.command === 'code.read') kids.push(res(h(Text, {color: GRAY}, t('{n} 行を読み込み', {n: v.lines}))));
   else if (call.command === 'code.grep' || call.command === 'code.glob') kids.push(res(h(Text, {color: GRAY}, call.command === 'code.grep' ? t('{n} 件ヒット', {n: v.count}) : t('{n} ファイル', {n: v.count}))));
-  else if (v.files) v.files.forEach((f, i) => { kids.push(res(h(Text, null, c.bold(rel(f.path)) + '  ' + c.green('+' + (f.added || 0)) + ' ' + c.red('-' + (f.removed || 0))), 'f' + i)); kids.push(h(Diff, {key: 'd' + i, diff: safeDiff(f.diff), W, max: 24})); });
-  else if (v.diff) { const vd = safeDiff(v.diff); let added = 0, removed = 0; for (const d of vd) { if (d.t === '+') added++; else if (d.t === '-') removed++; } kids.push(res(h(Text, null, c.green('+' + added) + ' ' + c.red('-' + removed)))); kids.push(h(Diff, {key: 'd', diff: vd, W})); }
+  else if (v.files) v.files.forEach((f, i) => { kids.push(res(h(Text, null, c.bold(rel(f.path)) + '  ' + c.green('+' + (f.added || 0)) + ' ' + c.red('-' + (f.removed || 0))), 'f' + i)); kids.push(h(Diff, {key: 'd' + i, diff: safeDiff(f.diff), omitted: f.diffOmitted || 0, W, max: 24})); });
+  else if (v.diff) { const vd = safeDiff(v.diff); let added = 0, removed = 0; if (typeof v.diffAdded === 'number' && typeof v.diffRemoved === 'number') { added = v.diffAdded; removed = v.diffRemoved; } else { for (const d of vd) { if (d.t === '+') added++; else if (d.t === '-') removed++; } } kids.push(res(h(Text, null, c.green('+' + added) + ' ' + c.red('-' + removed)))); kids.push(h(Diff, {key: 'd', diff: vd, omitted: v.diffOmitted || 0, W})); }
   else if (call.command === 'system.run') {
     const tail = (v.tail || []).filter(l => l.trim());
     kids.push(res(h(Box, {flexDirection: 'column'}, ...(tail.length ? tail : [t('(出力なし)')]).map((l, i) => h(Line, {key: i, color: GRAY}, l)),
       ...(call.outputLines > tail.length ? [h(Text, {key: 'more', color: DIM}, t('… ほか {n} 行（/output で全文）', {n: call.outputLines - tail.length}))] : []),
       ...(v.exit ?[h(Text, {key: 'x', color: '#f06e6e'}, v.killed === 'timeout' ? t('タイムアウト') : v.killed === 'cancelled' ? t('中断しました') : 'exit ' + v.exit)] : []))));
   }
+  // 想定外ストップ (src/expect.js): a missed prediction is named on the tool row itself,
+  // under whichever result the branch above drew. A matched prediction stays quiet.
+  if (v.expect && v.expect.matched === false) kids.push(res(h(Text, {color: '#e6be64', wrap: 'wrap'}, t('想定外: 予想 {expected} / 実際 {actual}', {expected: v.expect.expected, actual: v.expect.actual})), 'expect'));
   return h(Box, {flexDirection: 'column', marginBottom: 1}, kids);
 }
 // One unit that never shrinks: the row wraps whole keycaps when the labels (English) run long.
@@ -193,7 +352,7 @@ function Entry({e, ctrl, W}) {
         ...(e.missing?.length ? [h(Line, {key: 'miss'}, '  ' + c.yellow(t('見つからない: {list}', {list: e.missing.join(', ')})))] : []),
         ...(e.images || []).map((n, i) => h(Line, {key: 'img' + i}, '  ' + c.accent('▣ ') + c.gray(t('画像 {i} {name}', {i: i + 1, name: n})))));
     }
-    case 'md': return h(Md, {rows: e.rows, first: e.first});
+    case 'md': return h(Md, {rows: e.rows, first: e.first, W});
     case 'progress': return h(Box, {marginBottom: 1, width: W},
       h(Text, {color: ACCENT}, '⏺ '),
       h(Box, {flexShrink: 1, flexDirection: 'column'}, h(Text, {wrap: 'wrap'}, sanitizeEmbeds(e.message)),
@@ -218,6 +377,16 @@ function Entry({e, ctrl, W}) {
           : [h(Text, {key: 'none', color: DIM}, t('条件: なし'))]),
         e.focus.reason ? h(Box, {marginLeft: 2}, h(Text, {color: DIM, wrap: 'wrap'}, e.focus.reason)) : null);
     }
+    case 'proof': {
+      // /proof (evidence badges): an accent title, then one hanging row per
+      // judged claim — the mark carries the verdict's colour (✓ green,
+      // ✗ red, ? yellow), plain lines stay gray like a note.
+      const markOf = l => /^[✓?✗] /.test(String(l)) ? String(l)[0] : ' ';
+      const colorOf = m => m === '✓' ? '#78cd82' : m === '✗' ? '#f06e6e' : m === '?' ? '#e6be64' : GRAY;
+      return h(Box, {flexDirection: 'column', marginBottom: 1},
+        e.title ? h(Text, {color: ACCENT}, String(e.title)) : null,
+        ...(e.lines || []).map((l, i) => { const m = markOf(l); return h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: colorOf(m)}, m === ' ' ? '  ' : m + ' ')), h(Box, {flexShrink: 1}, h(Text, {color: colorOf(m), wrap: 'wrap'}, m === ' ' ? String(l) : String(l).slice(2)))); }));
+    }
     case 'gap': return h(Text, null, ' ');
     case 'shellout': { const slines = e.lines || []; return h(Box, {flexDirection: 'column', marginBottom: 1},
       h(Line, null, c.accent('⚙ ') + c.bold(e.id) + c.gray(e.running ? t('  実行中') : t('  終了 exit {exit}', {exit: e.exit}))),
@@ -233,13 +402,15 @@ function Entry({e, ctrl, W}) {
         // The elapsed time sits before the (cuttable) title, so a narrow screen keeps it (first B19).
         h(Line, null, mark + ' ' + c.accent(c.bold(t('エージェント {tag}', {tag: x.tag}))) + c.faint(' ' + (x.type || '')) + c.faint('   ' + elapsed((x.ended || Date.now()) - (x.started || 0))) + c.gray('  ' + (x.title || ''))),
 
-        ...md.rows(body.slice(0, max)).map((r, i) => h(Row, {key: i, prefix: r.prefix, text: r.text, code: r.code})),
+        ...md.rows(body.slice(0, max)).map((r, i) => h(Row, {key: i, prefix: r.prefix, text: r.text, code: r.code, table: r.table})),
         ...(body.length > max ? [h(Line, {key: 'more', color: DIM}, t('… ほか {n} 行（/agents で全文）', {n: body.length - max}))] : []));
     }
     case 'tool': return h(Tool, {call: e.call, cwd: a.cwd, W});
     case 'past': { // tools and Muse steps of a turn shown again on resume, compact
       const lines = [
-        ...(e.steps || []).map(s => (s.failed ? c.red('⏺ ') : c.faint('⏺ ')) + c.gray(s.title) + c.faint('  (Muse)')),
+        // A failed step carries a ✗ mark as well as its red, like an error note
+        // does, so the failure survives NO_COLOR (audit wave 6).
+        ...(e.steps || []).map(s => (s.failed ? c.red('✗ ') : c.faint('⏺ ')) + c.gray(s.title) + c.faint('  (Muse)')),
         // The error cut follows the screen width and says it cut (deep r1 R1-7): a fixed
         // 60 chars with no ellipsis hid the reason even on a 200-wide terminal.
         ...(e.tools || []).map(t => (t.ok ? c.faint(glyphFor(t) + ' ') : c.red(glyphFor(t) + ' ')) + c.gray(String(t.command).replace(/^code\./, '') + (t.summary ? ' ' + t.summary : '')) + (t.ok ? '' : c.red('  ' + truncate(String(t.error || ''), Math.max(60, W - 20))))),
@@ -247,16 +418,29 @@ function Entry({e, ctrl, W}) {
       return h(Box, {flexDirection: 'column', marginBottom: 1}, ...lines.slice(0, 6).map((l, i) => h(Line, {key: i}, l)),
         ...(lines.length > 6 ? [h(Line, {key: 'more', color: DIM}, t('  … ほか {n} 件', {n: lines.length - 6}))] : []));
     }
+    // A failed step carries a ✗ mark as well as its red, like an error note
+    // does, so the failure survives NO_COLOR (audit wave 6).
     case 'muse': return h(Box, {flexDirection: 'column', marginBottom: 1},
-      h(Line, null, (e.step.failed ? c.red('⏺ ') : c.accent('⏺ ')) + c.bold(e.step.title) + c.faint(e.step.unfinished ? t('  (Muse · 実行中のまま)') : '  (Muse)')),
+      h(Line, null, (e.step.failed ? c.red('✗ ') : c.accent('⏺ ')) + c.bold(e.step.title) + c.faint(e.step.unfinished ? t('  (Muse · 実行中のまま)') : '  (Muse)')),
       e.step.detail ? h(Box, null, h(Text, {color: DIM}, '  ⎿  '), h(Box, {flexShrink: 1}, h(Text, {color: e.step.failed ? '#f06e6e' : GRAY, wrap: 'wrap'}, e.step.detail))) : null);
     case 'sources': return h(Box, {flexDirection: 'column', marginBottom: 1}, h(Text, {color: DIM}, t('  出典')),
-      ...(e.items || []).slice(0, 6).map((s, i) => { const label = String(s.label || s.domain || ''), uri = String(s.uri || ''); const labelShown = truncate(label, Math.min(width(label), Math.max(6, W - 32))); const uriShown = tailText(uri, Math.max(10, W - 7 - width(labelShown))); return h(Line, {key: i, color: GRAY}, '  ' + (i + 1) + '. ' + labelShown + c.faint('  ' + uriShown)); }),
+      ...(e.items || []).slice(0, 6).map((s, i) => { const label = String(s.label || s.domain || ''), uri = String(s.uri || ''); const labelShown = truncate(label, Math.min(width(label), Math.max(6, W - 32))); const uriBudget = W - 7 - width(labelShown); const uriShown = uriBudget >= 4 ? tailText(uri, uriBudget) : ''; /* master-debug #20: same budget fix as the fs draw */ return h(Line, {key: i, color: GRAY}, '  ' + (i + 1) + '. ' + labelShown + c.faint('  ' + uriShown)); }),
       ...((e.items || []).length > 6 ? [h(Line, {key: 'more', color: DIM}, t('  … ほか {n} 件', {n: e.items.length - 6}))] : []));
-    case 'end': { const u = e.usage; const usage = u && (u.inputTokens || u.outputTokens || !(Number.isFinite(u.inputTokens) && Number.isFinite(u.outputTokens))) ? require('../turn-usage').usageText(u) : null; return h(Box, null, e.ok ? h(Text, {color: DIM}, '  ✻ ' + elapsed(e.ms) + (usage ? ' · ' + usage : '')) : h(Text, {color: e.aborted ? '#e6be64' : '#f06e6e', wrap: 'wrap'}, '  ⎿  ' + (e.aborted ? t('中断しました') : String(e.error || '')))); }
+    case 'end': { const u = e.usage; const usage = u && (u.inputTokens || u.outputTokens || !(Number.isFinite(u.inputTokens) && Number.isFinite(u.outputTokens))) ? require('../turn-usage').usageText(u) : null; return h(Box, null, e.ok ? h(Text, {color: DIM}, '  ✻ ' + elapsed(e.ms) + (usage ? ' · ' + usage : '') + (e.silent ? ' · ' + t('返事がありませんでした') : '')) : h(Text, {color: e.aborted ? '#e6be64' : '#f06e6e', wrap: 'wrap'}, '  ⎿  ' + (e.aborted ? t('中断しました') : String(e.error || '')))); }
     // A note wraps with a hanging indent (first B18), and an error note carries a mark as
     // well as its colour, so it stays an error with NO_COLOR (deep r4 R4-8).
     case 'note': return h(Box, {flexDirection: 'column', marginBottom: 1}, (e.lines || []).map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: e.level === 'error' ? '#f06e6e' : GRAY}, e.level === 'error' ? '✗ ' : '  ')), h(Box, {flexShrink: 1}, h(Text, {color: e.level === 'error' ? '#f06e6e' : GRAY, wrap: 'wrap'}, String(l))))));
+    case 'lore': return h(Box, {flexDirection: 'column', marginBottom: 1}, ...(e.title ? [h(Text, {key: 'title', bold: true}, String(e.title))] : []), ...(e.lines || []).map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: GRAY}, '  ')), h(Box, {flexShrink: 1}, h(Text, {color: GRAY, wrap: 'wrap'}, String(l))))));
+    // The bug-hunt lines (/hunt): the note shape, drawn identically by the fullscreen renderer (draw/entries/hunt.mjs).
+    case 'hunt': return h(Box, {flexDirection: 'column', marginBottom: 1}, (e.lines || []).map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: e.level === 'error' ? '#f06e6e' : GRAY}, e.level === 'error' ? '✗ ' : '  ')), h(Box, {flexShrink: 1}, h(Text, {color: e.level === 'error' ? '#f06e6e' : GRAY, wrap: 'wrap'}, String(l))))));
+    // A race result （競争） draws exactly like a note: gray hanging lines.
+    case 'race': return h(Box, {flexDirection: 'column', marginBottom: 1}, (e.lines || []).map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: GRAY}, '  ')), h(Box, {flexShrink: 1}, h(Text, {color: GRAY, wrap: 'wrap'}, String(l))))));
+    // Night work (/overnight): a note with a moon mark, so a queue list or the
+    // morning report reads as its own kind of entry in both renderers.
+    case 'overnight': return h(Box, {flexDirection: 'column', marginBottom: 1}, (e.lines || []).map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: ACCENT}, '☾ ')), h(Box, {flexShrink: 1}, h(Text, {color: GRAY, wrap: 'wrap'}, String(l))))));
+    // The crash investigation's report (src/crash-investigate.js): a bold heading over
+    // note-shaped lines, so the panel reads the same in both renderers.
+    case 'crash': return h(Box, {flexDirection: 'column', marginBottom: 1}, h(Text, {bold: true}, t('クラッシュ調査')), ...(e.lines || []).map((l, i) => h(Box, {key: i}, h(Box, {flexShrink: 0}, h(Text, {color: GRAY}, '  ')), h(Box, {flexShrink: 1}, h(Text, {color: GRAY, wrap: 'wrap'}, String(l))))));
     case 'help': {
       // Descriptions wrap under themselves instead of being cut with …: /help is where they are read
       // in full. The keys are one per cell of a grid; as one run-on paragraph they wrapped to the
@@ -294,6 +478,21 @@ function Entry({e, ctrl, W}) {
     // still names itself (deep r3 R8, first U8's gateway wording).
     if (W < 40) return h(Box, {flexDirection: 'column', marginBottom: 1}, ...rows.flatMap(([k, v]) => [h(Line, {key: k, bold: true}, '  ' + k), h(Line, {key: k + 'v'}, '    ' + tailText(v, Math.max(10, W - 4)))]));
     return h(Box, {flexDirection: 'column', marginBottom: 1}, ...rows.map(([k, v]) => h(Line, {key: k}, '  ' + c.gray(pad(k, kw)) + v))); }
+    // /parity (environment comparison, stage 1): a bold title, then per section an
+    // optional bold heading and its label/value rows — the /status row shape, with
+    // the label column fitted to the widest label of the whole entry. Under 40
+    // columns the rows stack exactly like /status.
+    case 'parity': { const rows = (e.sections || []).flatMap(s => s.rows || []); const kw = Math.max(6, ...rows.map(([k]) => width(k) + 2));
+    const children = [];
+    if (e.title) children.push(h(Line, {key: 'title', bold: true}, '  ' + e.title));
+    (e.sections || []).forEach((s, si) => {
+      if (s.heading) children.push(h(Line, {key: 'h' + si, bold: true}, '  ' + s.heading));
+      (s.rows || []).forEach(([k, v], ri) => {
+        if (W < 40) children.push(h(Line, {key: 'l' + si + '-' + ri, bold: true}, '  ' + k), h(Line, {key: 'v' + si + '-' + ri}, '    ' + tailText(v, Math.max(10, W - 4))));
+        else children.push(h(Line, {key: 'r' + si + '-' + ri}, '  ' + c.gray(pad(k, kw)) + v));
+      });
+    });
+    return h(Box, {flexDirection: 'column', marginBottom: 1}, ...children); }
     default: return null;
   }
 }
@@ -314,13 +513,16 @@ function usageWindowRows() {
 
 // ---------- live area ----------
 function focusLabel(status) {
-  return t(({running: '確認中', complete: '条件の根拠が揃いました', needs_input: '確認・判断待ち', stalled: '進展がないため停止', limit: '上限で停止', stopped: '中断', blocked: '続行できません'})[status] || '確認中');
+  return t(({running: '確認中', complete: '条件の根拠が揃いました', needs_input: '確認・判断待ち', stalled: '進展がないため停止', limit: '上限で停止', stopped: '中断しました', blocked: '続行できません', inactive: '追跡対象外'})[status] || '確認中');
 }
+// The fullscreen screen renders the live area to a string on every frame, where no effect
+// runs and every state starts at 0: there the tick is read off the clock instead.
+let clockTicks = false;
 function useTick(active, ms = 100) {
   const [n, setN] = useState(0);
   const motion = switchValue('motion');
   useEffect(() => { if (!active || !motion) return; const t = setInterval(() => setN(x => x + 1), ms); return () => clearInterval(t); }, [active, ms, motion]);
-  return n;
+  return clockTicks ? (active && motion ? Math.floor(Date.now() / ms) : 0) : n;
 }
 // The spinner word: Muse's own, from spinner.set; until it sends one, a word from this list —
 // English in both languages, a different one each turn, kept for the whole turn (picked from when
@@ -376,6 +578,20 @@ function Approval({a, ctrl, W}) {
     if (hiddenLines > 0 && partialChars > 0) rows.push(h(Text, {key: 'cmore', color: '#e6be64'}, t('… ほか {n} 行と {m} 文字（全部で {total} 行。見えていない行も実行されます）', {n: hiddenLines, m: partialChars, total: cmdLines.length})));
     else if (hiddenLines > 0) rows.push(h(Text, {key: 'cmore', color: '#e6be64'}, t('… ほか {n} 行（全部で {total} 行。見えていない行も実行されます）', {n: hiddenLines, total: cmdLines.length})));
     else if (partialChars > 0) rows.push(h(Text, {key: 'cmore', color: '#e6be64'}, t('… ほか {n} 文字（全部で {total} 文字。見えていない部分も実行されます）', {n: partialChars, total: cmd.length})));
+    // When anything was cut, the command's TAIL is shown too (wave 6, following
+    // the fs side): the dangerous part of a command — a trailing '; rm …', a
+    // final redirect — sits at the end, exactly what a head-only preview hid
+    // while asking for approval. The end of a partially shown line comes
+    // first, then the last up-to-3 hidden lines.
+    if (hiddenLines > 0 || partialChars > 0) {
+      const tail = [];
+      if (partialChars > 0 && shownLines > 0) tail.push('…' + cmdLines[shownLines - 1].slice(-Math.max(10, (W - 4) - 1)));
+      for (const l of cmdLines.slice(shownLines).slice(-3)) tail.push(l);
+      if (tail.length) {
+        rows.push(h(Text, {key: 'ctailh', color: DIM}, t('末尾:')));
+        tail.forEach((l, i) => rows.push(h(Text, {key: 'ctail' + i, wrap: 'wrap'}, l)));
+      }
+    }
     if (call.params?.cwd) rows.push(h(Text, {key: 'cwd', color: GRAY}, t('場所: {cwd}', {cwd: call.params.cwd})));
   } else if (a.preview?.error) rows.push(h(Text, {key: 'e', color: '#f06e6e', wrap: 'wrap'}, t('プレビューできません: {error}', {error: a.preview.error})));
   else if (a.preview?.files) {
@@ -404,6 +620,8 @@ function Approval({a, ctrl, W}) {
   }
   else if (a.preview?.diff) rows.push(h(Diff, {key: 'd', diff: safeDiff(a.preview.diff), W: W - 4, max: Math.max(8, (process.stdout.rows || 30) - 18)}));
   if (a.outside) rows.push(h(Text, {key: 'o', color: '#e6be64'}, t('⚠ 作業フォルダーの外への書き込みです')));
+  if (a.loreGrave) rows.push(h(Text, {key: 'lg', color: '#e6be64', wrap: 'wrap'}, t('⚠ 言い伝え（墓標）: この書き込みは、以前わざわざ消されたコードに似ています。消した理由が今も当てはまるなら、書き戻さないでください（詳しくは /lore）')));
+  if (call.tellClaim) rows.push(h(Text, {key: 'tc', color: '#e6be64'}, t('このファイルは {name} が担当中です', {name: call.tellClaim.name})));
   return h(Box, {flexDirection: 'column', marginTop: 1},
     h(Box, {flexDirection: 'column', borderStyle: 'round', borderColor: '#e6be64', paddingX: 1, width: W},
       h(Line, null, (call.agent && call.agent !== 'main' ? c.accent(t('[エージェント {agent}] ', {agent: call.agent})) : '') + c.yellow(c.bold(call.kind === 'exec' ? title(call) + t(' コマンド') : title(call))) + (call.kind === 'exec' ? '' : '  ' + (call.summary || ''))),
@@ -440,11 +658,18 @@ function Menu({m, W}) {
             const label = (i + 1) + '. ' + o.label, col = o.danger ? c.red : c.text;
             // The label box is 2 cells short of its column, so a label cut at the column
             // edge still leaves a gap before the description (deep r3 R6). The selected
-            // row's description wraps whole instead of being cut (first I4).
+            // row's description wraps whole instead of being cut (first I4); an unselected
+            // row's description is end-cut on one line (the fs draw does the same).
+            // A label that does not fit is cut in the MIDDLE, not at the end (the fs
+            // draw's menu, wave 6): an end cut dropped the label's suffix — the part
+            // that tells options apart, like '…（復元できません）' — and two options
+            // read as the same choice. The cut width is the label's own box: the whole
+            // row minus the cursor column in narrow mode, the label column otherwise.
+            const styledLabel = (on ? c.bold(col(label)) : col(label)) + mark;
             const row = narrow
-              ? h(Box, {key: i, flexDirection: 'column'}, h(Box, null, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {flexShrink: 1}, h(Line, null, (on ? c.bold(col(label)) : col(label)) + mark))),
+              ? h(Box, {key: i, flexDirection: 'column'}, h(Box, null, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {flexShrink: 1}, h(Line, null, truncateMiddle(styledLabel, W - 6)))),
                 o.desc ? h(Box, {paddingLeft: 2}, h(Text, {color: on ? GRAY : DIM, wrap: on ? 'wrap' : 'truncate-end'}, o.desc)) : null)
-              : h(Box, {key: i}, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {width: Math.max(4, labelW - 2), flexShrink: 0, marginRight: 2}, h(Line, null, (on ? c.bold(col(label)) : col(label)) + mark)),
+              : h(Box, {key: i}, h(Box, {flexShrink: 0, width: 2}, h(Text, null, on ? c.accent('❯') : ' ')), h(Box, {width: Math.max(4, labelW - 2), flexShrink: 0, marginRight: 2}, h(Line, null, truncateMiddle(styledLabel, Math.max(4, labelW - 2)))),
                 h(Box, {flexShrink: 1}, h(Text, {color: on ? GRAY : DIM, wrap: on ? 'wrap' : 'truncate-end'}, o.desc || '')));
             // A genre header when the group changes (/settings groups its rows):
             // display only — numbering and picking stay per option. The first
@@ -508,9 +733,21 @@ function Question({q, W}) {
   } else if (cur) {
     kids.push(h(Text, {key: 'q', bold: true}, cur.question + (cur.multi ? t('（複数選択）') : '')));
     const opts = cur.options || [], checked = q.checked?.[q.tab] || [], rows = [];
+    // The preview split is settled before the rows are built: an option label's
+    // cut width is its pane's width (the fs draw's question does the same).
+    const sel = q.index < opts.length ? opts[q.index] : null, preview = sel?.preview ? String(sel.preview) : null;
+    // Under 60 columns the preview goes UNDER the options at full width: side by side, its
+    // pane was a few cells wide and every line broke mid-phrase (first B6).
+    const vertical = !!preview && W < 60;
+    const leftW = preview && !vertical ? Math.max(20, Math.floor(innerW * 0.45)) : innerW;
     opts.forEach((o, i) => {
       const on = i === q.index, box = cur.multi ? (checked.includes(i) ? '[✓] ' : '[ ] ') : '';
-      const label = (i + 1) + '. ' + o.label;
+      // The label is cut in the MIDDLE when it does not fit (the fs draw's
+      // question, wave 6): an end cut dropped its suffix — the part that tells
+      // options apart, like '…（復元できません）' — and two options read as the
+      // same choice. The description under an unselected option stays end-cut
+      // on one line below; the selected one's wraps whole.
+      const label = truncateMiddle((i + 1) + '. ' + o.label, Math.max(4, leftW - 2 - width(box)));
       rows.push(h(Line, {key: 'o' + i}, (on ? c.accent('❯ ') : '  ') + box + (on ? c.bold(label) : label)));
       // The selected option's description wraps whole: it is the text being chosen between,
       // and a truncated description cannot be read anywhere else (first B5).
@@ -528,11 +765,6 @@ function Question({q, W}) {
     rows.push(h(Line, {key: 'sep', color: DIM}, '  ' + '─'.repeat(12)));
     const chatOn = q.index === opts.length + 1, chatLabel = t('この件について話す');
     rows.push(h(Line, {key: 'chat', color: DIM}, (chatOn ? c.accent('❯ ') : '  ') + (chatOn ? c.bold(chatLabel) : chatLabel)));
-    const sel = q.index < opts.length ? opts[q.index] : null, preview = sel?.preview ? String(sel.preview) : null;
-    // Under 60 columns the preview goes UNDER the options at full width: side by side, its
-    // pane was a few cells wide and every line broke mid-phrase (first B6).
-    const vertical = !!preview && W < 60;
-    const leftW = preview && !vertical ? Math.max(20, Math.floor(innerW * 0.45)) : innerW;
     const left = h(Box, {key: 'left', flexDirection: 'column', flexShrink: 0, width: leftW}, rows);
     let right = null, previewHidden = 0;
     if (preview) {
@@ -579,7 +811,10 @@ function layout(text, pos, max) {
 }
 function Chips({list, W}) {
   if (!list?.length) return null;
-  const kb = n => n < 1024 * 1024 ? Math.round(n / 1024) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB';
+  // Under 1 KB the byte count itself is shown: rounding to KB made a real file of
+  // a few hundred bytes read as '0 KB' (empty), and just under 1 MB rounded up to
+  // '1024 KB' instead of rolling into MB (audit wave 6).
+  const kb = n => n < 1024 ? Math.round(n) + ' B' : Math.round(n / 1024) < 1024 ? Math.round(n / 1024) + ' KB' : (n / 1024 / 1024).toFixed(1) + ' MB';
   // One chip per line: side by side they wrapped INTO each other and the names and sizes
   // interleaved into nonsense; the hint gets a line of its own too (first B1). On a
   // narrow screen the SIZE is what goes: the name is the part that identifies the file.
@@ -606,6 +841,17 @@ function useBoxPosition(ref) {
     return () => clearTimeout(id);
   });
   return pos;
+}
+// Where Prompt puts the caret, for the fullscreen screen (src/ui/fs/app.mjs), which draws the
+// box from a string and places the terminal cursor itself: row/col inside the box, and whether
+// the "↑ more lines" row sits above the text. Same arithmetic as Prompt below.
+export function promptCaret(s, W) {
+  if (s.limitInput) s = {...s, text: s.limitInput.text, pos: s.limitInput.text.length, busy: false, reasonFor: null};
+  const head = s.reasonFor ? t('理由 ') : '❯ ', inner = W - 4 - width(head);
+  const {lines: all, cur} = layout(s.text, s.pos, inner);
+  const max = Math.max(4, Math.min(30, (process.stdout.rows || 30) - 14));
+  const start = all.length <= max ? 0 : Math.max(0, Math.min(cur.row - Math.floor(max / 2), all.length - max));
+  return {row: cur.row - start, col: 2 + width(head) + cur.col, above: start > 0};
 }
 function Prompt({s, W}) {
   const ref = useRef(null), box = useBoxPosition(ref), {setCursorPosition} = useCursor();
@@ -740,20 +986,46 @@ function Footer({s, ctrl, W}) {
   // On a narrow screen a warning on the right (login, an update) outranks the mode label
   // on the left: with both, the warning's own command was the thing cut (first B2).
   const hideLeft = !s.flash && W < 48 && (s.loginNeeded || s.update?.latest);
+  // A flash is cut in the MIDDLE (wave 6, following the fs side): an end cut
+  // dropped the tail of the sentence, which in Japanese is where the negation
+  // lives — '…できません' read as its opposite. Head and tail both survive.
+  // The narrow-screen cap (half the width, the Box maxWidth below) cuts in the
+  // middle too, as the fs side's second cut does.
+  const flashCut = leftW > W - 4 ? truncateMiddle(flashText, W - 4) : flashText;
+  const flashCap = W < 48 ? Math.floor(W / 2) : Infinity;
+  const flashShown = width(flashCut) > flashCap ? truncateMiddle(flashCut, flashCap) : flashCut;
+  // When the cap cut lands a cell short of the cap on a wide character, the
+  // box still stays the cap wide (the fs side's leftBoxW), or the right side
+  // shifts a cell and its cut moves with it.
+  const flashBoxW = s.flash && width(flashCut) > flashCap ? flashCap : undefined;
   return h(Box, {paddingX: 1, width: W, justifyContent: 'space-between'},
     // On a narrow screen the left half is capped at half the width, so the connection dot
     // on the right always survives (deep r4 R4-4).
-    h(Box, {flexShrink: 0, marginRight: 2, ...(W < 48 ? {maxWidth: Math.floor(W / 2)} : {})}, s.flash ? h(Text, {color: '#e6be64', wrap: 'truncate-end'}, leftW > W - 4 ? truncate(flashText, W - 4) : flashText)
+    h(Box, {flexShrink: 0, marginRight: 2, ...(W < 48 ? {maxWidth: Math.floor(W / 2)} : {}), ...(flashBoxW ? {width: flashBoxW} : {})}, s.flash ? h(Text, {color: '#e6be64', wrap: 'truncate-end'}, flashShown)
       : hideLeft ? h(Text, null, '') : h(Text, null, h(Text, {color}, modeText), showHint ? h(Text, {color: DIM}, hint) : '')),
     h(Box, {flexShrink: 1}, h(Text, {wrap: 'truncate-end'}, right)));
 }
-function AgentCards({list, words}) {
+function AgentCards({list, words, budget}) {
   const n = useTick(list.some(x => x.state === 'working'));
   if (!list.length) return null;
   // As many as fit: 25 running agents (no limit set) took 50 rows and pushed the input off the
   // screen. Many agents get one line each; the rest are counted.
-  const room = Math.max(3, (process.stdout.rows || 30) - 20), compact = list.length * 2 > room;
-  const shown = [...list].sort((x, y) => (y.state === 'working') - (x.state === 'working')).slice(0, list.length > room ? room - 1 : room);
+  // Wave 14: Live also hands down its whole-area row budget; when it binds,
+  // the cards give way last among the sheddable parts (see Live) — first to
+  // one line each, then to fewer cards, keeping the count line.
+  const room = Math.max(3, (process.stdout.rows || 30) - 20);
+  let compact = list.length * 2 > room;
+  let shown = [...list].sort((x, y) => (y.state === 'working') - (x.state === 'working')).slice(0, list.length > room ? room - 1 : room);
+  if (budget != null) {
+    // The budget binds only below the natural height: at or above it the
+    // cards render exactly as they did before it existed.
+    const height = (arr, cp) => 1 + arr.reduce((sum, x) => sum + (x.state === 'working' && !cp && String(x.text || '').trim() ? 2 : 1), 0) + (list.length > arr.length ? 1 : 0);
+    if (height(shown, compact) > budget) {
+      if (!compact) compact = true;
+      while (shown.length && height(shown, compact) > budget) shown = shown.slice(0, -1);
+      if (!shown.length && budget < 2) return null;
+    }
+  }
   // The overflow count goes AFTER the cards: above them it read as a header for whatever
   // sat above the cards, not as part of this list (first U12).
   return h(Box, {flexDirection: 'column', marginTop: 1},
@@ -779,16 +1051,91 @@ function AddScreen({f, W}) {
       ...(f.lines || []).map((l, i) => h(Text, {key: i, wrap: 'wrap'}, l)),
       f.busy ? h(Line, {key: 'busy', color: DIM}, f.busy + '…') : null));
 }
-function Live({s, ctrl, W}) {
+// Display rows a Running block takes (title, the hidden-count note, the
+// shown tail lines), mirroring Running above.
+const runningRows = r => { if (!r) return 0; const all = [...(r.tail || []), ...(r.now?.trim() ? [r.now] : [])]; const shown = Math.min(5, all.length); return 1 + (all.length > shown ? 1 : 0) + shown; };
+// Display rows the composer takes, mirroring Prompt's window math: its top
+// margin and border (3), the windowed text lines, and the ↑ / ↓ notes.
+const promptRowsFor = (s, W) => {
+  const head = s.reasonFor ? t('理由 ') : '❯ ', inner = Math.max(1, W - 4 - width(head));
+  const {lines: all, cur} = layout(s.text || '', s.pos || 0, inner);
+  const max = Math.max(4, Math.min(30, (process.stdout.rows || 30) - 14));
+  const start = all.length <= max ? 0 : Math.max(0, Math.min(cur.row - Math.floor(max / 2), all.length - max));
+  const shown = Math.min(all.length - start, max), below = all.length - start - shown;
+  return 3 + shown + (start > 0 ? 1 : 0) + (below > 0 ? 1 : 0);
+};
+// Display rows AgentCards takes with no budget handed down, mirroring it.
+const agentNaturalRows = list => {
+  if (!list.length) return 0;
+  const room = Math.max(3, (process.stdout.rows || 30) - 20), compact = list.length * 2 > room;
+  const shown = [...list].sort((x, y) => (y.state === 'working') - (x.state === 'working')).slice(0, list.length > room ? room - 1 : room);
+  return 1 + shown.reduce((sum, x) => sum + (x.state === 'working' && !compact && String(x.text || '').trim() ? 2 : 1), 0) + (list.length > shown.length ? 1 : 0);
+};
+function Live({s, ctrl, W, rows}) {
   if (s.addFlow) return h(Box, {flexDirection: 'column', width: W},
     h(AddScreen, {f: s.addFlow, W}),
     s.approval ? h(Approval, {a: s.approval, ctrl, W}) : s.menu ? h(Menu, {m: s.menu, W}) : h(Prompt, {s, W}),
     h(Footer, {s, ctrl, W}));
   const preview = ctrl.previewRow(), todos = s.todos || [], open = todos.filter(t => t.status !== 'completed');
+  // Wave 14: the live area as a whole has a terminal-row budget. Each part
+  // used to cap itself against the full terminal height (preview rows-16,
+  // agent cards rows-20, the composer rows-14), so a stack of them — a
+  // streaming preview over todos over agent cards over the composer — ran
+  // taller than the terminal, and every frame Ink's erase-by-line-count
+  // missed, leaking the overflow into the scrollback. Now the parts that
+  // may give way share what is left after the fixed parts, composer and
+  // footer included: the stream preview gives way first, then the todos,
+  // then the agent cards.
+  const termRows = Math.max(1, rows || process.stdout.rows || 30);
+  const overlay = !!(s.approval || s.question || s.menu || s.limitInput);
+  const agentList = (s.agents || []).filter(x => x.state === 'working' || Date.now() - x.ended < 8000);
+  let fixed = 0;
+  if (!s.approval) {
+    fixed += runningRows(s.bangRunning) + runningRows(s.running);
+    if (s.busy && !s.running) fixed += W < 50 ? 3 : 2;
+    if (s.busy && s.focus?.status === 'running') fixed += 1;
+    if (s.queue?.length) fixed += 2;
+  }
+  if (!overlay && s.attachments?.length) fixed += s.attachments.length + 2;
+  let spare;
+  if (s.approval) spare = Math.min(3, Math.max(0, termRows - (8 + (s.approval.options?.length || 0) + (s.question ? 1 : 0)) - 10));
+  else if (s.question) spare = Math.max(0, termRows - fixed - (12 + ((s.question.questions?.[s.question.tab]?.options?.length) || 0)));
+  else if (s.menu) spare = Math.max(0, termRows - fixed - 17);
+  else if (s.limitInput) spare = Math.max(0, termRows - fixed - 6);
+  else {
+    const slashList = s.text?.startsWith('/') && !s.text.includes(' ');
+    fixed += promptRowsFor(s, W) + (slashList ? 10 : 1);
+    spare = Math.max(0, termRows - fixed);
+  }
+  let rest = spare;
+  const agentBudget = Math.min(agentNaturalRows(agentList), rest); rest -= agentBudget;
+  const todoBudget = Math.min(open.length && todos.length && !s.approval ? 1 + Math.min(todos.length, 8) + (todos.length > 8 ? 1 : 0) : 0, rest); rest -= todoBudget;
+  let todoShown = Math.min(8, todos.length);
+  while (todoShown > 0 && 1 + todoShown + (todoShown < todos.length ? 1 : 0) > todoBudget) todoShown--;
+  const pvRowRows = preview?.row ? Math.min(termRows, Math.max(1, Math.ceil((width(preview.row.prefix || '') + width(preview.row.text || '')) / Math.max(1, W)))) : 0;
+  const pvTableNatural = Math.min(preview?.table?.length || 0, Math.max(4, termRows - 16));
+  const previewBudget = s.approval ? 0 : Math.min(pvTableNatural + pvRowRows, rest);
+  const pvRowShown = previewBudget > 0 && !!preview?.row;
+  const pvTableShown = Math.max(0, Math.min(pvTableNatural, previewBudget - (pvRowShown ? Math.min(pvRowRows, previewBudget) : 0)));
+  const pvTableRows = pvTableShown ? (preview?.table || []).slice(-pvTableShown) : [];
+  // Wave 14 (W13-12), following the fs side (fs/draw/live/preview.mjs):
+  // when a preview row drawn here is cut, ONE line after the preview rows
+  // counts the hidden characters (' … ほか {n} 文字'). The count is over
+  // the rows actually shown above (the budget may shed some) at the width
+  // they are drawn at — the Live column is W wide, so a row's body is W
+  // minus its prefix. Table rows always count; the single row counts
+  // only when Row truncates it (table, or code with codeWrap off).
+  let pvHidden = 0;
+  pvTableRows.forEach((r, i) => { const prefix = (preview.first && i === 0 ? '⏺ ' : '  ') + (r.prefix ?? ''); pvHidden += hiddenChars(r.text || ' ', Math.max(1, W - width(prefix))); });
+  if (preview?.row && pvRowShown) {
+    const pr = preview.row, prPrefix = (preview.first && !pvTableShown ? '⏺ ' : '  ') + (pr.prefix ?? '');
+    if (pr.table || (pr.code && !switchValue('codeWrap'))) pvHidden += hiddenChars(pr.text || ' ', Math.max(1, W - width(prPrefix)));
+  }
   return h(Box, {flexDirection: 'column', width: W},
     // A table still being written: set as a whole here, printed above once it ends.
-    ...(preview?.table || []).slice(-Math.max(4, (process.stdout.rows || 30) - 16)).map((r, i) => h(Row, {key: 'tb' + i, prefix: (preview.first && i === 0 ? '⏺ ' : '  ') + r.prefix, text: r.text, code: true})),
-    preview?.row ? h(Row, {key: 'pv', prefix: (preview.first && !preview.table?.length ? '⏺ ' : '  ') + preview.row.prefix, text: preview.row.text, code: preview.row.code}) : null,
+    ...pvTableRows.map((r, i) => h(Row, {key: 'tb' + i, prefix: (preview.first && i === 0 ? '⏺ ' : '  ') + r.prefix, text: r.text, code: true, table: true})),
+    preview?.row && pvRowShown ? h(Row, {key: 'pv', prefix: (preview.first && !pvTableShown ? '⏺ ' : '  ') + preview.row.prefix, text: preview.row.text, code: preview.row.code, table: preview.row.table}) : null,
+    pvHidden > 0 ? h(Text, {key: 'pvnote', wrap: 'truncate-end'}, ' ' + c.faint(t(' … ほか {n} 文字', {n: pvHidden}))) : null,
     s.bangRunning && !s.approval ? h(Running, {r: s.bangRunning}) : null,
     s.running && !s.approval ? h(Running, {r: s.running}) : null,
     s.busy && !s.running && !s.approval ? h(Working, {s, W}) : null,
@@ -796,13 +1143,17 @@ function Live({s, ctrl, W}) {
     // The queue line names each item's first line and says when an item has more lines;
     // over the width it drops WHOLE items and counts them — a mid-item cut made a queued
     // text look shorter and different from what will be sent (first B9, deep r2 R2-10).
-    s.queue?.length && !s.approval ? h(Box, {marginTop: 1, paddingX: 2}, h(Text, {color: DIM}, t('キュー {n} 件: {first}', {n: s.queue.length, first: (() => { const items = s.queue.map(q => { const ls = String(q).split('\n'); return ls[0] + (ls.length > 1 ? t('（全 {n} 行）', {n: ls.length}) : ''); }); let out = '', usedN = 0; for (const it of items) { const trial = out ? out + ' · ' + it : it; if (usedN && width(trial) > 80) break; out = trial; usedN++; } return usedN < items.length ? out + ' ' + t('  … ほか {n} 件', {n: items.length - usedN}).trim() : out; })()}))) : null,
+    s.queue?.length && !s.approval ? h(Box, {marginTop: 1, paddingX: 2}, h(Text, {color: DIM}, t('キュー {n} 件: {first}', {n: s.queue.length, first: (() => { const items = s.queue.map(q => { const ls = String(q).split('\n'); return ls[0] + (ls.length > 1 ? t('（全 {n} 行）', {n: ls.length}) : ''); }); // The item budget follows the width (wave 6, following the fs side): it was the literal 80 regardless of the screen, so on a 40-cell terminal whole items were named that could never fit, and on a wide one items were dropped that would have fit. The budget is the real wrap width W - 4 minus the 'キュー N 件: ' prefix and the '… ほか M 件' suffix the line will carry; whole items are still dropped past it.
+    const prefixW = width(t('キュー {n} 件: ', {n: s.queue.length})); const suffixW = left => width(' ' + t('  … ほか {n} 件', {n: left}).trim()); let out = '', usedN = 0; for (const it of items) { const trial = out ? out + ' · ' + it : it; const leftAfter = items.length - usedN - 1; if (usedN && prefixW + width(trial) + (leftAfter ? suffixW(leftAfter) : 0) > W - 4) break; out = trial; usedN++; } return usedN < items.length ? out + ' ' + t('  … ほか {n} 件', {n: items.length - usedN}).trim() : out; })()}))) : null,
     // Eight todo rows at most, and the rest are counted: silently dropping rows past 8
     // hid exactly the tail of a long plan (first B8).
-    todos.length && open.length && !s.approval ? h(Box, {flexDirection: 'column', marginTop: 1}, ...todos.slice(0, 8).map((t, i) => h(Text, {key: i, wrap: 'truncate-end'}, '  ' + todoLine(t))), ...(todos.length > 8 ? [h(Text, {key: 'more', color: DIM}, t('  … ほか {n} 件', {n: todos.length - 8}) + ' (/todos)')] : [])) : null,
-    h(AgentCards, {words: s.agentWords, list: (s.agents || []).filter(x => x.state === 'working' || Date.now() - x.ended < 8000)}),
+    todos.length && open.length && !s.approval && todoBudget >= 2 ? h(Box, {flexDirection: 'column', marginTop: 1}, ...todos.slice(0, todoShown).map((td, i) => h(Text, {key: i, wrap: 'truncate-end'}, '  ' + todoLine(td))), ...(todoShown < todos.length ? [h(Text, {key: 'more', color: DIM}, t('  … ほか {n} 件', {n: todos.length - todoShown}) + ' (/todos)')] : [])) : null,
+    h(AgentCards, {words: s.agentWords, list: agentList, budget: agentBudget}),
     s.approval || s.question || s.menu || s.limitInput ? null : h(Chips, {list: s.attachments, W}),
-    s.approval ? h(Approval, {a: s.approval, ctrl, W}) : s.question ? h(Question, {q: s.question, W}) : s.menu ? h(Menu, {m: s.menu, W}) : s.limitInput ? h(Box, {flexDirection: 'column'},
+    // Wave 14: an approval landing over the question picker takes the keys
+    // and the screen (approval first, as before), but the picker must not
+    // vanish in silence: one line under the approval says it is waiting.
+    s.approval ? h(Box, {flexDirection: 'column'}, h(Approval, {a: s.approval, ctrl, W}), s.question ? h(Line, {color: ACCENT}, t('  質問が待っています。承認が終わると表示されます')) : null) : s.question ? h(Question, {q: s.question, W}) : s.menu ? h(Menu, {m: s.menu, W}) : s.limitInput ? h(Box, {flexDirection: 'column'}, 
       h(Text, {color: ACCENT}, s.limitInput.label || (s.limitInput.key === 'concurrent' ? t('同時に動かすエージェント数') : t('1タスクで起動できる合計数'))),
       h(Prompt, {s: {...s, text: s.limitInput.text, pos: s.limitInput.text.length, busy: false, reasonFor: null}, W}),
       // A flash (a validation error) keeps the enter/esc keys beside it: with the flash
@@ -815,6 +1166,9 @@ const RESIZE_SETTLE_MS = 150; // a drag sends many sizes; redraw once it stops
 function Root({ctrl}) {
   const s = useSyncExternalStore(ctrl.subscribe, ctrl.get);
   const {columns, rows} = useWindowSize(), W = Math.max(20, (columns || 100) - 1); // a floor wider than the terminal overflowed it
+  // The events ring keeps each render's size (Ink owns the actual draw, so
+  // the cost is the frame's own; coalesced in the ring — event-ring.js).
+  useEffect(() => { try { ctrl.eventRing?.recordRender({ms: 0, columns, rows, entries: s.entries?.length ?? null}); } catch {} });
   useEffect(() => { ctrl.trace('size ' + columns + 'x' + rows); }, [columns, rows]);
   // No mouse reporting (?1000h / ?1006h): with it on, the terminal hands every mouse event
   // to muser — the wheel no longer scrolls back through the output (the history lives in the
@@ -837,65 +1191,18 @@ function Root({ctrl}) {
   }, [columns, rows]);
   return h(React.Fragment, null,
     h(Static, {key: s.clearCount + ':' + redraws, items: s.entries}, e => h(Entry, {key: e.id, e, ctrl, W})),
-    h(Live, {s, ctrl, W}));
+    h(Live, {s, ctrl, W, rows}));
 }
 
 export {Entry, Live, Question};
 
 export function run({agent, museName, version, initial, connect, onReload, remoteCtrl}) {
+  // The classic screen. The fullscreen screen has its own entry
+  // (src/ui/fs/run.mjs); the session setup is shared (src/ui/boot.mjs).
   let app;
-  // Client mode (remote/DESIGN.md step 4): the conversation lives in the
-  // resident server and remoteCtrl (src/ui/remote-controller.mjs) already
-  // mirrors it; the view renders it exactly like a local Controller. The
-  // facade stands in for the agent everywhere the view reads one.
-  if (remoteCtrl) agent = remoteCtrl.agent;
-  const ctrl = remoteCtrl || new Controller({agent, museName, version, onExit: async () => {
-    app.unmount();
-    const id = agent.session.turns && agent.client.status !== 'demo' ? agent.session.id.slice(0, 8) : '';
-    if (id) process.stdout.write(c.faint(t('再開するには: muser resume {id}', {id})) + '\n');
-    // Leaving mid-turn only closed the sockets: Muse went on working for nobody.
-    if (agent.busy && agent.cancelAll) { process.stdout.write(c.faint(t('Muse の作業を止めています…')) + '\n'); await agent.cancelAll().catch(() => {}); }
-    agent.close(); setTimeout(() => process.exit(0), 50);
-  }, onReload: onReload ? () => {
-    // /reload: hand the terminal to a fresh process on the current code (it resumes this
-    // session), then leave. Closing first frees this window's node slot for it.
-    app.unmount();
-    let ok = true;
-    try { onReload(); } catch { ok = false; }
-    if (!ok) { const id = agent.session.turns ? agent.session.id.slice(0, 8) : ''; if (id) process.stdout.write(c.faint(t('再開するには: muser resume {id}', {id})) + '\n'); }
-    agent.close(); setTimeout(() => process.exit(0), 50);
-  } : undefined});
-  if (remoteCtrl) {
-    // Detach, never close: /exit and /reload reach the RemoteController's own
-    // callbacks; unmount first so the terminal is handed back cleanly.
-    const userExit = remoteCtrl.onExit, userReload = remoteCtrl.onReload;
-    remoteCtrl.onExit = async () => { try { app?.unmount(); } catch {} if (userExit) await userExit(); else setTimeout(() => process.exit(0), 50); };
-    remoteCtrl.onReload = userReload ? () => { try { app?.unmount(); } catch {} userReload(); } : undefined;
-  }
-  // What this window is doing, live, for `muser status` and other agents (src/window-status.js).
-  // A client window's conversation is the server's, which `muser status` lists already; the
-  // demo talks to no Muse.
-  if (!remoteCtrl && agent.client?.status !== 'demo') { try { new (require('../window-status.js').WindowStatus)({ctrl, agent}).start(); } catch {} }
-  // An exception nothing caught ends muser: leave a report (src/crash.js) and the way back into the
-  // chat instead of only a stack trace.
-  const crashed = e => {
-    let file = '';
-    try { file = require('../crash.js').write({version, error: e, state: ctrl.s, trail: ctrl.trail}); } catch {}
-    try { app?.unmount(); } catch {}
-    const id = agent.session.turns && agent.client.status !== 'demo' ? agent.session.id.slice(0, 8) : '';
-    process.stderr.write('\n' + String(e?.stack || e) + '\n\n' + t('muser が予期しないエラーで止まりました。') + '\n' +
-      (file ? t('記録を保存しました（入力や会話の中身は含みません）: {file}', {file}) + '\n' : '') +
-      // In client mode plain `muser resume` starts a LOCAL session instead of rejoining
-      // the server's: the hint names the client form (third M22).
-      (id ? (remoteCtrl ? t('続きから再開するには: muser --client resume {id}', {id}) : t('続きから再開するには: muser resume {id}', {id})) + '\n' : ''));
-    // A crash mid-turn stops the work like a normal exit does, instead of leaving Muse
-    // running for nobody (third M23). Bounded: a wedged cancel must not hang the exit.
-    const finish = () => { try { agent.close(); } catch {} process.exit(1); };
-    if (agent.busy && agent.cancelAll) { let done = false; const once = () => { if (!done) { done = true; finish(); } }; setTimeout(once, 2500); try { Promise.resolve(agent.cancelAll()).then(once, once); } catch { once(); } }
-    else finish();
-  };
-  process.on('uncaughtException', crashed);
-  process.on('unhandledRejection', crashed);
+  const session = bootSession({agent, museName, version, initial, connect, onReload, remoteCtrl,
+    hooks: {unmount: () => { try { app?.unmount(); } catch {} }}});
+  const ctrl = session.ctrl;
   // Start on a clean screen, like Claude Code: the shell prompt and the onboarding output go.
   // The clear goes into Ink's first write, inside its synchronized update (ESC[?2026h … l), so
   // the splash turns into the first frame at once. Written on its own it came ~33 ms (one
@@ -909,12 +1216,6 @@ export function run({agent, museName, version, initial, connect, onReload, remot
     };
   }
   app = render(h(Root, {ctrl}), {exitOnCtrlC: false, incrementalRendering: true, maxFps: 30, kittyKeyboard: {mode: require('../settings.js').switchValue('kitty') ? 'auto' : 'disabled'}, patchConsole: true});
-  // Drawn before Muse is reached: connect behind the screen; a message sent meanwhile waits for
-  // it (runTurn awaits ensureConnected). Then learn Muse's name for next time.
-  if (connect) connect().then(name => { if (name && name !== ctrl.museName) { ctrl.museName = name; ctrl.set({}); } }).catch(() => {});
-  if (agent.session.turns) ctrl.showResumed(agent.session, {startup: true}); // muser resume / -c
-  if (initial) ctrl.submit(initial);
-  if (agent.client.status !== 'demo') ctrl.checkUpdate(); // right away, in the background (src/update.js)
-  setTimeout(() => ctrl.refreshPlan(), 1500); // after the first frame: loading the login cookies blocks briefly
+  session.start();
   return app;
 }

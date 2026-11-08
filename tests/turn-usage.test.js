@@ -16,7 +16,13 @@ test.after(() => { fs.rmSync(process.env.LOCALAPPDATA, {recursive: true, force: 
 
 const {parse, strip, formatTokens, usageFromTranscript} = require('../src/turn-usage');
 
-test('parse: the documented example formats as 130.8k in / 395 out and keeps source and cost', () => {
+// Wave 7 spec update (this file, wherever a formatted usage string is
+// asserted): formatUsage's in/out words follow the UI language now — in
+// Japanese they are 入 / 出 ('130.8k 入 / 395 出'), not the fixed English
+// '130.8k in / 395 out' every assertion here used to pin. A stored
+// `formatted` string with no numbers behind it still passes through
+// verbatim (see the usageText test), so only re-formatted output changed.
+test('parse: the documented example formats as 130.8k 入 / 395 出 and keeps source and cost', () => {
   const r = parse('done\n\n[usage] context_tokens=130841 response_tokens=395 source=provider cost=unavailable');
   assert.ok(r);
   assert.equal(r.body.trim(), 'done');
@@ -24,7 +30,7 @@ test('parse: the documented example formats as 130.8k in / 395 out and keeps sou
   assert.equal(r.usage.outputTokens, 395);
   assert.equal(r.usage.source, 'provider');
   assert.equal(r.usage.cost, 'unavailable');
-  assert.equal(r.usage.formatted, '130.8k in / 395 out');
+  assert.equal(r.usage.formatted, '130.8k 入 / 395 出');
 });
 
 test('formatTokens: under 1000 as-is, thousands with one decimal and no trailing .0', () => {
@@ -49,7 +55,7 @@ test('formatTokens: from a million, M with one decimal ("6274.9k" was hard to re
 
 test('usageText: a stored record is formatted again from its numbers', () => {
   const {usageText} = require('../src/turn-usage');
-  assert.equal(usageText({inputTokens: 6274947, outputTokens: 48479, formatted: '6274.9k in / 48.5k out'}), '6.3M in / 48.5k out', 'an old record reads in today\'s units');
+  assert.equal(usageText({inputTokens: 6274947, outputTokens: 48479, formatted: '6274.9k in / 48.5k out'}), '6.3M 入 / 48.5k 出', 'an old record reads in today\'s units (and language: the stored English text is re-formatted, not kept)');
   assert.equal(usageText({formatted: '1k in / 2 out'}), '1k in / 2 out', 'no numbers: the stored text');
   assert.equal(usageText(null), '');
 });
@@ -69,13 +75,13 @@ test('parse: quoted values, all-unavailable reads as 0, and no line at the end r
   const none = parse('x\n[usage] context_tokens=unavailable response_tokens=unavailable');
   assert.equal(none.usage.inputTokens, 0);
   assert.equal(none.usage.outputTokens, 0);
-  assert.equal(none.usage.formatted, '0 in / 0 out');
+  assert.equal(none.usage.formatted, '0 入 / 0 出');
   assert.equal(parse('plain reply, no usage line'), null);
   assert.equal(parse('x\n[usage] context_tokens=5 response_tokens=6\nmore reply after it'), null, 'a usage line followed by more text is not a usage line');
   assert.equal(parse(''), null);
   assert.equal(parse(null), null);
   const upper = parse('x\n[USAGE] context_tokens=2000 response_tokens=50');
-  assert.equal(upper.usage.formatted, '2k in / 50 out');
+  assert.equal(upper.usage.formatted, '2k 入 / 50 出');
 });
 
 test('strip: removes only a trailing usage line and passes other text through', () => {
@@ -92,7 +98,7 @@ test('usageFromTranscript: the last assistant message carries it; user messages 
     {role: 'assistant', content: [{text: 'working…'}]},
     {role: 'assistant', content: [{text: 'answer'}, {text: '\n\n[usage] context_tokens=2000 response_tokens=50 source=estimate'}]},
   ]});
-  assert.equal(found.usage.formatted, '2k in / 50 out');
+  assert.equal(found.usage.formatted, '2k 入 / 50 出');
   assert.equal(found.usage.source, 'estimate');
   assert.equal(usageFromTranscript({messages: [{role: 'assistant', content: [{text: 'no usage here'}]}]}), null);
   assert.equal(usageFromTranscript({}), null);
@@ -138,7 +144,7 @@ test('a fake completion event through the agent puts usage on turn-end and in th
   const e = await turnEnd;
   assert.equal(reply.text, 'done', 'the reply itself never carries the usage line');
   assert.ok(!reply.text.includes('[usage]'));
-  assert.equal(e.usage.formatted, '130.8k in / 395 out');
+  assert.equal(e.usage.formatted, '130.8k 入 / 395 出');
   assert.equal(e.usage.inputTokens, 130841);
   assert.equal(e.usage.outputTokens, 395);
   assert.equal(e.usage.rounds, 1, 'a single reply is a one-round user turn total');
@@ -166,10 +172,10 @@ test('a fake completion event through the agent puts usage on turn-end and in th
     return out.out;
   };
   const withUsage = await show(React.createElement(Entry, {e: {type: 'end', ...e}, ctrl, W: 100}));
-  assert.match(withUsage, /✻ \d+s · 130\.8k in \/ 395 out/);
+  assert.match(withUsage, /✻ \d+s · 130\.8k 入 \/ 395 出/);
   const without = await show(React.createElement(Entry, {e: {type: 'end', ok: true, ms: 12000}, ctrl, W: 100}));
   assert.match(without, /✻ 12s/);
-  assert.ok(!without.includes('in /'), 'nothing extra when there is no usage');
+  assert.ok(!without.includes('入 /') && !without.includes('in /'), 'nothing extra when there is no usage');
 });
 
 // A user turn of several replies: Focus rounds sum into one turn-end total,
@@ -223,7 +229,7 @@ test('a 2-round Focus run sums both rounds on turn-end and tallies each reply on
   assert.equal(ends, 1, 'one turn-end for the whole user turn');
   assert.equal(endEvent.usage.inputTokens, 150000, 'both rounds, not just the last reply');
   assert.equal(endEvent.usage.outputTokens, 350);
-  assert.equal(endEvent.usage.formatted, '150k in / 350 out');
+  assert.equal(endEvent.usage.formatted, '150k 入 / 350 出');
   assert.equal(endEvent.usage.rounds, 2);
   assert.equal(turnUsages.length, 2, 'one turn-usage event per reply');
   assert.deepEqual(turnUsages.map(u => u.agent), ['main', 'main']);
@@ -271,7 +277,7 @@ test('a parallel agent reply is tallied via turn-usage, with no turn-end', async
     transcript: {messages: [{role: 'assistant', content: [{text: 'parallel done\n\n[usage] context_tokens=2000 response_tokens=20 source=provider'}]}]}}});
   const snap = await doneP;
   assert.equal(worker.tag, 'a1');
-  assert.equal(snap.usage.formatted, '2k in / 20 out');
+  assert.equal(snap.usage.formatted, '2k 入 / 20 出');
   assert.equal(snap.usage.inputTokens, 2000);
   assert.equal(snap.usage.outputTokens, 20);
   assert.equal(usages.length, 1, 'exactly one turn-usage event for the parallel reply');

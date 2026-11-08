@@ -49,8 +49,10 @@ function errorDetail(body) {
 class MuseClient extends EventEmitter {
   // requireLogin: only connect with credentials obtained from the muse.ai login, and not at all
   // while the website session is logged out.
-  constructor({credentials,fetchJson,checkPin,requireLogin=false,locale}) {
+  constructor({credentials,fetchJson,checkPin,requireLogin=false,locale,wakeVm}) {
     super(); this.credentials=credentials; this.fetchJson=fetchJson; this.checkPin=checkPin; this.requireLogin=requireLogin;
+    // muser: wakes a suspended Muse VM (session.js). The gateway answers 502 while the VM sleeps.
+    this.wakeVm=typeof wakeVm==='function'?wakeVm:null;
     // Like the web client, ask the VM for text in the user's language (settings, connectors, permissions).
     this.locale=typeof locale==='string'&&/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(locale)?locale:'';
     this.pending=new Map(); this.ws=null; this.transport=null; this.connecting=null; this.status='disconnected'; this.badFrames=0;
@@ -103,7 +105,22 @@ class MuseClient extends EventEmitter {
   async connect() {
     if(this.status==='connected') return;
     if(this.connecting) return this.connecting;
-    this.connecting=this.open().finally(()=>{this.connecting=null;}); return this.connecting;
+    this.connecting=this.openWaking().finally(()=>{this.connecting=null;}); return this.connecting;
+  }
+  // muser: a VM that muse.ai suspended after idling makes the gateway answer 502/503/504
+  // (found on a real account: vm_state SUSPENDED, every connect 502, restarting muser did
+  // not help). muse.ai's own page wakes it (POST /api/hatch/vm/wake); do the same once,
+  // then connect again. Any other failure, or a wake that does not bring the VM up, stays
+  // the original error.
+  async openWaking() {
+    try { return await this.open(); }
+    catch(e) {
+      if(!this.wakeVm||!(e&&e.status>=502&&e.status<=504)) throw e;
+      this.state('connecting',t('Muse の VM が休止していたので、起こしています…'));
+      let woke=false; try { woke=await this.wakeVm(); } catch {}
+      if(!woke) { this.state('error',e.message); throw e; }
+      return await this.open();
+    }
   }
   async open() {
     this.disconnect(false); this.state('connecting',t('Muse に接続しています…'));
@@ -149,7 +166,7 @@ class MuseClient extends EventEmitter {
       // instead of leaving connect() hanging until the 20 s timeout above.
       this._openFail=e=>{clearTimeout(timeout);reject(e);};
       ws.on('open',()=>{try{ws.send(noise.message1());}catch{fail(new Error(t('暗号化接続を開始できませんでした。')));}});
-      ws.on('unexpected-response',(_,res)=>{const auth=res.statusCode===401||res.statusCode===403;fail(new Error(auth?t('Muse の認証が切れています。ログインし直してください。'):t('Muse に接続できませんでした (HTTP {status})。', {status: res.statusCode})),auth?'auth_required':'error');});
+      ws.on('unexpected-response',(_,res)=>{const auth=res.statusCode===401||res.statusCode===403;fail(Object.assign(new Error(auth?t('Muse の認証が切れています。ログインし直してください。'):t('Muse に接続できませんでした (HTTP {status})。', {status: res.statusCode})),{status:res.statusCode}),auth?'auth_required':'error');});
       ws.on('error',()=>{if(!established)fail(new Error(t('Muse の通信に失敗しました。接続情報を更新してください。')));});
       ws.on('message',data=>{
         if(this.ws!==ws) return;
@@ -178,7 +195,7 @@ class MuseClient extends EventEmitter {
         // codes stay transient drops, as before.
         const auth=code===1008||code===4401||code===4403;
         if(!established)fail(new Error(auth?t('Muse の認証が切れています。ログインし直してください。'):t('Muse との接続が閉じられました。')),auth?'auth_required':'error');
-        else if(auth){this.disconnect(false);this.state('auth_required',t('Muse の認証が切れています。ログインし直してください。'));}
+        else if(auth){this.disconnect(false,new Error(t('Muse の認証が切れています。ログインし直してください。')));this.state('auth_required',t('Muse の認証が切れています。ログインし直してください。'));}
         else {this.disconnect(false);this.state('disconnected',t('接続が切れました。再接続しています…'));}
       });
     });
@@ -340,7 +357,12 @@ class MuseClient extends EventEmitter {
       try{ws.ping();}catch{}
     },20000);this.pingTimer.unref?.();
   }
-  disconnect(announce=true) {
+  // pendingError (wave 14): when the socket died for a specific reason that an
+  // ordinary disconnect must not flatten — an auth-expired close (4401) — pending requests
+  // reject with THAT error, so callers can tell "log in again" apart from a plain
+  // drop instead of seeing the generic ended-connection message. Callers without
+  // a specific reason keep the generic rejection, as before.
+  disconnect(announce=true,pendingError=null) {
     // Deep #95: invalidate any open() still waiting (its seq check stops it) and
     // settle a handshake in flight at once; neither may create or keep a socket
     // after this disconnect.
@@ -353,7 +375,7 @@ class MuseClient extends EventEmitter {
       try{ws.once?.('close',()=>clearTimeout(timer));}catch{}
     }}
     this.transport?.destroy();this.transport=null;
-    for(const p of this.pending.values()){clearTimeout(p.timer);clearTimeout(p.idleTimer);p.reject(new Error(t('Muse の接続が終了しました。')));}this.pending.clear();
+    for(const p of this.pending.values()){clearTimeout(p.timer);clearTimeout(p.idleTimer);p.reject(pendingError||new Error(t('Muse の接続が終了しました。')));}this.pending.clear();
     this.socketVmId=null;
     // A credential refresh deferred by #126 (different VM than the live socket)
     // applies now that no socket is using the old credentials.

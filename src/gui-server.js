@@ -10,14 +10,19 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {execFile} = require('node:child_process');
 const {MODES} = require('./policy.js');
+const {inside, isSensitivePath, realOf} = require('./tools.js');
+const {buildUiConfig} = require('./ui-config.js');
+const {renameRetry} = require('./config.js');
 const mention = require('./mentions.js');
 
 const MAX_ENTRIES = 200; // /api/state and entries-reset carry only the newest entries
+const FOCUS_EVIDENCE_TAIL = 40; // focusfix: distributed focus state carries only the newest evidence entries (Focus.modelState's trim)
 const MAX_BODY = 1024 * 1024;
 const SEND_MAX_BODY = 16 * 1024 * 1024; // v6: POST /send alone may carry base64 images
 const ATTACH_MAX_COUNT = 8, ATTACH_MAX_TOTAL = 11 * 1024 * 1024; // v6: decoded image bytes per send
 const ATTACH_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const STATE_DEBOUNCE_MS = 50; // bursts of Controller changes coalesce into one state event
+const PLAN_REFRESH_MS = 5 * 60 * 1000; // gui-serve: a plan older than this is re-read in the background when the GUI reads state (at most once per window per conversation)
 const DIFF_CAP = 200000; // v3: a per-file diff body is capped at 200k chars (truncated: true when capped)
 const GIT_TIMEOUT_MS = 15000, GIT_DIFF_TIMEOUT_MS = 30000; // generous but bounded
 const GIT_MAX_BUFFER = 32 * 1024 * 1024; // room for a big status/numstat/diff before the JS-side caps apply
@@ -62,6 +67,16 @@ function imageMagicMatches(type, bytes) {
   return false;
 }
 
+// serverfirst-debug G5: a wire string — a string stays itself, null and
+// undefined become null, anything else is String()-ed when it safely can
+// be and null when it cannot (a BigInt stringifies fine here, where
+// plain()'s JSON round-trip would have given up on the whole object).
+function wireString(v) {
+  if (typeof v === 'string') return v;
+  if (v === null || v === undefined) return null;
+  try { return String(v); } catch { return null; }
+}
+
 function plainList(list) {
   if (!Array.isArray(list)) return plain(list);
   const out = [];
@@ -80,6 +95,61 @@ function plainList(list) {
     }
     // Nothing salvageable: drop just this item.
   }
+  return out;
+}
+
+// focusfix: shape the Focus state for distribution. snapshot() below is the one
+// place /api/state and every SSE state frame are built from, and it used to ship
+// plain(s.focus) verbatim, which had three problems:
+//  1. evidence was the FULL log (Focus caps it at 300 entries of commands, paths
+//     and output digests). The model-facing Focus.modelState() deliberately trims
+//     to the newest 40 for size; the wire gets the same trim, plus evidenceTotal
+//     so a client can tell older entries exist. The trim happens on the plain()
+//     copy here — the Controller's live state is never mutated.
+//  2. A focus object that reached the Controller without goal/status (some
+//     emitters send partial shapes) left GUI/phone clients unable to say what
+//     task a window is on — window-status.js had to re-add the goal on its own.
+//     A missing goal is filled from the standing goal (the Controller state's
+//     goal, else the agent's), and a missing status from whether the task is
+//     waiting on the user (an ask or an open picker) or still running. Fields
+//     the focus object already carries are never overwritten.
+//  3. ask (the selectable-question choices) rode along whatever the status, so
+//     a COMPLETED task still distributed a live picker: a client keying the
+//     picker on ask presence could show it, and answering it would start a new
+//     task. The choices — and the picker's live state (snapshot's `question`) —
+//     are only live while the status is 'needs_input'. A snapshot with NO focus
+//     at all keeps a `question` the Controller opened some other way, as before.
+function focusForWire(s, a) {
+  if (!s.focus) return null;
+  const f = plain(s.focus);
+  if (!f || typeof f !== 'object') return f;
+  if (Array.isArray(f.evidence)) {
+    f.evidenceTotal = f.evidence.length;
+    if (f.evidence.length > FOCUS_EVIDENCE_TAIL) f.evidence = f.evidence.slice(-FOCUS_EVIDENCE_TAIL);
+  }
+  if (typeof f.goal !== 'string' || !f.goal) {
+    const goal = s.goal?.text ?? (typeof a?.standingGoal === 'function' ? a.standingGoal()?.text : null);
+    if (typeof goal === 'string' && goal) f.goal = goal;
+  }
+  if (typeof f.status !== 'string' || !f.status) f.status = (f.ask || s.question) ? 'needs_input' : 'running';
+  if (f.status !== 'needs_input') f.ask = null;
+  return f;
+}
+
+// gui-serve: the standing goal (/goal) itself, for the snapshot's `goal` field.
+// The focus object above only borrows the goal's TEXT for its own goal field, so
+// a GUI reopening had no way to learn that a goal stands (or when it was set, or
+// how many auto-continuation legs it has run). The sources are the same ones
+// focusForWire reads: the Controller state (s.goal, kept live by the agent's
+// 'goal' event) first, then the agent's standingGoal() (session.goal). Only the
+// fields the goal object actually carries cross the wire (plain(): text, legs,
+// setAt today) — nothing is invented, and no goal (or a goal without text) is null.
+function goalForWire(s, a) {
+  let g = s?.goal ?? null;
+  if (!g && typeof a?.standingGoal === 'function') { try { g = a.standingGoal(); } catch { g = null; } }
+  if (!g || typeof g !== 'object') return null;
+  const out = plain(g);
+  if (!out || typeof out.text !== 'string' || !out.text) return null;
   return out;
 }
 
@@ -138,24 +208,33 @@ class GuiServer {
   // routes also live under /api/s/:id/... per conversation. serverDiscoveryFile (or
   // MUSER_SERVER_FILE) additionally writes ~/.muser/server.json; onStop backs
   // POST /api/server/stop; accounts/recent providers are injectable for tests.
-  constructor({controller, agent, token, port, version, discoveryFile, host, serverDiscoveryFile, onStop, accountsProvider, recentProvider} = {}) {
-    if (!host && !controller) throw new Error('GuiServer needs a controller');
-    if (!host && !agent) throw new Error('GuiServer needs an agent');
+  constructor({controller, agent, token, port, version, discoveryFile, host, serverDiscoveryFile, onStop, accountsProvider, recentProvider, execSessionIds, setup, accountsAdmin} = {}) {
+    this.setup = setup || null;
+    // app-ui: the account registry / pool / config the /api/accounts routes use (tests inject a fake).
+    this.accountsAdmin = accountsAdmin || null;
+    // Setup mode (first-run preparation over HTTP, /api/setup): the server opens
+    // before any conversation exists, so a setup flow alone is enough to build
+    // one — the host arrives later through setHost(). Without setup, a
+    // controller/agent (or a host) is required, as before.
+    if (!host && !controller && !this.setup) throw new Error('GuiServer needs a controller');
+    if (!host && !agent && !this.setup) throw new Error('GuiServer needs an agent');
     this.host = host || null;
     this.controller = controller || null;
     this.agent = agent || null;
     // Single-conversation mode wraps its pair as one entry, so every route below
     // speaks of entries only. In host mode the entry is the host's default.
-    this.ownEntry = host ? null : {id: agent.session?.id || 'default', agent, controller, museName: controller.museName ?? null};
+    this.ownEntry = host || !agent || !controller ? null : {id: agent.session?.id || 'default', agent, controller, museName: controller.museName ?? null};
     this.token = token || crypto.randomBytes(32).toString('hex');
     this.requestedPort = port ?? 0;
     this.port = null;
+    this._explicitVersion = version != null;
     this.version = version ?? controller?.version ?? host?.defaultEntry()?.controller?.version ?? require('../package.json').version;
     this.discoveryFile = discoveryFile || process.env.MUSER_GUI_FILE || defaultDiscoveryFile();
     this.serverDiscoveryFile = serverDiscoveryFile || process.env.MUSER_SERVER_FILE || null;
     this.onStop = onStop || null;
     this.accountsProvider = accountsProvider || null;
     this.recentProvider = recentProvider || null;
+    this.execSessionIds = execSessionIds || null; // () => Set of exec-run conversation ids (tests inject)
     this.link = null; // src/link/link.js Link, attached by serve() once it is up (muser link)
     this.clients = new Set(); // the default entry's SSE clients (kept for compat)
     this.serverClients = new Set(); // /api/server/events clients
@@ -165,16 +244,68 @@ class GuiServer {
     // keyed by the object itself, so a POST can be bound to the object the
     // client actually saw. A replaced object gets a fresh id; the same object
     // keeps its id across snapshots.
-    this._approvalIds = new WeakMap(); this._menuIds = new WeakMap();
-    this._approvalSeq = 0; this._menuSeq = 0;
+    this._approvalIds = new WeakMap(); this._menuIds = new WeakMap(); this._questionIds = new WeakMap();
+    this._approvalSeq = 0; this._menuSeq = 0; this._questionSeq = 0;
+    // serverfirst: question ids a /send answer was already accepted for (see
+    // the questionId guard in dispatch). Bounded: only the newest ids are
+    // remembered, which covers any realistic double-answer window.
+    this._answeredQuestionIds = new Set(); this._answeredQuestionOrder = [];
     this._changesCache = new Map(); // cwd -> {at, promise} (c4#7)
     this.changesCacheMs = CHANGES_CACHE_MS; // tests may shrink/disable it
+    this.planRefreshMs = PLAN_REFRESH_MS; // tests may shrink it (see maybeRefreshPlan)
     this.avatarCacheMs = AVATAR_CACHE_TTL_MS;
     this._starting = null; // #64: the in-flight start() promise, shared by concurrent callers
     this.eventsHeartbeatMs = 25000; // SSE keep-alive cadence; an open stream also touches its host entry (#61)
     this.unsubscribe = null;
     this.startedAt = null;
     this._hostListener = null;
+    this._setupListener = null;
+  }
+
+  // The setup flow's current plain state, or the finished state when this
+  // server has no setup flow (preparation already done before it opened).
+  setupState() {
+    if (!this.setup) return {phase: 'done'};
+    try { return this.setup.state() || {phase: 'done'}; } catch { return {phase: 'done'}; }
+  }
+  setupPhase() { return this.setupState()?.phase || 'done'; }
+
+  // Hand the conversations to a server that opened in setup mode: the same
+  // port/token keep serving, the hosted entries are attached, the host's
+  // events start flowing, and the discovery file is rewritten so gui.json
+  // names the default conversation's sessionId.
+  setHost(host) {
+    if (!host) throw new Error('GuiServer.setHost needs a host');
+    this.host = host;
+    if (!this._explicitVersion) {
+      const v = host.defaultEntry()?.controller?.version;
+      if (v != null) this.version = v;
+    }
+    for (const entry of this.allEntries()) this.attachEntry(entry);
+    this.attachHostListener();
+    if (this.port) this.writeDiscovery();
+    return this;
+  }
+  attachHostListener() {
+    if (!this.host || this._hostListener) return;
+    this._hostListener = event => {
+      if (event?.type === 'session-opened') { const e = this.host.get(event.sessionId); if (e) this.attachEntry(e); }
+      if (event?.type === 'session-closed') this.detachEntry(event.sessionId);
+      this.broadcastServerEvent(event);
+    };
+    this.host.on('event', this._hostListener);
+  }
+  attachSetupListener() {
+    if (!this.setup || this._setupListener || typeof this.setup.on !== 'function') return;
+    this._setupListener = () => this.broadcastSetup();
+    this.setup.on('change', this._setupListener);
+  }
+  broadcastSetup() {
+    if (!this.setup) return;
+    const setup = this.setupState();
+    for (const client of [...this.serverClients]) {
+      try { client.res.write('data: ' + JSON.stringify({kind: 'setup', setup}) + '\n\n'); } catch { this.dropServerClient(client); }
+    }
   }
   // Deep H1: the stable per-object id for an approval or menu, assigned on
   // first sight (in a snapshot or an answer attempt) and never reused.
@@ -186,19 +317,92 @@ class GuiServer {
   }
   approvalIdOf(ap) { return this.objectId(this._approvalIds, '_approvalSeq', 'approval-', ap); }
   menuIdOf(menu) { return this.objectId(this._menuIds, '_menuSeq', 'menu-', menu); }
+  questionIdOf(q) { return this.objectId(this._questionIds, '_questionSeq', 'question-', q); }
+  // Remember that a question answer was accepted, so a duplicate /send
+  // carrying the same questionId is refused even while the picker is still
+  // closing (or a same-shaped picker has opened since).
+  markQuestionAnswered(id) {
+    if (id === undefined || id === null) return;
+    const key = String(id);
+    if (!this._answeredQuestionIds.has(key)) { this._answeredQuestionIds.add(key); this._answeredQuestionOrder.push(key); }
+    while (this._answeredQuestionOrder.length > 100) this._answeredQuestionIds.delete(this._answeredQuestionOrder.shift());
+  }
+  // Undo a mark (serverfirst-debug G1): the guard now burns the id BEFORE
+  // submit, and a submit that then fails at once must hand the question
+  // back — a refused send never eats the question it meant to answer.
+  unmarkQuestionAnswered(id) {
+    const key = String(id);
+    if (!this._answeredQuestionIds.delete(key)) return;
+    const i = this._answeredQuestionOrder.indexOf(key);
+    if (i >= 0) this._answeredQuestionOrder.splice(i, 1);
+  }
   get url() { return 'http://127.0.0.1:' + this.port; }
   defaultEntry() { return this.host ? this.host.defaultEntry() : this.ownEntry; }
   resolveEntry(id) { return this.host ? this.host.get(id) : (this.ownEntry && this.ownEntry.id === id ? this.ownEntry : null); }
-  allEntries() { return this.host ? [...this.host.entries.values()] : [this.ownEntry]; }
+  allEntries() { return this.host ? [...this.host.entries.values()] : this.ownEntry ? [this.ownEntry] : []; }
   state(entry) { const c = (entry || this.defaultEntry())?.controller; return c ? (c.s || c.get()) : {}; }
+
+  // gui-serve: the weekly plan in the snapshot is only re-read by the Controller
+  // at a turn's end (and a few other moments), so a conversation left open in
+  // serve kept showing hours-old usage — and two conversations on one account
+  // could disagree (66% here, 100% there). When the GUI reads state (GET
+  // /api/state, or subscribing to the state SSE), a plan that is stale — never
+  // read, or the same plan object has been on show for over planRefreshMs — is
+  // re-read in the BACKGROUND: the answer is not waited for, and the fresh plan
+  // reaches the GUI through the ordinary Controller-change state event once it
+  // lands. The entry remembers (on itself, serve-side only) which plan object
+  // was last seen and when, plus the last refresh attempt: attempts are capped
+  // at one per planRefreshMs per conversation, so a failing read is not retried
+  // on every poll (refreshPlan itself still shares one in-flight read). The
+  // demo is offline and refreshPlan already no-ops there; it is skipped here
+  // too, so a demo entry never even records an attempt.
+  maybeRefreshPlan(entry) {
+    const controller = entry?.controller;
+    if (!entry || !controller || typeof controller.refreshPlan !== 'function') return false;
+    if (entry.agent?.client?.status === 'demo') return false;
+    const now = Date.now();
+    let plan = null;
+    try { plan = this.state(entry)?.plan ?? null; } catch { plan = null; }
+    if (plan !== entry._planSeen) { entry._planSeen = plan; entry._planSeenAt = now; }
+    if (plan && entry._planSeenAt && now - entry._planSeenAt < this.planRefreshMs) return false; // still fresh
+    if (entry._planRefreshAt && now - entry._planRefreshAt < this.planRefreshMs) return false; // rate cap
+    entry._planRefreshAt = now;
+    try { Promise.resolve(controller.refreshPlan()).catch(() => {}); } catch {}
+    return true;
+  }
 
   // The /api/state snapshot (docs/gui-protocol.md). Entries are the Controller's own entry
   // objects (plain JSON, newest 200); approval is the pending request itself, minus the
   // parts that cannot cross JSON (resolve, its expiry timer, the call's abort signal).
   snapshot(entry, withEntries = true) {
     if (entry === undefined || typeof entry === 'boolean') { withEntries = entry === undefined ? true : entry; entry = this.defaultEntry(); }
-    if (!entry) return {version: this.version, session: {id: null, turns: 0}, entries: withEntries ? [] : undefined};
+    if (!entry) return {version: this.version, session: {id: null, turns: 0}, entries: withEntries ? [] : undefined, ...(this.setup ? {setup: {phase: this.setupPhase()}} : {})};
     const s = this.state(entry), a = entry.agent, ap = s.approval;
+    const focus = focusForWire(s, a); // focusfix: trimmed evidence, goal/status filled, ask gated (see focusForWire)
+    // serverfirst: the picker state (see the `question` field below), with its
+    // Deep H1-style id folded in — a client answering through POST /send names
+    // this id as `questionId`, and the server refuses a second answer.
+    const question = s.question && (!focus || focus.status === 'needs_input') ? plain(s.question) : null;
+    if (question && typeof question === 'object') question.id = this.questionIdOf(s.question);
+    // serverfirst-debug G5/G6/Y1: the three fields below are picked field
+    // by field, never whole-object passthroughs. promptFor's message is
+    // normalised to a string like the menu label (a BigInt message used to
+    // make plain() return null for the whole prompt, so a genuinely
+    // pending prompt crossed as null); addFlow crosses as exactly the
+    // {lines, busy} its comment always claimed (extra/internal fields no
+    // longer leak to every client, and one bad field no longer nulls the
+    // whole add screen); accountReserved goes through plain() like every
+    // other field, so a non-JSON value cannot throw inside the snapshot's
+    // own JSON.stringify and 500 the whole state read.
+    let promptFor = null, addFlow = null;
+    if (s.promptFor) { try { promptFor = {message: wireString(s.promptFor.message)}; } catch { promptFor = {message: null}; } }
+    if (s.addFlow) {
+      let lines = [], busy = null;
+      try { if (Array.isArray(s.addFlow.lines)) lines = s.addFlow.lines.map(x => wireString(x)).filter(x => x !== null); } catch {}
+      try { busy = wireString(s.addFlow.busy); } catch {}
+      addFlow = {lines, busy};
+    }
+    const accountReserved = s.accountReserved != null ? plain(s.accountReserved) : null;
     const snap = {
       version: this.version,
       cwd: a.cwd ?? null,
@@ -206,13 +410,26 @@ class GuiServer {
       mode: s.mode ?? a.mode ?? null,
       busy: !!s.busy,
       queue: [...(s.queue || [])],
-      approval: ap ? plain({id: this.approvalIdOf(ap), call: ap.call, preview: ap.preview ?? null, options: ap.options, index: ap.index ?? 0, outside: !!ap.outside}) : null,
+      approval: ap ? plain({id: this.approvalIdOf(ap), call: ap.call, preview: ap.preview ?? null, options: ap.options, index: ap.index ?? 0, outside: !!ap.outside, loreGrave: ap.loreGrave ?? null}) : null,
       shells: (s.shells || []).map(sh => ({id: sh.id, command: sh.command, running: !!sh.running})),
-      focus: s.focus ? plain(s.focus) : null,
+      focus,
+      goal: goalForWire(s, a),
       todos: plain(s.todos) || [],
       agents: plain(s.agents) || [],
       plan: s.plan ? plain(s.plan) : null,
       account: s.account ? plain(s.account) : null,
+      // serverfirst (out-CL §1): the three fields the remote Controller
+      // already consumes (remote-controller.mjs applySnapshot) but no
+      // snapshot ever sent, so /account add's screen, its prompt and the
+      // reserved-account lane could never appear in a client window.
+      // promptFor's live object carries resolve/reject closures; the wire
+      // shape is exactly the data a front-end renders: {message}.
+      // addFlow is {lines, busy}; accountReserved is the label string of
+      // the account a switch is reserved for, or null. All three are
+      // picked and normalised above (see the G5/G6/Y1 note).
+      promptFor,
+      addFlow,
+      accountReserved,
       // Who the user works with (the TUI's Muse name, e.g. "kaguya") and the word Muse picked
       // for its spinner this turn (spinner.set; null until it picks one).
       muse: {name: entry.controller.museName ?? entry.museName ?? null},
@@ -228,10 +445,18 @@ class GuiServer {
         hint: s.menu.hint ?? null,
         index: s.menu.index ?? 0,
         current: plain(s.menu.current ?? null),
+        // serverfirst (out-CL §1): the local menu's `side` is a paging
+        // closure (controller.mjs menuKey: ←/→ turn the /resume folder
+        // pages) and cannot cross JSON; the wire carries whether paging
+        // exists, and POST .../menu {side: -1|1} invokes it server-side
+        // (see menuSide). Each option's `group` (the /settings genre
+        // heading, view.mjs) is plain data and rides along as-is.
+        side: typeof s.menu.side === 'function',
         options: (s.menu.options || []).map(o => ({
           value: plain(o?.value ?? null),
           label: typeof o?.label === 'string' ? o.label : String(o?.value ?? ''),
           ...(typeof o?.desc === 'string' ? {desc: o.desc} : {}),
+          ...(typeof o?.group === 'string' ? {group: o.group} : {}),
           ...(o?.danger ? {danger: true} : {}),
           ...(o?.mark ? {mark: true} : {}),
         })),
@@ -268,11 +493,25 @@ class GuiServer {
       // choices themselves ride in focus.ask above; this is the picker's live state
       // (tab, checks, typed answers), plain data only — a client answers by sending
       // the composed reply as a normal message, like the phone page did.
-      question: s.question ? plain(s.question) : null,
+      // focusfix: like focus.ask, the picker state is only distributed while the
+      // focus status is 'needs_input' — a completed task must not ship a live
+      // picker. With no focus at all there is no status to gate on, so a picker
+      // the Controller opened some other way still rides, as before.
+      // serverfirst: the object also carries `id` (assigned above); a client
+      // that answers SHOULD send it back as `questionId` in the /send body —
+      // the server then refuses a second answer with 409 (see dispatch).
+      question,
       clientStatus: a.client?.status ?? null,
       device: {name: a.constructor?.DEVICE ?? null, slot: a.nodeSlot?.slot ?? null, connected: !!a.device?.connected},
       update: s.update ? plain(s.update) : null,
+      // app-ui: a text question the Controller is waiting on (promptAsk: an account's name,
+      // the contact / code of the device registration) — only its words; the answer is a
+      // send or POST /api/prompt. The account-add screen (addFlow) and accountReserved
+      // are the sanitised fields above (release-039 merge: app-ui had added raw copies of
+      // both here, which overrode them and let a non-JSON value 500 the state read).
+      prompt: promptFor ? {message: promptFor.message ?? ''} : null,
     };
+    if (this.setup) snap.setup = {phase: this.setupPhase()};
     if (withEntries) snap.entries = plainList((s.entries || []).slice(-MAX_ENTRIES));
     return snap;
   }
@@ -306,14 +545,8 @@ class GuiServer {
     this.port = server.address().port;
     this.startedAt = Date.now();
     for (const entry of this.allEntries()) this.attachEntry(entry);
-    if (this.host) {
-      this._hostListener = event => {
-        if (event?.type === 'session-opened') { const e = this.host.get(event.sessionId); if (e) this.attachEntry(e); }
-        if (event?.type === 'session-closed') this.detachEntry(event.sessionId);
-        this.broadcastServerEvent(event);
-      };
-      this.host.on('event', this._hostListener);
-    }
+    this.attachHostListener();
+    this.attachSetupListener();
     await this.writeDiscoveryChecked();
     return this;
     })();
@@ -342,6 +575,7 @@ class GuiServer {
   }
 
   async close() {
+    if (this.setup && this._setupListener) { try { this.setup.removeListener('change', this._setupListener); } catch {} this._setupListener = null; }
     if (this.host && this._hostListener) { try { this.host.removeListener('event', this._hostListener); } catch {} this._hostListener = null; }
     for (const [, att] of [...this.attached]) {
       if (att.unsubscribe) { try { att.unsubscribe(); } catch {} att.unsubscribe = null; }
@@ -371,12 +605,12 @@ class GuiServer {
   }
   writeDiscoveryFile(file, data, force = false) {
     if (!force && this.discoveryOwnedByLiveOther(file)) return;
+    const tmp = file + '.tmp-' + process.pid;
     try {
       fs.mkdirSync(path.dirname(file), {recursive: true});
-      const tmp = file + '.tmp-' + process.pid;
       fs.writeFileSync(tmp, JSON.stringify(data));
-      fs.renameSync(tmp, file);
-    } catch {}
+      renameRetry(tmp, file);
+    } catch { try { fs.unlinkSync(tmp); } catch {} }
   }
   // c4#9 (deep #36): "the pid in the file is alive" alone is not ownership —
   // after a crash the pid can be REUSED by an unrelated process, and the
@@ -446,10 +680,48 @@ class GuiServer {
     if (!this.authorized(req)) return this.json(res, 401, {error: 'unauthorized'});
     const url = new URL(req.url, 'http://127.0.0.1');
     const p = url.pathname;
+    // First-run setup (setup mode): server-level routes, answered before any
+    // conversation route — like /api/server/* below, and deliberately NOT in
+    // the phone channel's allowlist (src/link/channel-server.js), so a paired
+    // phone can never answer setup questions. Answers carry credentials, so
+    // every setup response is no-store. The Bearer check above applies as usual.
+    if (req.method === 'GET' && p === '/api/setup') return this.jsonNoStore(res, 200, this.setupState());
+    if (req.method === 'POST' && p === '/api/setup/answer') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (!this.setup) return this.jsonNoStore(res, 409, {error: 'setup is not running'});
+      const arg = {promptId: body.promptId};
+      if ('value' in body) arg.value = body.value;
+      if ('index' in body) arg.index = body.index;
+      try { await this.setup.answer(arg); } catch (e) { return this.jsonNoStore(res, e.status || 400, {error: e.message}); }
+      return this.jsonNoStore(res, 200, {ok: true});
+    }
+    if (req.method === 'POST' && p === '/api/setup/start') {
+      const body = await this.readBody(req, res).catch(() => null); if (body === null) return;
+      if (!this.setup) return this.jsonNoStore(res, 409, {error: 'setup is not running'});
+      let started;
+      try { started = this.setup.start(); } catch (e) { return this.jsonNoStore(res, e.status || 400, {error: e.message}); }
+      if (started && typeof started.then === 'function') {
+        // Do not wait for the flow to finish — only surface an immediate
+        // refusal (already running -> 409), which settles within a tick.
+        let refusal = null;
+        started.then(() => {}, e => { refusal = e; });
+        await new Promise(r => setImmediate(r));
+        if (refusal) return this.jsonNoStore(res, refusal.status || 400, {error: refusal.message});
+      }
+      return this.jsonNoStore(res, 200, {ok: true});
+    }
+    if (req.method === 'POST' && p === '/api/setup/cancel') {
+      const body = await this.readBody(req, res).catch(() => null); if (body === null) return;
+      if (!this.setup) return this.jsonNoStore(res, 409, {error: 'setup is not running'});
+      try { this.setup.cancel(); } catch (e) { return this.jsonNoStore(res, e.status || 400, {error: e.message}); }
+      return this.jsonNoStore(res, 200, {ok: true});
+    }
     // v5 server-wide routes (remote/SERVER.md): about the server itself, not one
     // conversation. They answer in single-conversation mode too (one session),
     // except the session-opening ones, which need a SessionsHost.
     if (req.method === 'GET' && p === '/api/server') return this.json(res, 200, this.serverInfo());
+    // app-ux: the GUI theme for paired clients (read-only; see ui-config.js).
+    if (req.method === 'GET' && p === '/api/ui-config') return this.json(res, 200, buildUiConfig());
     if (req.method === 'GET' && p === '/api/server/events') return this.serverEvents(req, res);
     if (req.method === 'POST' && p === '/api/server/stop') {
       // c4#2 (deep #29): a body readBody already refused (400/413, null) must
@@ -497,7 +769,10 @@ class GuiServer {
     if (req.method === 'POST' && p === '/api/sessions') {
       const body = await this.readBody(req, res); if (body === null) return;
       if (!this.host) return this.json(res, 501, {error: 'session hosting is not enabled'});
-      try { const entry = await this.host.openNew({cwd: body.cwd, account: body.account, mode: body.mode}); return this.json(res, 201, {id: entry.id}); }
+      // serverfirst (out-CL §1): the attach values discovery.js forwards
+      // (--max-agents / --max-agents-total / --no-focus) ride along to the
+      // host, which validates and passes them to the conversation factory.
+      try { const entry = await this.host.openNew({cwd: body.cwd, account: body.account, mode: body.mode, maxAgents: body.maxAgents, maxAgentsTotal: body.maxAgentsTotal, focusEnabled: body.focusEnabled, noFocus: body.noFocus}); return this.json(res, 201, {id: entry.id}); }
       catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
     }
     const openMatch = /^\/api\/sessions\/([^/]+)\/open$/.exec(p);
@@ -505,7 +780,7 @@ class GuiServer {
       const openBody = await this.readBody(req, res).catch(() => null);
       if (openBody === null) return; // c4#2: refused body, no open
       if (!this.host) return this.json(res, 501, {error: 'session hosting is not enabled'});
-      try { const entry = await this.host.openExisting(decodeURIComponent(openMatch[1])); return this.json(res, 200, {id: entry.id}); }
+      try { const entry = await this.host.openExisting(decodeURIComponent(openMatch[1]), {maxAgents: openBody.maxAgents, maxAgentsTotal: openBody.maxAgentsTotal, focusEnabled: openBody.focusEnabled, noFocus: openBody.noFocus}); return this.json(res, 200, {id: entry.id, ...(entry.attachDropped ? {attachApplied: false} : {})}); }
       catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
     }
     const closeMatch = /^\/api\/sessions\/([^/]+)\/close$/.exec(p);
@@ -516,6 +791,10 @@ class GuiServer {
       try { this.host.close(decodeURIComponent(closeMatch[1])); return this.json(res, 200, {ok: true}); }
       catch (e) { return this.json(res, e.status || 400, {error: e.message}); }
     }
+    // app-ui: the account registry (muser account list / use / auto / remove, and rename),
+    // for clients that cannot run the CLI on this PC (the phone). Switching a
+    // conversation's account and adding one are per-conversation (POST /api/account).
+    if (p === '/api/accounts' || p.startsWith('/api/accounts/')) return this.accountsRoute(req, res, p);
     // Per-conversation routes: /api/s/:id/... names a conversation; the unprefixed
     // routes (v1-v4) keep pointing at the default conversation, unchanged.
     const sMatch = /^\/api\/s\/([^/]+)(\/.*)$/.exec(p);
@@ -525,7 +804,15 @@ class GuiServer {
       return this.dispatch(entry, req, res, url, '/api' + sMatch[2]);
     }
     const entry = this.defaultEntry();
-    if (!entry) return this.json(res, 404, {error: 'no conversation open'});
+    if (!entry) {
+      // Setup mode (no conversation yet, a first-run setup still running):
+      // /api/state answers the empty snapshot plus the setup phase; every other
+      // conversation route keeps the usual no-conversation 404. Without a
+      // pending setup (e.g. the default conversation was closed, gui #59) the
+      // unprefixed state route stays a 404 as before.
+      if (req.method === 'GET' && p === '/api/state' && this.setup && this.setupPhase() !== 'done') return this.json(res, 200, this.snapshot());
+      return this.json(res, 404, {error: 'no conversation open'});
+    }
     return this.dispatch(entry, req, res, url, p);
   }
 
@@ -540,11 +827,12 @@ class GuiServer {
     // touch; the SSE stream touches for as long as it stays open (events()).
     if (req.method !== 'GET') this.host?.touch(entry.id);
     const controller = entry.controller, agent = entry.agent;
-    if (req.method === 'GET' && p === '/api/state') return this.json(res, 200, this.snapshot(entry, true));
+    if (req.method === 'GET' && p === '/api/state') { this.maybeRefreshPlan(entry); return this.json(res, 200, this.snapshot(entry, true)); }
     if (req.method === 'GET' && p === '/api/events') return this.events(entry, req, res);
     if (req.method === 'GET' && p === '/api/complete') return this.complete(entry, url, res);
     if (req.method === 'GET' && p === '/api/changes') return this.changes(entry, url, res);
     if (req.method === 'GET' && p === '/api/muse-avatar') return this.museAvatar(entry, res, url.searchParams.get('video'));
+    if (req.method === 'GET' && p === '/api/image') return this.workspaceImage(entry, res, url.searchParams.get('path'));
     if (req.method === 'GET' && p === '/api/outputs') return this.outputs(entry, url, res);
     if (req.method === 'GET' && p === '/api/entries') return this.entriesPage(entry, url, res);
     if (req.method === 'POST' && p === '/api/send') {
@@ -562,6 +850,47 @@ class GuiServer {
       // back to its "look at this image" wording for a text-less turn.
       if (!text.trim() && !hasAttachments) return this.json(res, 400, {error: 'text is required'});
       const st0 = this.state(entry);
+      // serverfirst (out-CL §6): the ask_user double-answer guard. A question
+      // answer is a plain /send, so without correlation the second front-end's
+      // answer landed as an ordinary chat message after the first answer had
+      // already closed the picker. A body may carry `questionId` — the `id`
+      // of the snapshot's question object it answers. When it does, the send
+      // is bound to that question exactly like an approvalId: no question
+      // open, a different question open, or this id already answered are all
+      // the same refusal — 409 {error: 'question already answered',
+      // code: 'question_answered'} — and the send never reaches submit().
+      // First answer wins. Sends without questionId are unchanged (legacy
+      // clients, the phone page, plain chat while a picker is open).
+      // serverfirst-debug G2: only a non-empty STRING engages the guard.
+      // The old String() coercion let ["question-1"] pass as a valid id and
+      // made "" / 0 / false / {} count as "present", refusing plain chat
+      // sends with a bogus question_answered; any other shape is ignored,
+      // exactly like a send without the field.
+      const questionId = typeof body.questionId === 'string' && body.questionId !== '' ? body.questionId : null;
+      if (questionId !== null) {
+        // serverfirst-debug G3: the guard judges the same question the
+        // snapshot shows — gated on the Focus status (needs_input), like
+        // snapshot() — not the raw state field, so an id picked up while
+        // the task waited cannot be answered after the status moved on.
+        const focus0 = focusForWire(st0, entry.agent);
+        const open = st0?.question && (!focus0 || focus0.status === 'needs_input') ? st0.question : null;
+        if (this._answeredQuestionIds.has(questionId) || !open || questionId !== this.questionIdOf(open))
+          return this.json(res, 409, {error: 'question already answered', code: 'question_answered'});
+        // serverfirst-debug G4: the answer must actually REACH the
+        // question. submit() answers a pending decline reason or prompt
+        // first and drops plain sends during an account add (after closing
+        // the picker), so in those states this send would burn the id and
+        // close the picker without answering it. Refuse instead; the
+        // picker stays open for a later answer.
+        if (st0?.reasonFor || st0?.promptFor || controller.addingAccount)
+          return this.json(res, 409, {error: 'question already answered', code: 'question_answered'});
+        // serverfirst-debug G1: burn the id BEFORE submit, not after.
+        // submit clears the picker asynchronously (a queued/steered answer
+        // can lag a tick), and a duplicate racing that window used to pass
+        // this guard and submit a second answer. A submit that fails at
+        // once un-burns the id below, so the question survives a refusal.
+        this.markQuestionAnswered(questionId);
+      }
       // Audit #79: a busy submit whose queue is already full (Controller
       // MAX_QUEUE = 5) is dropped by submit() with only a flash — the API
       // must not answer 202 for a message it knows will never be queued.
@@ -614,6 +943,10 @@ class GuiServer {
       }
       if (submitError) {
         if (hasAttachments) { if (typeof controller.set === 'function') controller.set({attachments: prevAttachments || []}); else if (st0) st0.attachments = prevAttachments || []; }
+        // serverfirst-debug G1: the send was refused, so the questionId
+        // burned at the guard is handed back — the picker is still open
+        // and its real answer must still be able to land.
+        if (questionId !== null) this.unmarkQuestionAnswered(questionId);
         return this.json(res, 500, {error: 'send failed: ' + (submitError.message || String(submitError))});
       }
       return this.json(res, 202, {ok: true});
@@ -623,6 +956,39 @@ class GuiServer {
       // Deep H1: body.approvalId (or decision.approvalId) binds the answer to
       // the approval the client saw; approval() rejects a mismatch with 409.
       return this.approval(entry, body.decision, res, body?.approvalId ?? body?.decision?.approvalId);
+    }
+    if (req.method === 'POST' && p === '/api/account') {
+      // {id}: switch this conversation (Controller.accountCommand — checks login and device,
+      // reserves the switch for the turn's end when busy). {add: label}: start adding an
+      // account (the Edge login opens on THIS PC; its questions arrive as state.prompt).
+      const body = await this.readBody(req, res); if (body === null) return;
+      if (typeof body.add === 'string') {
+        if (typeof controller.addAccountFlow !== 'function') return this.json(res, 501, {error: 'adding accounts is not available'});
+        if (controller.addingAccount || controller.loggingIn) return this.json(res, 409, {error: 'an account is already being added or logged in'});
+        Promise.resolve(controller.addAccountFlow(body.add.trim())).catch(() => {});
+        return this.json(res, 202, {ok: true});
+      }
+      if (typeof body.id !== 'string' || !body.id) return this.json(res, 400, {error: 'id or add is required'});
+      if (typeof controller.accountCommand !== 'function') return this.json(res, 501, {error: 'switching accounts is not available'});
+      Promise.resolve(controller.accountCommand(body.id)).catch(() => {});
+      return this.json(res, 202, {ok: true});
+    }
+    if (req.method === 'POST' && p === '/api/prompt') {
+      const body = await this.readBody(req, res); if (body === null) return;
+      // One route for both sides of the release-039 merge: {cancel: true} cancels the
+      // pending typed prompt (serverfirst-debug R4: a client window could not), and
+      // {value} answers it (app-ui: the phone types the account name / code). Any other
+      // shape is refused before the pending check.
+      if (body?.cancel !== true && typeof body?.value !== 'string') return this.json(res, 400, {error: 'prompt route takes {cancel: true} or {value: string}'});
+      const st = this.state(entry);
+      if (!st?.promptFor) return this.json(res, 409, {error: 'no question is waiting'});
+      if (body.cancel === true) {
+        if (typeof controller.cancelPrompt !== 'function') return this.json(res, 500, {error: 'cancelPrompt is not available'});
+        controller.cancelPrompt();
+        return this.json(res, 200, {ok: true});
+      }
+      controller.submitPrompt(body.value);
+      return this.json(res, 200, {ok: true});
     }
     if (req.method === 'POST' && p === '/api/mode') {
       const body = await this.readBody(req, res); if (body === null) return;
@@ -636,6 +1002,7 @@ class GuiServer {
     if (req.method === 'POST' && p === '/api/menu') {
       const body = await this.readBody(req, res); if (body === null) return;
       if (body?.cancel === true) return this.menuCancel(entry, res, body);
+      if (body?.side !== undefined) return this.menuSide(entry, body, res);
       return this.menuPick(entry, body, res);
     }
     if (req.method === 'POST' && p === '/api/limit') {
@@ -671,14 +1038,14 @@ class GuiServer {
     const def = this.defaultEntry();
     let sessions;
     if (this.host) sessions = this.host.list();
-    else if (def) { const s = this.state(def); sessions = [{id: def.id, cwd: def.agent.cwd ?? null, turns: def.agent.session?.turns ?? 0, mode: s.mode ?? def.agent.mode ?? null, busy: !!s.busy, approval: !!s.approval, account: def.agent.accountId ?? null, accountLabel: def.agent.accountLabel ?? null, museName: def.controller.museName ?? null, isDefault: true}]; }
+    else if (def) { const s = this.state(def); sessions = [{id: def.id, cwd: def.agent.cwd ?? null, title: def.agent.session?.title ?? null, turns: def.agent.session?.turns ?? 0, mode: s.mode ?? def.agent.mode ?? null, busy: !!s.busy, approval: !!s.approval, account: def.agent.accountId ?? null, accountLabel: def.agent.accountLabel ?? null, museName: def.controller.museName ?? null, isDefault: true}]; }
     else sessions = [];
     let accounts = [];
     try {
       if (this.accountsProvider) accounts = this.accountsProvider() || [];
       else { const a = require('./accounts'); const active = a.activeId(); accounts = a.list().map(x => ({id: x.id, label: x.label, active: x.id === active})); }
     } catch {}
-    return {protocol: 6, version: this.version, pid: process.pid, startedAt: this.startedAt, port: this.port, sessions, muse: {name: def?.controller?.museName ?? def?.museName ?? null}, accounts, link: this.linkState()};
+    return {protocol: 6, version: this.version, pid: process.pid, startedAt: this.startedAt, port: this.port, sessions, muse: {name: def?.controller?.museName ?? def?.museName ?? null}, accounts, link: this.linkState(), setup: {phase: this.setupPhase()}};
   }
 
   // The link as the local API may show it: state() carries the pairing code for
@@ -761,6 +1128,10 @@ class GuiServer {
 
   // GET /api/sessions?cwd=&limit= (v5): the stored conversations (src/sessions.js
   // recent), each marked with whether it is open here, and busy when it is.
+  // origin is the conversation's creation mark ('exec' for one `muser exec`
+  // created); an interactive conversation has none and reports null, so a
+  // caller can keep exec-made folders out of its project candidates. A conversation made
+  // before the mark existed still reads 'exec' when an exec run on record names it.
   sessionList(url, res) {
     const cwd = url.searchParams.get('cwd') || undefined;
     const limitRaw = Number(url.searchParams.get('limit'));
@@ -768,9 +1139,12 @@ class GuiServer {
     let recent;
     try { recent = this.recentProvider ? this.recentProvider(cwd) : require('./sessions').recent(cwd); }
     catch (e) { return this.json(res, 500, {error: e.message}); }
+    let execIds = null;
+    try { execIds = this.execSessionIds ? this.execSessionIds() : require('./exec-status').sessionIds(); } catch {}
     const sessions = (recent || []).slice(0, limit).map(s => {
       const entry = this.resolveEntry(s.id);
-      return {id: s.id, cwd: s.cwd ?? null, title: s.title || '', turns: s.turns ?? 0, created: s.created ?? null, updated: s.updated ?? null, account: s.account ?? null, open: !!entry, busy: entry ? !!this.state(entry).busy : false};
+      const origin = typeof s.origin === 'string' && s.origin ? s.origin : (execIds && execIds.has(s.id) ? 'exec' : null);
+      return {id: s.id, cwd: s.cwd ?? null, title: s.title || '', turns: s.turns ?? 0, created: s.created ?? null, updated: s.updated ?? null, account: s.account ?? null, origin, open: !!entry, busy: entry ? !!this.state(entry).busy : false};
     });
     return this.json(res, 200, {sessions});
   }
@@ -842,6 +1216,27 @@ class GuiServer {
       menu.cancel?.();
     }
     return this.json(res, 200, {ok: true});
+  }
+
+  // POST .../menu {side: -1|1} (serverfirst): turn the open menu's page —
+  // exactly the TUI's menuKey ←/→ branch (controller.mjs), which calls the
+  // menu's own side(dir); the closure stays server-side and the paged menu
+  // reaches clients through the next snapshot (its id changes with the new
+  // menu object, as for any replaced menu). Same identity binding as a
+  // pick: a supplied menuId that is not the open menu's is a 409.
+  menuSide(entry, body, res) {
+    const s = this.state(entry), menu = s?.menu;
+    if (!menu) return this.json(res, 409, {error: 'no menu open'});
+    if (body?.menuId !== undefined && body?.menuId !== null && String(body.menuId) !== String(this.menuIdOf(menu))) return this.json(res, 409, {error: 'menu has changed'});
+    if (body.side !== -1 && body.side !== 1) return this.json(res, 400, {error: 'side must be -1 or 1'});
+    if (typeof menu.side !== 'function') return this.json(res, 409, {error: 'menu has no paging'});
+    let paged;
+    try { paged = menu.side(body.side); } catch (e) { return this.json(res, 500, {error: e.message}); }
+    // serverfirst-debug G7: an ASYNC paging failure gets menuPick's
+    // treatment (surfaced as an error entry on the conversation) instead
+    // of an unhandled rejection behind a 200 the client already believed.
+    Promise.resolve(paged).catch(e => this.surfaceAsyncError(entry, e));
+    return this.json(res, 200, {ok: true, side: body.side});
   }
 
   // POST /limit {value, key} or {cancel: true, key} (v6): answer the pending
@@ -1022,6 +1417,70 @@ class GuiServer {
     return this.json(res, 200, {ok: true});
   }
 
+  // ---- app-ui: /api/accounts ----
+  admin() {
+    if (this.accountsAdmin) return this.accountsAdmin;
+    return {
+      accounts: require('./accounts'),
+      pool: require('./account-pool'),
+      setAuto: on => require('./config').update(cfg => { cfg.accountAuto = !!on; }),
+    };
+  }
+  // The accounts an open conversation is using (they must not be removed under it).
+  accountsInUse() {
+    const used = new Set();
+    for (const e of this.allEntries()) { const id = e.agent?.accountId ?? e.agent?.account?.id; if (id) used.add(id); }
+    return used;
+  }
+  async accountsRoute(req, res, p) {
+    const {accounts, pool, setAuto} = this.admin();
+    if (req.method === 'GET' && p === '/api/accounts') {
+      // statuses() reads each account's weekly plan (one muse.ai call each); a failure
+      // there reads as unknown, and a total failure falls back to the bare registry.
+      let all;
+      try { all = await pool.statuses(); }
+      catch { all = accounts.list().map(a => ({id: a.id, label: a.label, hasLogin: null, device: null, available: null, percentUsed: null})); }
+      const def = accounts.activeId(), used = this.accountsInUse();
+      const vms = new Map();
+      for (const s of all) if (s.vm) vms.set(s.vm, (vms.get(s.vm) || 0) + 1);
+      const items = all.map(s => ({
+        id: s.id, label: s.label, isDefault: s.id === def, inUse: used.has(s.id),
+        hasLogin: s.hasLogin ?? null, device: s.device ?? null, available: s.available ?? null,
+        percentUsed: s.percentUsed ?? s.plan?.percentUsed ?? null, quotaStatus: s.quotaStatus ?? null,
+        resetsAt: s.plan?.resetsAt ?? null, planName: s.plan?.plan ?? null,
+        sharedMuse: !!(s.vm && vms.get(s.vm) > 1), removable: s.id !== accounts.DEFAULT_ID,
+      }));
+      let threshold = null; try { threshold = accounts.threshold(); } catch {}
+      return this.json(res, 200, {accounts: items, auto: !!pool.autoEnabled(), defaultId: def, threshold});
+    }
+    if (req.method !== 'POST') return this.json(res, 404, {error: 'not found'});
+    const body = await this.readBody(req, res); if (body === null) return;
+    try {
+      if (p === '/api/accounts/auto') {
+        if (typeof body.on !== 'boolean') return this.json(res, 400, {error: 'on must be true or false'});
+        setAuto(body.on);
+        return this.json(res, 200, {ok: true, auto: body.on});
+      }
+      const target = typeof body.id === 'string' ? accounts.get(body.id) : null;
+      if (!target) return this.json(res, 404, {error: 'unknown account'});
+      if (p === '/api/accounts/default') { accounts.setActive(target.id); return this.json(res, 200, {ok: true}); }
+      if (p === '/api/accounts/rename') {
+        if (typeof body.label !== 'string' || !body.label.trim()) return this.json(res, 400, {error: 'label is required'});
+        accounts.rename(target.id, body.label.trim());
+        return this.json(res, 200, {ok: true});
+      }
+      if (p === '/api/accounts/remove') {
+        if (target.id === accounts.DEFAULT_ID) return this.json(res, 400, {error: 'the first account cannot be removed'});
+        if (this.accountsInUse().has(target.id)) return this.json(res, 409, {error: 'a conversation is using this account'});
+        const {leftover} = accounts.remove(target.id) || {};
+        return this.json(res, 200, {ok: true, ...(leftover ? {leftover: true} : {})});
+      }
+    } catch (e) {
+      return this.json(res, 400, {error: String(e?.message || e)});
+    }
+    return this.json(res, 404, {error: 'not found'});
+  }
+
   // GET /api/complete (docs/gui-protocol.md v2): the same candidates the TUI offers.
   // kind=slash reuses Controller.slashList (the ↑↓ candidate source; descriptions are
   // looked up in that same COMMANDS table, loaded lazily — never a copy of the list).
@@ -1041,7 +1500,31 @@ class GuiServer {
       const list = mention.complete(q, entry.agent.cwd, mention.COMPLETE_LIMIT) || [];
       return this.json(res, 200, {items: list.map(text => ({text}))});
     }
-    return this.json(res, 400, {error: 'kind must be slash or file'});
+    // app-ui: the pickers the GUI fills from its own reading of the PC (SkillCatalog /
+    // AgentTypes) — a phone cannot read the PC's files, so the serve answers them.
+    // kind=agent: the /agent types for this cwd (built-in + .muser/agents), as the TUI's
+    // /agent usage line lists them. kind=skill: the ENABLED skills /skill accepts.
+    // kind=instructions: which project instruction files exist (the empty chat's /init card).
+    if (kind === 'agent' || kind === 'skill' || kind === 'instructions') {
+      const {t} = require('./i18n');
+      const cwd = entry.agent.cwd;
+      const match = name => !q || name.startsWith(q.toLowerCase());
+      try {
+        if (kind === 'agent') {
+          const types = typeof entry.agent.types === 'function' ? entry.agent.types() : require('./agent-types').load(cwd);
+          return this.json(res, 200, {items: Object.entries(types || {}).filter(([name]) => match(name)).map(([name, def]) => ({text: name, desc: t(String(def?.description || name)), readOnly: !!def?.readOnly}))});
+        }
+        if (kind === 'skill') {
+          const list = require('./skills').load(cwd) || [];
+          return this.json(res, 200, {items: list.filter(s => s.enabled && match(s.name)).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0).map(s => ({text: s.name, desc: String(s.description || '')}))});
+        }
+        const files = ['AGENTS.md', 'CLAUDE.md', 'MUSE.md', '.muser/instructions.md'];
+        return this.json(res, 200, {items: files.filter(f => { try { return !!cwd && fs.statSync(path.join(cwd, f)).isFile(); } catch { return false; } }).map(text => ({text}))});
+      } catch (e) {
+        return this.json(res, 500, {error: String(e?.message || e)});
+      }
+    }
+    return this.json(res, 400, {error: 'kind must be slash, file, agent, skill or instructions'});
   }
 
   // name -> description from controller.mjs's COMMANDS (the single definition), cached.
@@ -1067,6 +1550,10 @@ class GuiServer {
     const promise = this.computeChangedFiles(cwd);
     const rec = {at: now, promise};
     this._changesCache.set(cwd, rec);
+    // The TTL runs from when the run FINISHES: stamped at the start, a git run slower
+    // than the TTL (routine under load) left no cache window at all, and the c4#7 test
+    // flaked whenever a cold git run crossed 1 s during the full suite.
+    promise.then(() => { if (this._changesCache.get(cwd) === rec) rec.at = Date.now(); }, () => {});
     promise.catch(() => { if (this._changesCache.get(cwd) === rec) this._changesCache.delete(cwd); });
     return promise;
   }
@@ -1169,6 +1656,44 @@ class GuiServer {
     } catch (e) { return this.json(res, 502, {error: 'avatar unavailable: ' + e.message}); }
   }
 
+  // GET /api/image?path=<p>: one image file from inside the conversation's
+  // working folder, read-only (app-md: the phone previews images Muse saw
+  // or made). The real path must stay inside the real working folder
+  // (symlinks resolved on both sides), sensitive paths are refused, only
+  // the four attachment image types pass, the magic bytes must match the
+  // extension's type, and the body is capped at 8 MB.
+  async workspaceImage(entry, res, rel) {
+    const IMAGE_EXTS = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp'};
+    const IMAGE_MAX = 8 * 1024 * 1024;
+    try {
+      if (typeof rel !== 'string' || !rel || rel.length > 1024) return this.json(res, 400, {error: 'path is required'});
+      const cwd = entry.agent?.cwd;
+      if (!cwd) return this.json(res, 404, {error: 'no working folder'});
+      const type = IMAGE_EXTS[path.extname(rel).toLowerCase()];
+      if (!type) return this.json(res, 400, {error: 'not an image file'});
+      const joined = path.resolve(cwd, rel);
+      if (isSensitivePath(joined)) return this.json(res, 403, {error: 'sensitive path'});
+      const real = realOf(joined);
+      const realCwd = realOf(cwd);
+      if (!real || !realCwd || !inside(realCwd, real) || real === realCwd) return this.json(res, 404, {error: 'not found'});
+      if (isSensitivePath(real)) return this.json(res, 403, {error: 'sensitive path'});
+      const st = await fs.promises.stat(real).catch(() => null);
+      if (!st || !st.isFile()) return this.json(res, 404, {error: 'not found'});
+      // app-debug #6: a hardlink inside the folder can BE a file outside it
+      // (same inode under a second name) — the realpath check cannot see it,
+      // so a multiply-linked file is not provably "inside only".
+      if (st.nlink > 1) return this.json(res, 404, {error: 'not found'});
+      if (st.size > IMAGE_MAX) return this.json(res, 413, {error: 'image too large'});
+      const data = await fs.promises.readFile(real);
+      // The size is re-checked on the bytes actually read: the stat above
+      // and this read are not atomic (the file can grow between them).
+      if (data.length > IMAGE_MAX) return this.json(res, 413, {error: 'image too large'});
+      if (!imageMagicMatches(type, data)) return this.json(res, 400, {error: 'not an image file'});
+      res.writeHead(200, {'content-type': type, 'content-length': data.length, 'cache-control': 'private, max-age=3600'});
+      res.end(data);
+    } catch (e) { return this.json(res, 502, {error: 'image unavailable: ' + e.message}); }
+  }
+
   async changes(entry, url, res) {
     const cwd = entry.agent.cwd ?? null;
     const fileParam = url.searchParams.get('file');
@@ -1223,7 +1748,9 @@ class GuiServer {
       const outputs = raw.map((o, i) => {
         const id = o && o.id !== undefined && o.id !== null && o.id !== '' ? String(o.id) : (o && o.at ? 'output-' + o.at + '-' + i : 'output-' + i);
         const title = o && typeof o.title === 'string' && o.title ? o.title : [o?.command, o?.summary].filter(v => typeof v === 'string' && v).join('  ');
-        const full = o && typeof o.text === 'string' ? o.text : String(o?.text ?? '');
+        // Stage 2 (memory): an output over the Controller's total cap lives in a file;
+        // resolve it through the Controller so the GUI still receives the full text.
+        const full = o && typeof o.text === 'string' ? o.text : (entry.controller && typeof entry.controller.outputText === 'function' ? entry.controller.outputText(o) : String(o?.text ?? ''));
         // Audit #84: the list form returned every stored output in full
         // (up to 30, unbounded each) while the shell form caps at 1 MB.
         // The list form now caps each text the same way, flagged.
@@ -1248,12 +1775,14 @@ class GuiServer {
   }
 
   events(entry, req, res) {
+    this.maybeRefreshPlan(entry); // gui-serve: subscribing reads state too — a stale plan is re-read in the background (see maybeRefreshPlan)
     if (!this.attached.has(entry)) this.attachEntry(entry);
     const att = this.attached.get(entry);
     // c4#6 (deep #33): cap subscribers per conversation, like the server stream.
     if (att.clients.size >= MAX_SSE_CLIENTS) return this.json(res, 503, {error: 'too many event clients'});
     res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no'});
-    const client = {res, entry, lastEntries: this.state(entry).entries || [], lastStateJson: '', stateTimer: null, heartbeat: null};
+    const initialEntries = this.state(entry).entries || [];
+    const client = {res, entry, lastEntries: initialEntries, lastEntriesCount: initialEntries.length, lastEntriesTailId: initialEntries.length ? initialEntries[initialEntries.length - 1]?.id : undefined, lastStateJson: '', stateTimer: null, heartbeat: null};
     const state = this.snapshot(entry, false);
     client.lastStateJson = JSON.stringify(state);
     this.sendEvent(client, {kind: 'state', state});
@@ -1294,6 +1823,14 @@ class GuiServer {
   // Controller.subscribe fires on every set(): entry appends (and wholesale list
   // replacements — /new, /resume, /clear) go out at once; other state changes are
   // debounced ~50 ms and sent without entries.
+  // Wave18: the append check is O(1) per client instead of scanning every
+  // previously sent id (O(entries) per client per change). Each client keeps
+  // the count of entries it was last sent and the id of the last one; the new
+  // list is an append iff it did not shrink and the entry now at the old
+  // boundary (prevCount - 1 — also the tail when nothing was added) still
+  // carries that id. Any other shape is a replacement and goes out as an
+  // entries-reset, as before. A set() that does not replace the entries array
+  // still skips this entirely via the lastEntries identity check below.
   onControllerChange(entry, att) {
     att = att || this.attached.get(entry);
     if (!att) return;
@@ -1301,10 +1838,14 @@ class GuiServer {
       const entries = this.state(entry).entries || [];
       if (client.lastEntries !== entries) {
         const prev = client.lastEntries || [];
-        const appended = entries.length >= prev.length && prev.every((e, i) => entries[i] && entries[i].id === e.id);
-        if (appended) for (const ent of entries.slice(prev.length)) this.sendEvent(client, {kind: 'entry', entry: plain(ent)});
+        const prevCount = typeof client.lastEntriesCount === 'number' ? client.lastEntriesCount : prev.length;
+        const prevTailId = typeof client.lastEntriesCount === 'number' ? client.lastEntriesTailId : (prev.length ? prev[prev.length - 1]?.id : undefined);
+        const appended = entries.length >= prevCount && (prevCount === 0 || entries[prevCount - 1]?.id === prevTailId);
+        if (appended) for (const ent of entries.slice(prevCount)) this.sendEvent(client, {kind: 'entry', entry: plain(ent)});
         else this.sendEvent(client, {kind: 'entries-reset', entries: plainList(entries.slice(-MAX_ENTRIES))});
         client.lastEntries = entries;
+        client.lastEntriesCount = entries.length;
+        client.lastEntriesTailId = entries.length ? entries[entries.length - 1]?.id : undefined;
       }
       if (!client.stateTimer) {
         client.stateTimer = setTimeout(() => {
@@ -1317,7 +1858,7 @@ class GuiServer {
     }
   }
 
-  json(res, status, obj) {
+  json(res, status, obj, headers) {
     if (res.writableEnded) return;
     // Audit #83: stringify BEFORE writeHead — a value JSON cannot carry
     // (a BigInt, a throwing getter) used to throw after the 200 head was
@@ -1325,9 +1866,10 @@ class GuiServer {
     // a second, corrupt body. A stringify failure is a clean 500 instead.
     let body;
     try { body = JSON.stringify(obj); } catch { status = 500; body = JSON.stringify({error: 'internal error'}); }
-    res.writeHead(status, {'content-type': 'application/json'});
+    res.writeHead(status, {'content-type': 'application/json', ...(headers || {})});
     res.end(body);
   }
+  jsonNoStore(res, status, obj) { return this.json(res, status, obj, {'cache-control': 'no-store'}); }
 
   // Reads and parses a JSON body; on any problem it answers (400/413) and returns null.
   // maxBody overrides the global cap for the one route that needs it (v6 /send).

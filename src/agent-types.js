@@ -28,18 +28,84 @@ const BUILTIN = {
     prompt: 'You run and fix tests. Find how this project runs its tests, run them, investigate each failure, make the smallest correct fix, and re-run until they pass. Report what failed, what you changed, and the final result.'},
 };
 
+const MAX_FILE = 256 * 1024;
+
+// A frontmatter scalar as skills.js's parser reads it (Wave 16): values were stored raw
+// here, so readonly: "true" failed the boolean test below (a read-only type silently
+// became writable) and tools: "code.read", "code.grep" produced entries still wearing
+// their quotes, which never match a real tool name. A value wrapped in matching quotes
+// loses them: double quotes decode \-escapes the way skills.js does (\n, \t, \r, \",
+// \\, \0; any other escaped character keeps just the character), single quotes double
+// a quote to escape it ('' -> '). A comment after the closing quote is not part of the
+// value. Anything else is returned exactly as written.
+function unquote(value) {
+  let v = value;
+  if (v[0] === '"' || v[0] === "'") {
+    const q = v[0];
+    for (let j = 1; j < v.length; j++) {
+      if (q === '"' && v[j] === '\\') { j++; continue; }
+      if (v[j] === q) {
+        if (q === "'" && v[j + 1] === "'") { j++; continue; }
+        const rest = v.slice(j + 1).trim();
+        if (rest === '' || rest.startsWith('#')) v = v.slice(0, j + 1);
+        break;
+      }
+    }
+  }
+  if (/^"[\s\S]*"$/.test(v)) return v.slice(1, -1).replace(/\\(.)/g, (_, c) => ({n: '\n', t: '\t', r: '\r', '"': '"', '\\': '\\', '0': '\0'})[c] ?? c);
+  if (/^'[\s\S]*'$/.test(v)) return v.slice(1, -1).replace(/''/g, "'");
+  return v;
+}
+
+// Whether a value is ONE quoted scalar: its closing quote (found with unquote's
+// escape rules) is its last character. '"code.read", "code.grep"' closes early, so
+// it is a list of two scalars, not one — the tools handling in parse() needs the
+// difference, or unquoting it whole would leave the inner quotes in place.
+function isQuotedScalar(v) {
+  if (v[0] !== '"' && v[0] !== "'") return false;
+  const q = v[0];
+  for (let j = 1; j < v.length; j++) {
+    if (q === '"' && v[j] === '\\') { j++; continue; }
+    if (v[j] === q) {
+      if (q === "'" && v[j + 1] === "'") { j++; continue; }
+      return j === v.length - 1;
+    }
+  }
+  return false;
+}
+
 function parse(file) {
+  // No size cap (Wave 16): the whole file was read and parsed on every load() — every
+  // spawn and /agent list — however large it grew. skills.js caps SKILL.md at the same
+  // 256 KB; refuse a file over it instead of reading it whole (load() surfaces this
+  // error as its per-file diagnostic, which names the file again).
+  const size = fs.statSync(file).size;
+  if (size > MAX_FILE) throw new Error(t('ファイルが大きすぎるため読み取りを拒否しました: {file}（{size} バイト; 上限は 256KB / {max} バイトです）', {file, size, max: MAX_FILE}));
   // A BOM hid the frontmatter: "readonly: true" was lost and the whole file became the prompt.
   let text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(text);
-  if (!m && text.startsWith('---') && !text.split('\n').slice(1).some(line => line.trim() === '---'))
+  // Trailing spaces/tabs on a delimiter line still delimit (Wave 16), mirroring
+  // skills.js: a first line '--- ' used to match nothing here, so ALL frontmatter was
+  // lost and the whole file became the prompt. '----' / '---x' are still not
+  // delimiters, and an opening delimiter with no closing one still throws, as before.
+  const m = /^---[ \t]*\n([\s\S]*?)\n---[ \t]*\n?([\s\S]*)$/.exec(text);
+  if (!m && /^---[ \t]*(\n|$)/.test(text) && !text.split('\n').slice(1).some(line => line.trim() === '---'))
     throw new Error(t('frontmatter が閉じていません（終わりの --- がありません）'));
   const meta = {};
   if (m) for (const line of m[1].split('\n')) { const kv = /^(\w+)\s*:\s*(.*)$/.exec(line.trim()); if (kv) meta[kv[1].toLowerCase()] = kv[2].trim(); }
-  const name = String(meta.name || path.basename(file).replace(/\.md$/i, '')).toLowerCase().replace(/[^a-z0-9_-]/g, '');
-  const tools = meta.tools ? meta.tools.split(',').map(s => s.trim()).filter(Boolean) : null;
-  return {name, def: {description: meta.description || name, readOnly: /^(true|yes|1)$/i.test(meta.readonly || ''), tools, prompt: (m ? m[2] : text).trim(), file}};
+  // Fold accents to their base letter before the deletion below (Wave 17): deleting
+  // every non-[a-z0-9_-] character dropped the accented letters themselves, so 'café'
+  // and 'cafè' both became 'caf' and 'straße' became 'strae' (never 'strasse'). NFD
+  // splits a letter from its combining marks, the marks go, and ß maps to ss first.
+  const name = String(unquote(meta.name || path.basename(file).replace(/\.md$/i, ''))).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').replace(/[^a-z0-9_-]/g, '');
+  // Unquote before the list interpretation (Wave 16): the whole tools value may be
+  // one quoted scalar ('"code.read, code.grep"'), and each comma-separated entry may
+  // be quoted itself ('"code.read", "code.grep"') — the first shape is unquoted here
+  // (isQuotedScalar keeps the second from being unquoted whole), the second per entry.
+  let toolsRaw = meta.tools || '';
+  if (toolsRaw && isQuotedScalar(toolsRaw)) toolsRaw = unquote(toolsRaw);
+  const tools = toolsRaw ? toolsRaw.split(',').map(s => unquote(s.trim())).filter(Boolean) : null;
+  return {name, def: {description: meta.description ? unquote(meta.description) : name, readOnly: /^(true|yes|1)$/i.test(unquote(meta.readonly || '')), tools, prompt: (m ? m[2] : text).trim(), file}};
 }
 
 // Does the allowed pattern `a` cover the requested tool/pattern `x`? Exact match, or `a`
@@ -91,6 +157,11 @@ function load(cwd) {
         // lost it, while one asking for a broader pattern than allowed must still be dropped.
         def.tools = !def.tools ? allowed : allowed ? def.tools.filter(x => allowed.some(a => patternCovers(a, x))) : def.tools;
       }
+      // Replacing just the prompt must not widen the type: when an override of an existing
+      // type (builtin or user-defined, from either directory) says nothing about tools, it
+      // inherits the tools the type already had instead of falling back to null (= all tools).
+      // A brand-new type has no `before`, so it keeps the traditional default.
+      if (before && !def.tools) def.tools = before.tools;
       if (Object.prototype.hasOwnProperty.call(BUILTIN, name))
         warnOnce('shadow:' + file, t('muser: 組み込みエージェント {name} は {file} で上書きされます', {name, file}));
       // A project file replacing the USER's own type was silent, unlike the builtin

@@ -221,6 +221,25 @@ test('fix2 login #34: pollLogin treats parse/429/5xx session errors as error, no
   assert.ok(!logs.some(l => l.includes('確認中')), 'a plain 4xx stays the waiting stage');
 });
 
+test('master-debug #3: pollLogin stops at once when the caller aborts, not at the timeout', async () => {
+  const {pollLogin} = require('../src/login');
+  const ac = new AbortController();
+  const browser = {contexts: () => [{cookies: async () => []}], on: () => {}, isConnected: () => true};
+  const t0 = Date.now();
+  const p = pollLogin(browser, {timeoutMs: 60000, intervalMs: 2000, signal: ac.signal});
+  setTimeout(() => ac.abort(), 120);
+  await assert.rejects(p, e => e && e.reasonKind === 'cancelled');
+  assert.ok(Date.now() - t0 < 5000, 'the poll stopped promptly after the abort');
+});
+
+test('master-debug #17: pollLogin names its failure reasons (window-closed / poll-timeout)', async () => {
+  const {pollLogin} = require('../src/login');
+  const closed = {contexts: () => [], on: () => {}, isConnected: () => false};
+  await assert.rejects(pollLogin(closed, {timeoutMs: 1000, intervalMs: 40}), e => e && e.reasonKind === 'window-closed');
+  const waiting = {contexts: () => [{cookies: async () => []}], on: () => {}, isConnected: () => true};
+  await assert.rejects(pollLogin(waiting, {timeoutMs: 150, intervalMs: 40}), e => e && e.reasonKind === 'poll-timeout');
+});
+
 test('fix2 login #35: logout removes the Edge browser profile as well as the jars', t => {
   const {logout, PROFILE} = require('../src/login');
   const dir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'muser-fix2-logout-')), 'browser');

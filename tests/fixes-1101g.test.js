@@ -74,13 +74,17 @@ test('agent-reply: a busy session times out', async () => {
   await assert.rejects(w.promise, /タイムアウト/);
 });
 
-test('agent-reply: several assistant messages resolve to the latest only', async () => {
+test('agent-reply: with no live reply segment, several assistant messages resolve to the latest only', async () => {
+  // 2026-11-08 (reply-split): messages streamed in the turn's last segment
+  // now join (tests/reply-split.test.js). Without that segment (a poll-only
+  // recovery) earlier messages may be pre-tool narration, so the latest alone
+  // stays the reply, as before.
   const client = fakeClient({events: [ev('m1', 'first', {seq: 1}), ev('m2', 'second', {seq: 2})]});
   const w = waitForReply({client, ...opts});
   w.accept('');
   const r = await w.promise;
   assert.equal(r.text, 'second', 'not a concatenation of the turn');
-  assert.deepEqual(r.messageIds, ['m1', 'm2']);
+  assert.deepEqual(r.messageIds, ['m2']);
 });
 
 // --- Noise loopback: NoiseXX is initiator-only in the client, so the responder

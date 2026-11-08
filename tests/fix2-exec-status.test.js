@@ -81,13 +81,21 @@ test('f1-5: prune keeps a live run file whose read fails transiently', () => {
   } finally { cleanupNames(names); }
 });
 
-test('f1-5: prune keeps an unparseable file instead of assuming it is dead', () => {
+test('f1-5: prune counts an unparseable file and prunes it with the oldest excess', () => {
+  // Wave-9 spec change: the old rule left every unparseable file in place
+  // forever, so a corrupt file was exempt from the cap for good and the folder
+  // stayed permanently over KEEP. An unparseable file is now counted like any
+  // other, ordered by its name's stamp (mtime fallback), and goes with the
+  // oldest excess — unlike the transient-read case above, where a live run's
+  // file still survives because its content, once read, says it is running.
   const badName = '20260101-000000-' + process.pid + '.json';
   const names = seedPruneDir(badName, '{not json');
   try {
     es.prune();
-    assert.ok(fs.existsSync(path.join(es.dir(), badName)), 'a file prune cannot parse is left for a later prune');
+    assert.ok(!fs.existsSync(path.join(es.dir(), badName)), 'an unparseable file is pruned with the oldest excess, not kept forever');
     assert.ok(!fs.existsSync(path.join(es.dir(), '20260102-000000-1.json')), 'readable finished files still prune as before');
+    assert.ok(!fs.existsSync(path.join(es.dir(), '20260102-000001-1.json')), 'the excess is filled from the oldest readable files after the unparseable one');
+    assert.ok(fs.existsSync(path.join(es.dir(), '20260102-000002-1.json')), 'newer files within KEEP are kept');
   } finally { cleanupNames(names); }
 });
 

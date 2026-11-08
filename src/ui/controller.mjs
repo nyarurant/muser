@@ -5,8 +5,9 @@ import {createRequire} from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {createMd, tableRows} from './md.mjs';
+import {createMd, tableRows, tableWidths} from './md.mjs';
 import {sanitizeEmbeds, stripEmbeds, stripControls, partialEmbedTail} from './sanitize.mjs';
+import {memReportLines, writeHeapSnapshot} from './mem-report.mjs';
 const require = createRequire(import.meta.url);
 const {MODES, LABELS, alwaysKey, modeFrom} = require('../policy.js');
 const MODE_HELP = {
@@ -16,6 +17,7 @@ const MODE_HELP = {
   'bypass': '全部自動で実行（確認なし）',
 };
 const {TOOLS} = require('../tools.js');
+const {slimToolCall} = require('../slim-call.js');
 const sessions = require('../sessions.js');
 const mcpConfig = require('../mcp.js');
 const clip = require('../clipboard.js');
@@ -25,7 +27,21 @@ const transcript = require('../transcript.js');
 const permissions = require('../permissions.js');
 const skills = require('../skills.js');
 const update = require('../update.js');
-const {applyAgentLimits, switchValue, savedValue, setSwitch, envOverride, NUMBERS, numberValue, setNumber, defaultMode, setDefaultMode, QUOTA_FALLBACKS, quotaFallback, setQuotaFallback} = require('../settings.js');
+const configStore = require('../config.js');
+const {applyAgentLimits, switchValue, savedValue, setSwitch, envOverride, NUMBERS, numberValue, setNumber, defaultMode, setDefaultMode, QUOTA_FALLBACKS, quotaFallback, setQuotaFallback, FOCUS_LOG_LEVELS, focusLogLevel, setFocusLogLevel} = require('../settings.js');
+const {FocusLog, logFile} = require('../focus-log.js');
+// The 2026-11-07 feature cores (export, proof, lore, crash, parity, the
+// work log's reader) are required inside the command methods that use
+// them, not here: most windows never open those commands, and the
+// modules should not ride every boot (the same pattern /hunt uses).
+const {EXPECT_MODES, expectMode, setExpectMode} = require('../settings.js');
+// 想定外ストップの動き (/settings)。record が既定（2026-11-07 に利用者が選択）。
+const EXPECT_MODE_LABELS = {record: '記録だけ', stop: '記録して次の書き込みを1回止める', off: 'オフ'};
+const EXPECT_MODE_HELP = {record: '予想が外れたら作業ログに記録し、結果と画面に「想定外」と出すだけ。作業は止めない（既定）', stop: '記録に加えて、次の書き込みを1回だけ止めて立て直させる', off: 'expect を受け取っても判定も記録もしない'};
+
+// Focus の判定ログの記録のしかた (/settings)。
+const FOCUS_LOG_LEVEL_LABELS = {off: '記録しない', normal: '判定と理由だけ', verbose: 'ツールの内容も（上限付き）'};
+const FOCUS_LOG_LEVEL_HELP = {off: '判定ログを記録しません', normal: '判定とその理由だけを記録します（既定）', verbose: 'ツールの内容と結果の先頭も記録します（上限付き・秘密情報は記録しません）'};
 // The weekly-limit question's unanswered choice (/settings), and how long it waits for an answer.
 const QUOTA_FALLBACK_LABELS = {auto: '追加購入分がなければ引き継ぐ', extra: 'このまま続ける', handover: '引き継ぐ', ask: '待つ（自動では決めない）'};
 const QUOTA_FALLBACK_HELP = {auto: '追加購入分が残っていればこのまま続け、なければ一番軽いアカウントへ引き継ぐ', extra: '追加購入分を使って今のアカウントで続ける', handover: '追加購入分があっても、一番軽いアカウントへ引き継ぐ', ask: '答えるまで何もしない（追加購入分があれば作業はそのまま進む）'};
@@ -38,11 +54,18 @@ const i18n = require('../i18n.js');
 const {t} = i18n;
 
 export const COMMANDS = [
-  ['/focus', '完了条件と根拠を確認（自動で有効。/focus off・on で切替）'],
+  ['/focus', '完了条件と根拠を確認（自動で有効。/focus off・on で切替、/focus carry <会話の ID> で別会話のタスクを引き継ぎ）'],
   ['/settings', '設定（エージェント・Focus・ツール上限・承認モード・言語・ベル・更新確認・表示・スキル・MCP）'], ['/goal', '常設ゴールを設定（達成まで自動で続行。/goal で表示、/goal clear で解除）'],
-  ['/help', 'コマンドとキー操作（!コマンド・@ファイル も）'], ['/permissions', '承認モード（権限）を選ぶ（/permissions bypass で直接）'],
+  ['/help', 'コマンドとキー操作（!コマンド・@ファイル も）'], ['/permissions', '承認モード（権限）を選ぶ（/permissions bypass で直接。/mode・/perm でも可）'],
   ['/new', '新しい会話を始める'], ['/clear', '画面を消して新しい会話'], ['/resume', 'このフォルダーの過去の会話を再開'],
-  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルを管理する（一覧とオン・オフ。使うのは /skill）'], ['/skill', 'スキルを指定して頼む（/skill <名前> <頼みたいこと>。管理は /skills）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/account', 'アカウントの確認と切替・追加（/account <名前> で切替、なしで一覧、/account add で追加）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/update', 'muser を最新版に更新する（npm）'], ['/reload', '新しいコードで再起動（会話は引き継ぎ）'], ['/output', 'PC 操作の出力を全文で見る（画面では一部だけ）'], ['/exit', '終了'],
+  ['/agent', '並列エージェントに任せる（/agent [explore|plan|review|test] <タスク>）'], ['/agents', '並列エージェントの一覧・結果・停止'], ['/bg', 'バックグラウンドの処理（/bg で一覧・出力、/bg kill bg1 で停止）'], ['/mcp', 'MCP サーバーのオン・オフと取り込み'], ['/image', '画像を添付（パスなしでクリップボードから）'], ['/todos', 'Muse の Todo'], ['/status', '接続とセッションの状態'], ['/init', 'AGENTS.md を Muse に書いてもらう'], ['/skills', 'スキルを管理する（一覧とオン・オフ。使うのは /skill）'], ['/skill', 'スキルを指定して頼む（/skill <名前> <頼みたいこと>。管理は /skills）'], ['/usage', 'Muse の利用状況（週の使用量）と muser の記録'], ['/export', '不具合の調べに使うレポートを開発者に送る（中身を見せてから）'], ['/login', 'muse.ai にログインし直す（Edge の窓が開きます）'], ['/account', 'アカウントの確認と切替・追加（/account <名前> で切替、なしで一覧、/account add で追加）'], ['/lang', '表示言語を切り替える（English / 日本語）'], ['/update', 'muser を最新版に更新する（npm）'], ['/reload', '新しいコードで再起動（会話は引き継ぎ）'], ['/output', 'PC 操作の出力を全文で見る（画面では一部だけ）'], ['/exit', '終了（/quit でも可）'], ['/debug', '判定ログを表示（/debug log、最新20件。/debug mem・/debug heap も）'], ['/worklog', 'この会話の作業ログを表示（最新20件）'],
+  ['/proof', '裏取り（直前の返事を作業ログと突き合わせ。反証テストつき。/proof <ターン>・--yes）'],
+  ['/lore', 'コードの言い伝えを見る（why・傷跡・墓標・仮説付箋）'], ['/why', 'その行がなぜ変わったか（/why <ファイル>:<行>）'],
+  ['/hunt', 'バグ狩り（/hunt [範囲] で監査、/hunt fix High で修正、/hunt status で進み具合）'],
+  ['/race', '競争（同じ頼みを N 体に違う方針でやらせて比べる。/race <頼み>）'],
+  ['/overnight', '夜間作業（/overnight add <頼み> で積む。list・start・report）'],
+  ['/crash', 'クラッシュ調査（直近の落下と直前の変更を突き合わせて Muse に調べさせる）'],
+  ['/parity', '環境比較（この PC の指紋を表示。/parity diff <A> <B> で 2 つの指紋を比べる）'],
 ];
 
 let nextId = 1;
@@ -52,19 +75,137 @@ const ATTACH_TOTAL = 11 * 1024 * 1024; // images per message, before base64 (the
 const bell = () => { let on = true; try { on = switchValue('bell'); } catch {} if (on) process.stdout.write('\x07'); };
 const MAX_QUEUE = 5, MAX_HISTORY = 200, BANG_NOTE = 20000; // characters of a !command's output sent to Muse
 const HISTORY_FILE = process.env.MUSER_HISTORY_FILE || path.join(os.homedir(), '.muser', 'history.json'); // tests point it elsewhere
+const HISTORY_FILE_GIVEN = !!process.env.MUSER_HISTORY_FILE; // an explicitly redirected file is not the user's real history
+// Memory reduction (docs/design/memory.md): history tool rows are slimmed on the way in
+// (stage 1, src/slim-call.js), and the kept full outputs carry two separate caps on top
+// of the 30-item one (stage 2). The memory cap (outputsMaxChars) governs only the text
+// held in memory: overflow spills, oldest first, to this process's own folder under
+// %LOCALAPPDATA%\muser\outputs\<pid> and is read back in full when /output asks for it —
+// entries are never dropped to satisfy it. The disk cap bounds the spill folder itself:
+// total spilled bytes stay within 4x the memory cap; past that the oldest spilled
+// entries lose their files and remain as no-text entries (see spillOutputs).
+const OUTPUTS_MAX_ITEMS = 30, OUTPUTS_MAX_CHARS = 4 * 1024 * 1024;
+// Wave 18 (B): a finished agent's entry used to keep snap.result / snap.error
+// in full, forever — scrollback entries are never trimmed, so 25 results of
+// 1 MB held ~24 MB in entries long after the outputs caps had spilled or
+// dropped the same text on the /output side. An agent entry now keeps only a
+// preview: at most the 200 lines any draw shows (the e.full view) within a
+// char budget. The full text lives in the outputs list — agent-done keeps it
+// there via keepOutput and the stored snap points at it via snap.outputId —
+// and /output reads it back in full. Untruncated snaps pass through by
+// reference, like other entries.
+const AGENT_PREVIEW_LINES = 200, AGENT_PREVIEW_CHARS = 64 * 1024;
+function previewText(text) {
+  const lines = text.split('\n');
+  if (lines.length <= AGENT_PREVIEW_LINES && text.length <= AGENT_PREVIEW_CHARS) return text;
+  const kept = []; let chars = 0;
+  for (const line of lines) {
+    if (kept.length >= AGENT_PREVIEW_LINES || chars + line.length + 1 > AGENT_PREVIEW_CHARS) break;
+    kept.push(line); chars += line.length + 1;
+  }
+  if (!kept.length) kept.push(lines[0].slice(0, AGENT_PREVIEW_CHARS)); // a single line over the whole budget: hard-cut it
+  return kept.join('\n');
+}
+function slimAgentSnap(snap) {
+  if (!snap) return snap;
+  let out = null;
+  for (const field of ['result', 'error']) {
+    if (typeof snap[field] !== 'string') continue;
+    const p = previewText(snap[field]);
+    if (p === snap[field]) continue;
+    out = out || {...snap};
+    out[field] = p; out[field + 'Omitted'] = snap[field].split('\n').length - p.split('\n').length;
+  }
+  return out || snap;
+}
+const slimEntry = e => {
+  if (!e) return e;
+  if (e.type === 'tool' && e.call) return {...e, call: slimToolCall(e.call)};
+  if (e.type === 'agent' && e.snap) { const snap = slimAgentSnap(e.snap); return snap === e.snap ? e : {...e, snap}; }
+  return e;
+};
+function defaultOutputsDir() { return path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser', 'outputs', String(process.pid)); }
+// Folders whose owning process is gone are removed by the next window that starts (the
+// window-status rule). A folder whose pid was reused by a live process survives until
+// that pid ends; it holds only tool output, and the owning window removes its own folder
+// at exit, so leftovers stay bounded and harmless.
+export function cleanupStaleOutputDirs(baseDir) {
+  let names; try { names = fs.readdirSync(baseDir); } catch { return; }
+  for (const name of names) {
+    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+    let alive = false; try { process.kill(Number(name), 0); alive = true; } catch (e) { alive = !!(e && e.code === 'EPERM'); }
+    if (!alive) { try { fs.rmSync(path.join(baseDir, name), {recursive: true, force: true}); } catch {} }
+  }
+}
+// /output and ctrl+o copy the full text to %TEMP%\muser-output\<time>-<command>.txt
+// on EVERY view (showOutput below): a convenience copy the user can open in an
+// editor. Unlike the spill folder above it had no deletion path at all, so the
+// copies piled up in the temp folder forever — and command output can hold
+// secrets (audit-cli wave 5-A). They are swept when a Controller starts: a copy
+// is kept only while it is BOTH fresh (modified within the last 24 h) and among
+// the newest 50; anything older or beyond that count is deleted. The 24 h window
+// leaves a file a note just pointed at openable for the rest of the day and the
+// next morning; the count caps a single busy day. The spill files under
+// %LOCALAPPDATA%\muser\outputs are a different store (stage 2 above) and are
+// NOT touched here. Only *.txt files directly inside the folder are swept —
+// every copy made here (and by the remote controller, which shares the folder)
+// is one — other files and subfolders are left alone. Best-effort: a missing
+// folder, a locked file or a racing window never fails startup.
+export const TEMP_OUTPUT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+export const TEMP_OUTPUT_MAX_FILES = 50;
+export function cleanupStaleTempOutputs(dir = path.join(os.tmpdir(), 'muser-output'), now = Date.now()) {
+  let names; try { names = fs.readdirSync(dir); } catch { return 0; }
+  const files = [];
+  for (const name of names) {
+    if (!name.endsWith('.txt')) continue;
+    const file = path.join(dir, name);
+    try { const st = fs.statSync(file); if (st.isFile()) files.push({file, mtimeMs: st.mtimeMs}); } catch {}
+  }
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let removed = 0;
+  files.forEach(({file, mtimeMs}, i) => {
+    if (now - mtimeMs <= TEMP_OUTPUT_MAX_AGE_MS && i < TEMP_OUTPUT_MAX_FILES) return;
+    try { fs.unlinkSync(file); removed++; } catch {}
+  });
+  return removed;
+}
+let outputsExitHook = false;
+function hookOutputsExit(dir) { if (outputsExitHook) return; outputsExitHook = true; process.on('exit', () => { try { fs.rmSync(dir, {recursive: true, force: true}); } catch {} }); }
 // The most text the composer (or the picker's editor) will hold (deep c1 #11):
 // the queue and the attachments are capped, but the draft was not — a multi-
 // megabyte paste went in whole and every keystroke then re-rendered it. Past
 // the cap, typing and pasting simply stop growing the text (paste says so).
 const MAX_INPUT = 1000000;
 function loadHistory() { return readHistoryDisk() || []; }
-// The history on disk, or null when the file is there but could not be read or
-// parsed: a read failure is not an empty history, and saving over it would
-// replace everything with the newest entry alone (fifth audit f1-3, the
-// read-side twin of the lost update below).
+// Move a corrupt history file aside, in the sessions.json style
+// (src/sessions.js backupCorruptFile): the original bytes survive as
+// history.json.corrupt-<time> and the caller starts from an empty history,
+// so new entries are recorded again from that moment on.
+function backupCorruptHistory() {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  try { fs.renameSync(HISTORY_FILE, HISTORY_FILE + '.corrupt-' + stamp); return true; } catch { return false; }
+}
+// The history on disk, or null when the file is there but could not be READ
+// (a lock, a permission problem): a read failure is not an empty history,
+// and saving over it would replace everything with the newest entry alone
+// (fifth audit f1-3, the read-side twin of the lost update below). A file
+// that reads fine but is corrupt — unparseable, or valid JSON that is not
+// an array — is a different case (wave 13): the old code returned null for
+// a parse failure, so saveHistory refused every save and the input history
+// was never recorded again, and a wrong-shaped file was silently replaced
+// with no copy kept. Now it is moved aside (backupCorruptHistory) and the
+// read answers empty, exactly as sessions.json treats a corrupt index —
+// the bytes survive in the .corrupt-* file and recording resumes at once.
+// (If the move itself fails, the read still answers empty: the save's own
+// temp+rename then replaces the bad file instead of staying stuck.)
 function readHistoryDisk() {
-  try { const h = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); return Array.isArray(h) ? h.filter(x => typeof x === 'string').slice(-MAX_HISTORY) : []; }
+  let raw;
+  try { raw = fs.readFileSync(HISTORY_FILE, 'utf8'); }
   catch (e) { return e && e.code === 'ENOENT' ? [] : null; }
+  let h;
+  try { h = JSON.parse(raw); } catch { backupCorruptHistory(); return []; }
+  if (Array.isArray(h)) return h.filter(x => typeof x === 'string').slice(-MAX_HISTORY);
+  backupCorruptHistory(); return [];
 }
 // A short cross-window lock for the read-modify-write below (deep c1 #13):
 // two windows saving at the same moment each merged from the same stale copy,
@@ -93,14 +234,19 @@ function acquireHistoryLock() {
 // last window to send a message erased what was typed in the others.
 function saveHistory(history) {
   const release = acquireHistoryLock();
+  let temp = null;
   try {
     const text = history[history.length - 1], disk = readHistoryDisk();
     if (disk === null) return; // unreadable right now: never overwrite it with just the newest entry
     if (typeof text === 'string' && disk[disk.length - 1] !== text) disk.push(text);
     fs.mkdirSync(path.dirname(HISTORY_FILE), {recursive: true});
-    const temp = HISTORY_FILE + '.tmp-' + process.pid;
-    fs.writeFileSync(temp, JSON.stringify(disk.slice(-MAX_HISTORY))); fs.renameSync(temp, HISTORY_FILE);
-  } catch {}
+    temp = HISTORY_FILE + '.tmp-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    // renameRetry, not a plain rename: a momentarily locked history.json (another window or a
+    // reader holding it open) made the rename throw EPERM and the entry was silently lost, with
+    // the temp file left behind. The swallow stays — history must not crash a turn — but only
+    // after the retries are exhausted, and the temp is removed when the write ultimately fails.
+    fs.writeFileSync(temp, JSON.stringify(disk.slice(-MAX_HISTORY))); configStore.renameRetry(temp, HISTORY_FILE); temp = null;
+  } catch { if (temp) { try { fs.unlinkSync(temp); } catch {} } }
   finally { try { release?.(); } catch {} }
 }
 
@@ -117,8 +263,17 @@ function clusterCount(s) { if (!graphemeSegmenter) return [...s].length; let n =
 function offsetAtClusterCol(s, col) { if (!graphemeSegmenter) return [...s].slice(0, col).join('').length; let n = 0, off = 0; for (const g of graphemeSegmenter.segment(s)) { if (n >= col) break; off += g.segment.length; n++; } return off; }
 
 export class Controller {
-  constructor({agent, museName, version, onExit, onReload}) {
+  constructor({agent, museName, version, onExit, onReload, outputsDir, outputsMaxChars}) {
     this.heldSteps = []; this.outputs = [];
+    this.outputsDir = outputsDir || defaultOutputsDir(); this.outputsMaxChars = outputsMaxChars || OUTPUTS_MAX_CHARS; this.outputSeq = 0;
+    // Spill names carry a per-Controller tag: the default outputs dir is per-pid, so every
+    // conversation in one resident Server shares it, and two Controllers spilling in the
+    // same millisecond with the same per-instance seq used to write the SAME file — one
+    // conversation's /output then served the other's text (master-debug #10).
+    this.outputTag = Math.random().toString(36).slice(2, 8);
+    cleanupStaleOutputDirs(path.dirname(this.outputsDir));
+    cleanupStaleTempOutputs(); // wave 5-A: sweep stale /output copies in %TEMP%\muser-output (see above)
+    if (!outputsDir) hookOutputsExit(this.outputsDir);
     this.agent = agent; this.museName = museName; this.version = version; this.onExit = onExit; this.onReload = onReload;
     this.listeners = new Set();
     this.s = {
@@ -129,7 +284,7 @@ export class Controller {
       text: '', pos: 0, mode: agent.mode, clearCount: 0, attachments: [], agents: [], shells: [], queue: [],
     };
     // exitArmed is per-key (recovery scan): ctrl+c arming must not make one ctrl+d an exit.
-    this.history = loadHistory(); this.hIndex = -1; this.draft = ''; this.exitArmed = {key: null, at: 0}; this.queue = []; this.tabState = null; this.md = null; this.atPick = {key: null, idx: 0}; this.slashPick = {key: null, idx: 0}; this.dollarPick = {key: null, idx: 0}; this.dollarDismissed = null; this._skillCache = null;
+    this.history = loadHistory(); this.hIndex = -1; this.draft = ''; this.histEdits = {}; this.exitArmed = {key: null, at: 0}; this.queue = []; this.tabState = null; this.md = null; this.atPick = {key: null, idx: 0}; this.slashPick = {key: null, idx: 0}; this.dollarPick = {key: null, idx: 0}; this.dollarDismissed = null; this._skillCache = null;
     this.accountSwitchReservation = null; this.quotaWarnedFor = new Map(); this.quotaKeep = new Map(); this.quotaWaitMs = QUOTA_WAIT_MS; this.quotaTimer = null; this.lastTurnEnd = null; this.questionShownFor = '';
     this.wire();
     // Started from the home folder or a drive root, every search without a path walks all of it.
@@ -146,7 +301,24 @@ export class Controller {
   trace(what) { (this.trail ||= []).push([Date.now(), what]); if (this.trail.length > 400) this.trail.splice(0, 100); }
   // Never trim this list: Ink's <Static> remembers how many items it has printed (items.length)
   // and prints only items.slice(that), so a capped list stops growing and nothing new appears.
-  push(...entries) { this.set({entries: [...this.s.entries, ...entries.map(e => ({id: nextId++, ...e}))]}); }
+  // Wave 18 (A) — why push still copies the whole array (O(N) per push, O(N²)
+  // over a long conversation) instead of pushing in place: two consumers key
+  // on the entries array's IDENTITY, so a mutated-in-place array silently
+  // stops updating them.
+  //  - Ink's <Static> (view.mjs) memoises items.slice(index) on [items,
+  //    index] and advances index in an effect keyed on [items.length]: with
+  //    the same reference the memo never recomputes for the new tail, and
+  //    the advanced index then skips that tail for good — the entry never
+  //    reaches the classic scrollback.
+  //  - gui-server's onControllerChange streams appends only when the array
+  //    reference changes (client.lastEntries !== entries): same reference,
+  //    and remote / GUI clients are never sent the new entries.
+  // The fullscreen renderer (fs/history.mjs) is length-based and would be
+  // safe, but every view shares this one array, and both consumers above
+  // live outside this file — in-place push waits on them learning a change
+  // signal (a state version counter would do). Until then the copy IS the
+  // change notification, so (A) is deliberately NOT fixed here.
+  push(...entries) { this.set({entries: [...this.s.entries, ...entries.map(e => ({id: nextId++, ...slimEntry(e)}))]}); }
   flash(msg, ms = 2500) { this.set({flash: msg}); clearTimeout(this.flashTimer); this.flashTimer = setTimeout(() => this.set({flash: ''}), ms); }
 
   // ---- agent events ----
@@ -154,6 +326,13 @@ export class Controller {
     const a = this.agent;
     a.approver = call => this.ask(call);
     a.on('device', d => this.set({deviceOk: !!d.connected}));
+    // Wave 13: another window's mode change, picked up by the agent's next
+    // judgment (refreshPermissions), reaches the footer too.
+    a.on('permissions', ({mode}) => { if (mode && mode !== this.s.mode) this.set({mode}); });
+    // Every node slot held: this window waits for one of its own instead of sharing the saved
+    // id, and says so (the same words `muser exec` prints to its log).
+    a.on('node-wait', ({max}) => this.flash(t('この PC の muser の端末枠（{max} 個）がすべて使用中です。空くのを待っています…', {max}), 60000));
+    a.on('node-wait-done', ({slot}) => this.flash(t('端末枠 {slot} が空いたので使います。', {slot}), 10000));
     a.on('connection', c => {
       if (c.state === 'connecting') this.flash(t('Muse に接続しています…'), 60000);
       else if (c.state === 'reconnecting') this.flash(t('Muse に再接続しています…'), 60000);
@@ -212,7 +391,13 @@ export class Controller {
       const renderDiff = diff => (diff || []).map(d => d.t === '…' ? '⋮' : (d.t === '+' ? '+ ' : d.t === '-' ? '- ' : '  ') + (d.l || '')).join('\n');
       const diffParts = Array.isArray(dv.files) ? dv.files.map(f => (f.path || '') + '\n' + renderDiff(f.diff)) : Array.isArray(dv.diff) ? [renderDiff(dv.diff)] : [];
       if (diffParts.length && diffParts.join('').trim()) full = (full ? full + '\n' : '') + diffParts.join('\n');
-      this.push({type: 'tool', call: {...call, outputLines: this.keepOutput(call, full)}});
+      // The view's tail is the tool's own cut of its raw output (src/tools.js) and the
+      // finished row draws it as-is: sanitise it line by line, exactly as the streaming
+      // display above does, or an escape in the output (OSC 52, a screen-clearing CSI)
+      // reaches the terminal when the row is written to scrollback.
+      const done = {...call, outputLines: this.keepOutput(call, full)};
+      if (Array.isArray(dv.tail)) done.view = {...dv, tail: dv.tail.map(l => stripEmbeds(frames(String(l ?? ''))))};
+      this.push({type: 'tool', call: done});
     });
     // Near the weekly limit (90%+), the plan is read again after every tool call of any agent,
     // so the limit is met mid-task instead of only at the turn's end (see watchQuota).
@@ -231,17 +416,34 @@ export class Controller {
       upsert(snap);
       // Results over the card's 200-line full view were unreachable: keep the whole result for /output too.
       const body = String(snap.state === 'done' ? snap.result || '' : snap.error || '');
-      if (body.trim()) this.keepOutput({id: 'agent-' + snap.tag + '-' + (snap.ended || Date.now()), command: 'agent.spawn', summary: snap.tag + ' ' + (snap.title || '')}, body);
-      this.push({type: 'agent', snap}); bell();
+      // Wave 18 (B): the entry itself stores only slimEntry's preview of the
+      // snap; the full text is the outputs entry named by snap.outputId.
+      let entrySnap = snap;
+      if (body.trim()) {
+        const outputId = 'agent-' + snap.tag + '-' + (snap.ended || Date.now());
+        this.keepOutput({id: outputId, command: 'agent.spawn', summary: snap.tag + ' ' + (snap.title || '')}, body);
+        entrySnap = {...snap, outputId};
+      }
+      this.push({type: 'agent', snap: entrySnap}); bell();
     });
     // #167: sawText is per-turn state. Resetting it only in submit() left auto-continued
     // legs and turns driven from other surfaces judged by the PREVIOUS turn's flag, so a
     // reply that never streamed was never shown by the turn-end safety net either.
-    a.on('turn-start', () => { this.sawText = false; this.resumeEpoch = (this.resumeEpoch || 0) + 1; this.planAtTurn = this.s.plan?.percentUsed ?? null; });
+    a.on('turn-start', () => { this.sawText = false; this.resumeEpoch = (this.resumeEpoch || 0) + 1; this.planAtTurn = this.s.plan?.percentUsed ?? null; this.doneStreams?.clear(); });
     // An account switch (automatic failover or /account): the plan on screen belonged to the
     // old account, and the new account's Muse may carry another name.
     a.on('account', ev => {
       usage.resetWeb?.();
+      // Wave11 (1): shell-completion notes still pending belong to the OLD session.
+      // They must not be sent to the new account's Muse as an automatic turn (nor
+      // ride the next user message via submit's extra): show them on screen as a
+      // plain note only, and clear shellNotes/shellPending for the new session.
+      const pendingShell = this.shellNotes || [];
+      if (pendingShell.length) {
+        const cmds = pendingShell.map(n => { const id = (/<task-id>([^<]*)<\/task-id>/.exec(n) || [])[1] || ''; const st = (/<status>([^<]*)<\/status>/.exec(n) || [])[1] || ''; return (id + ' ' + st).trim(); }).filter(Boolean);
+        this.note(t('前の会話のバックグラウンド処理の完了通知は、新しい会話には送りませんでした') + (cmds.length ? ': ' + cmds.join(', ') : ''));
+      }
+      this.shellNotes = []; this.shellPending = false;
       // Any switch satisfies a pending reservation, whichever account it landed on.
       this.accountSwitchReservation = null;
       // #159: a quota question (and its unattended fallback timer) belongs to the account
@@ -249,13 +451,27 @@ export class Controller {
       // OLD account on the new account's screen.
       clearTimeout(this.quotaTimer); this.quotaTimer = null;
       if (this.s.menu?.quotaChoice) this.set({menu: null});
-      this.set({account: {id: ev.id, label: ev.label}, plan: null, accountReserved: null});
+      // W2F-1: the same goes for every other pending answer of the OLD
+      // account — an approval (shown, in its decline-reason stage, or
+      // queued), a selectable question, a numeric limit input and a
+      // composer prompt. Left open across the switch, the old approval
+      // could still be allowed on the new account's screen. Expire them
+      // on the deny / cancel side, like a timeout does.
+      for (const req of [this.s.approval, this.s.reasonFor, ...(this.pending || [])]) if (req && !req.done) { try { req.resolve({allow: false, expired: true}); } catch {} }
+      this.pending = [];
+      if (this.s.reasonFor) this.restoreDraft();
+      if (this.s.promptFor) this.cancelPrompt();
+      if (this.s.approval || this.s.reasonFor || this.s.question || this.s.limitInput) this.set({approval: null, reasonFor: null, question: null, limitInput: null});
+      // Wave 16 (4): attachments composed for the old account's chat are
+      // cleared too — left in place, the next send silently carried them
+      // into the new account's chat.
+      this.set({account: {id: ev.id, label: ev.label}, plan: null, accountReserved: null, attachments: []});
       // A switch the agent started itself (failover) has no handoff yet: build it from
       // the session it just left, so the new account's Muse still gets the context.
       if (!a.pendingHandoff && ev.fromSession) {
         // The session as saved (its title too: the note named no session after a failover).
         let from = null; try { from = sessions.find(ev.fromSession); } catch {}
-        try { a.pendingHandoff = this.buildAccountHandoff({label: ev.label}, from || {id: ev.fromSession, title: ''}, require('../accounts.js').get(ev.from)?.label || ev.from || '') || undefined; } catch {}
+        try { a.pendingHandoff = this.buildAccountHandoff({label: ev.label}, from || {id: ev.fromSession, title: ''}, require('../accounts.js').get(ev.from)?.label || ev.from || '', {agents: ev.orphans || a.lastSwitchOrphans || []}) || undefined; } catch {}
       }
       this.note(t('アカウントを {label} に切り替えました。Muse 側の会話は新しいチャットから始まります。', {label: ev.label}));
       this.refreshPlan();
@@ -266,19 +482,49 @@ export class Controller {
       // goes on screen while that account is still the current one — a slow
       // answer for the account just left used to rename the one just arrived.
       Promise.resolve(a.client?.request?.('GET', '/identity')).then(r => { const n = typeof r?.name === 'string' && r.name.trim() ? r.name.trim().slice(0, 40) : null; if (n) { try { require('../accounts.js').rememberMuseName(ev.id, n); } catch {} } if (n && a.accountId === ev.id && n !== this.museName) { this.museName = n; this.set({}); } }).catch(() => {});
+      // Wave 16 (3): the expirations above are what blocked the held queue
+      // (deep c1 #9), but nothing ever drained it after a failover — held
+      // messages sat until some later turn happened to end. Drain now,
+      // the way closeQuestion resumes held work. The agent emits 'account'
+      // before its own _switching clears (and a controller-side switch
+      // clears accountSwitching only after that promise settles), so a
+      // message drained here may be re-held by submit's switch guard;
+      // retry once on the next tick, when both flags are down.
+      if (!this.drainQueueOnce() && this.bangPending) this.sendBangNotes();
+      if (this.queue.length && (this.accountSwitching || a._switching)) setTimeout(() => { if (!this.drainQueueOnce() && this.bangPending) this.sendBangNotes(); }, 0);
     });
     // A background shell that ends starts the work again on its own (see onShellFinished).
     a.shells?.on?.('finished', s => this.onShellFinished(s));
     // A message sent mid-turn reached Muse inside a tool result: it leaves the queue, so the
     // turn's end does not send it a second time.
     a.on('steer', ({texts} = {}) => {
-      for (const tx of texts || []) { const i = this.queue.indexOf(tx); if (i >= 0) this.queue.splice(i, 1); }
+      // The queue holds what the user typed (see submit: a $skill text is
+      // queued in its typed form), while the agent's steer texts are the
+      // expanded sendText — match a delivered text against the expansion
+      // of each queued entry as well as against the entry itself.
+      for (const tx of texts || []) { let i = this.queue.indexOf(tx); if (i < 0) i = this.queue.findIndex(q => this.sendTextFor(q) === tx); if (i >= 0) this.queue.splice(i, 1); }
       // Delivered: Muse has it and answers it inside the work, so Focus goes on. Only messages
       // still waiting in the queue stop the task after this round (2026-11-03: a clarification
       // Muse had already answered ended the turn as "a new user message is queued").
       this.agent.focusInputPending = this.queue.length > 0;
       this.set({queue: [...this.queue]});
       this.note(t('作業中の Muse に伝えました'));
+    });
+    // tell: one line per delivery batch, whichever surface renders this controller
+    // (fullscreen, classic, and the GUI through the server snapshot of its entries).
+    a.on('tell', ({messages, working} = {}) => {
+      const m = (messages || [])[0]; if (!m) return;
+      // Peer-controlled strings: strip terminal escapes like any other
+      // outside text (sanitize.mjs), and cut by code points so an emoji at
+      // the boundary is not split into a lone surrogate.
+      const who = stripControls(m.from?.name || m.from?.title || String(m.from?.sessionId || '').slice(0, 8) || '?');
+      const text = [...stripControls(String(m.text || '')).replace(/\s+/g, ' ')].slice(0, 80).join('');
+      this.note(t('別の muser（{name}）から指示が届きました: {text}', {name: who, text}) + (messages.length > 1 ? t(' ほか {n} 件', {n: messages.length - 1}) : '') + (working ? '' : t('（空のまま Enter で進めます）')));
+    });
+    // tell: the claim guard stopped a write once. Muse is told in the tool result; the user
+    // sees it here too (with bypass there is no approval screen to show the claimant).
+    a.on('tell-claim', ({name, file} = {}) => {
+      this.note(t('{name} が担当中のファイルなので、書き込みを 1 回止めました: {file}', {name: stripControls(String(name || '?')), file: stripControls(String(file || ''))}));
     });
     a.on('turn-end', e => {
       this.lastTurnEnd = e; // an automatic handover resumes a turn that failed (askQuotaChoice)
@@ -287,7 +533,8 @@ export class Controller {
       // Safety net: if no text streamed this turn, show the final reply that the turn ended with.
       if (e.ok && !this.sawText && e.text?.trim()) {
         const md = createMd();
-        this.push({type: 'md', rows: md.rows(sanitizeEmbeds(e.text.trimEnd()).split('\n')), first: true}, {type: 'gap'});
+        const src = sanitizeEmbeds(e.text.trimEnd());
+        this.push({type: 'md', rows: md.rows(src.split('\n')), src, first: true}, {type: 'gap'});
       }
       this.set({busy: false});
       if (e.sources?.length) this.push({type: 'sources', items: e.sources});
@@ -300,16 +547,27 @@ export class Controller {
       // reopening a picker the user already closed — closing it loses nothing, the
       // question stays in the Focus state and a typed reply still resumes the task.
       if (e.focus?.status === 'needs_input' && e.focus.ask && !this.s.question) {
-        const askKey = e.focus.id + ':' + e.focus.round + ':' + e.focus.revision;
+        // Focus fix: the ask content is part of the key — resumeLeg restarts
+        // rounds at 1 and ask/plan/checkpoint do not bump revision, so the
+        // bare id:round:revision key repeats when the same question is
+        // re-asked early in a resumed leg and the dedupe swallowed the new
+        // ask. The exact same ask re-delivered in the same state still
+        // serialises identically and dedupes as before.
+        const askKey = e.focus.id + ':' + e.focus.round + ':' + e.focus.revision + ':' + JSON.stringify(e.focus.ask ?? null);
         if (this.questionShownFor !== askKey) { this.questionShownFor = askKey; this.openQuestion(e.focus.ask); }
       }
       // Local tally heads-up: today's turns reached the daily limit (if one is set).
-      try { const lim = usage.limits(); if (e.ok && lim.dailyTurns > 0 && !this.usageWarned && usage.summary().today.turns >= lim.dailyTurns) { this.usageWarned = true; this.note(t('今日のターン上限（{n}）に達しました', {n: lim.dailyTurns})); } } catch {}
+      // W2F-5: the warned key is the day AND the limit, not a lifetime flag —
+      // a new day, or a changed limit, re-arms the warning.
+      try { const lim = usage.limits(); const warnKey = new Date().toDateString() + ':' + lim.dailyTurns; if (e.ok && lim.dailyTurns > 0 && this.usageWarned !== warnKey && usage.summary().today.turns >= lim.dailyTurns) { this.usageWarned = warnKey; this.note(t('今日のターン上限（{n}）に達しました', {n: lim.dailyTurns})); } } catch {}
       // The real weekly usage, refreshed after every turn; say how much this turn moved it.
       const before = this.planAtTurn;
       const accountAtEnd = this.agent.accountId;
       this.refreshPlan().then(p => {
-        if (p && before !== null && before !== undefined && p.percentUsed > before) this.note(t('Muse の週の使用量 {before}% → {after}%（この作業で +{diff}%）', {before, after: p.percentUsed, diff: p.percentUsed - before}));
+        // The diff is rounded to one decimal (the most the plan's own percent carries,
+        // usage.js formatPercent): the raw subtraction printed float artifacts such as
+        // +0.20000000000000107% for a 41.9 → 42.1 move.
+        if (p && before !== null && before !== undefined && p.percentUsed > before) this.note(t('Muse の週の使用量 {before}% → {after}%（この作業で +{diff}%）', {before, after: p.percentUsed, diff: Math.round((p.percentUsed - before) * 10) / 10}));
         if (p) this.maybeWarnAccountQuota(p, accountAtEnd);
         // A switch the user reserved for this turn boundary runs first (below); quota
         // failover does not override the user's own pick. And if a switch already
@@ -344,7 +602,7 @@ export class Controller {
           this.set({queue: []});
           this.setText(cur ? back + '\n' + cur : back);
           this.flash(t('待っていた {n} 件を入力欄に戻しました', {n}), 5000);
-        } else if (this.queue.length && !this.s.question) { const next = this.queue.shift(); this.agent.dropSteer?.(next); this.agent.focusInputPending = this.queue.length > 0; this.set({queue: [...this.queue]}); this.submit(next); }
+        } else if (this.queue.length && !this.s.question) { const next = this.queue.shift(); this.agent.dropSteer?.(this.sendTextFor(next)); this.agent.focusInputPending = this.queue.length > 0; this.set({queue: [...this.queue]}); this.submit(next); }
         // A !command that finished during the turn: its output now (after esc it waits for the next message).
         else if (this.bangPending && !e.aborted) this.sendBangNotes();
         // A background shell that finished during the turn: the work resumes now, the same way.
@@ -368,7 +626,16 @@ export class Controller {
     this.sawText = true;
     let st = this.s.stream;
     if (st && st.id !== id) { this.endMessage(st.id); st = null; }
-    if (!st) { this.md = createMd(); st = {id, done: 0, partial: '', started: false, emitted: '', raw: '', clean: ''}; }
+    if (!st) {
+      this.md = createMd();
+      // A message that already ended this turn can still get a late update
+      // (2026-11-08: the first half's final text arrived after the second
+      // half had started, and a fresh stream re-printed the whole first
+      // half). Resume from what was already shown: only the new suffix is
+      // emitted, and an unchanged text emits nothing.
+      const prev = this.doneStreams?.get(id);
+      st = prev ? {id, done: prev.clean.length, partial: '', started: true, emitted: prev.clean, raw: prev.raw, clean: prev.clean, resumed: true} : {id, done: 0, partial: '', started: false, emitted: '', raw: '', clean: ''};
+    }
     // An embed token may be split across deltas: hold back a trailing unfinished `[[...`
     // fragment until it resolves; past the legal token size it is treated as literal text
     // (the hold-back limit lives in sanitize.mjs, audit #181).
@@ -396,15 +663,19 @@ export class Controller {
       st = {id, done: 0, partial: '', started: false, emitted: '', raw: '', clean: ''};
     }
     const rest = clean.slice(st.done), nl = rest.lastIndexOf('\n');
-    let started = st.started, done = st.done;
+    let started = st.started, done = st.done, srcHeld = st.srcHeld || '';
     if (nl >= 0) {
       // Table lines are held by the renderer until the table ends (shown meanwhile in the live
       // area, via stream.table), so a chunk can complete lines and still print nothing yet.
-      const rows = this.md.feed(rest.slice(0, nl).split('\n'));
-      if (rows.length) { this.push({type: 'md', rows, first: !started}); started = true; }
+      const src = rest.slice(0, nl);
+      const rows = this.md.feed(src.split('\n'));
+      // A table's lines are held (no rows yet), but their source must still travel: it rides
+      // the next piece that has rows, or the message's last piece (endMessage).
+      srcHeld = srcHeld ? srcHeld + '\n' + src : src;
+      if (rows.length) { this.push({type: 'md', rows, src: srcHeld, first: !started}); srcHeld = ''; started = true; }
       done += nl + 1;
     }
-    this.set({stream: {id, done, started, partial: clean.slice(done), emitted: clean.slice(0, done), raw: text, clean, table: [...this.md.pending]}});
+    this.set({stream: {id, done, started, partial: clean.slice(done), emitted: clean.slice(0, done), raw: text, clean, table: [...this.md.pending], srcHeld}});
   }
   // Preview of the unfinished line; must not move the fence state of the real render.
   previewRow() {
@@ -419,7 +690,21 @@ export class Controller {
     const shown = st.partial.length > room ? '…' + st.partial.slice(-room) : st.partial;
     // The unfinished next row of a held table shows once it is whole (in the table, aligned).
     const fence = this.md.fence, row = shown && !(st.table?.length && /^\s*\|/.test(shown)) ? this.md.row(shown) : null; this.md.fence = fence;
-    return {row, first: !st.started, table: st.table?.length ? tableRows(st.table) : []};
+    // Wave 13: the preview keeps the column widths it first showed for this
+    // table. tableRows() alone re-sets the whole table from the lines present,
+    // so a wider row arriving later moved every border in the rows already on
+    // screen. The widths freeze at the first preview of the table (keyed by
+    // the stream id and the table's first line; a shorter table than the
+    // frozen one is a new table) and wider cells are cut to them; the printed
+    // table at the end is set again at its true widths (md.flush, no freeze).
+    let table = [];
+    if (st.table?.length) {
+      const fz = this._pvTable;
+      if (!fz || fz.id !== st.id || fz.head !== st.table[0] || st.table.length < fz.len) this._pvTable = {id: st.id, head: st.table[0], len: st.table.length, widths: tableWidths(st.table)};
+      else fz.len = st.table.length;
+      table = tableRows(st.table, this._pvTable.widths);
+    } else this._pvTable = null;
+    return {row, first: !st.started, table};
   }
   flushStream() { if (this.s.stream) this.endMessage(this.s.stream.id); }
   endMessage(id) {
@@ -428,7 +713,17 @@ export class Controller {
     // unfinished trailing token into the placeholder instead of leaking `[[hatch_...`).
     const tail = st.raw != null ? sanitizeEmbeds(st.raw).slice(st.done) : st.partial;
     const rows = [...(tail ? this.md.feed(tail.split('\n')) : []), ...this.md.flush()];
-    if (rows.length) this.push({type: 'md', rows, first: !st.started});
+    const src = [st.srcHeld, tail].filter(x => x).join('\n');
+    // A whitespace-only tail (a resumed message whose late update only added
+    // a trailing space) is not an entry of its own.
+    if (rows.length && (tail.trim() || (st.srcHeld || '').trim())) this.push({type: 'md', rows, src, first: !st.started});
+    // Remember what this message has shown in full, so a late update for the
+    // same id resumes instead of re-printing (see onText).
+    if (typeof st.raw === 'string') {
+      this.doneStreams ??= new Map();
+      this.doneStreams.set(id, {raw: st.raw, clean: sanitizeEmbeds(st.raw)});
+      while (this.doneStreams.size > 50) this.doneStreams.delete(this.doneStreams.keys().next().value);
+    }
     this.push({type: 'gap'});
     this.set({stream: null});
     for (const step of this.heldSteps.splice(0)) this.push({type: 'muse', step});
@@ -471,7 +766,7 @@ export class Controller {
     this.menuBuf = ''; clearTimeout(this.menuTimer);
     bell();
     return new Promise(resolve => {
-      const req = {call, preview, options, index: 0, outside};
+      const req = {call, preview, options, index: 0, outside, loreGrave: call.loreGrave || null};
       req.resolve = v => { if (req.done) return; req.done = true; clearTimeout(req.timer); resolve(v); };
       // Muse stops waiting at call.deadline; the approval closes then instead of staying open
       // for a change that would run unseen by Muse.
@@ -489,8 +784,8 @@ export class Controller {
     else this.pending = (this.pending || []).filter(x => x !== req);
     req.resolve({allow: false, expired: true});
     const what = ((req.call.command || '') + ' ' + (req.call.summary || '')).trim();
-    if (why === 'stopped') this.note(t('作業を止めたので、承認待ちだった {what} は取りやめました。', {what}));
-    else this.note(t('承認が間に合わず Muse が待つのをやめたので、{what} は行いませんでした。', {what}));
+    if (why === 'stopped') this.note(t('承認待ちだった {what} は取りやめました。', {what}));
+    else this.note(t('{what} は行いませんでした（承認が間に合いませんでした）。', {what}));
     if (!this.s.approval && !this.s.reasonFor) this.nextApproval();
   }
   // Declining with a reason borrows the input; what the user was typing comes back after.
@@ -500,7 +795,8 @@ export class Controller {
     if (next) this.set({approval: next});
   }
   answer(i) {
-    const a = this.s.approval, o = a.options[i];
+    const a = this.s.approval, o = a?.options?.[i];
+    if (!a || !o) return; // already expired (e.g. an account switch took it): nothing to answer
     if (!o.allow) { this.reasonDraft = {text: this.s.text, pos: this.s.pos}; return this.set({approval: null, reasonFor: a, text: '', pos: 0}); }
     if (o.autoEdit && this.agent.mode === 'default') this.setMode('auto-edit');
     this.set({approval: null, ...(a.call.agent === 'main' ? {running: {call: a.call, tail: []}} : {})});
@@ -523,11 +819,30 @@ export class Controller {
   async mcpPick(v) {
     const a = this.agent;
     if (!this.agent.mcp && !v.import) return this.note(t('このモードでは MCP を使えません。'));
-    if (v.import) { mcpConfig.importServers(mcpConfig.discover()); this.note(t('取り込みました（すべてオフ）。')); return this.mcpMenu(); }
+    // Wave 15: importing writes the real mcp.json — in the demo it refuses,
+    // like the other demo guards (the toggle below already refuses there:
+    // the demo agent has no mcp hub).
+    if (v.import) { if (a.client?.status === 'demo') return this.note(t('デモでは MCP サーバーを取り込めません。')); mcpConfig.importServers(mcpConfig.discover()); this.note(t('取り込みました（すべてオフ）。')); return this.mcpMenu(); }
     if (this.s.busy) return this.flash(t('作業中は切り替えられません'));
     const cfg = mcpConfig.setEnabled(v.toggle, v.on), s = cfg.mcpServers[v.toggle];
     try {
-      if (v.on) { this.flash(t('{name} に接続しています…', {name: v.toggle}), 15000); await a.mcp.connect(v.toggle, s); }
+      if (v.on) {
+        this.flash(t('{name} に接続しています…', {name: v.toggle}), 15000);
+        // Wave 15: no second connect here — setEnabled() above already applied
+        // the toggle live (the hub's applyEnabled started the connect; mcp.js
+        // joins an in-flight connect now, but the extra front-door call was
+        // still a duplicate). Wait for the entry that live apply started to
+        // settle instead, and surface its error the way the direct connect's
+        // throw was surfaced.
+        const deadline = Date.now() + 30000;
+        for (;;) {
+          const cur = a.mcp.servers.get(v.toggle);
+          if (!cur || cur.status === 'connected') break;
+          if (cur.status === 'error') throw new Error(cur.error || v.toggle);
+          if (Date.now() > deadline) break;
+          await new Promise(r => setTimeout(r, 100));
+        }
+      }
       else await a.mcp.disconnect(v.toggle);
       a.mcp.index(); await a.reconnectDevice();
       const live = a.mcp.servers.get(v.toggle);
@@ -552,6 +867,9 @@ export class Controller {
   // and are saved in ~/.muser/config.json; the rest open their own menus (/lang, /mode, /skills, /mcp).
   settingsMenu(index = 0) {
     const a = this.agent, demo = a.client?.status === 'demo';
+    // Wave 14: a broken config.json (read as the defaults, or already moved aside by a
+    // save) is said once, here where the defaults are on show — not silently.
+    try { configStore.read(); const cn = configStore.takeCorruptNotice(); if (cn) this.note(cn.dest ? t('設定ファイルが壊れていたため、{dest} に退避しました。いまは既定値で表示しています。', {dest: String(cn.dest).split(/[\\/]/).pop()}) : t('設定ファイルが壊れていて読めなかったため、既定値で表示しています。保存すると、壊れたファイルは退避されます。'), 'error'); } catch {}
     const count = n => n === 0 ? t('無制限') : String(n);
     const limits = a.agentLimits || {concurrent: 4, perTurn: 0};
     const onOff = v => v ? t('オン') : t('オフ');
@@ -567,12 +885,18 @@ export class Controller {
     const G = {work: t('作業の進め方'), limits: t('上限と使用量'), approvals: t('承認'), display: t('表示'), notify: t('通知と更新'), link: t('連携')};
     const options = [
       {value: 'agents', group: G.work, label: t('エージェント上限'), desc: t('同時 {concurrent} ／ タスク合計 {perTurn}', {concurrent: count(limits.concurrent), perTurn: count(limits.perTurn)})},
-      {value: 'focus', group: G.work, label: t('Focus（完了条件の自動管理）'), desc: onOff(a.focusEnabled !== false)},
+      {value: 'focus', group: G.work, label: t('Focus（完了条件の自動管理）'), desc: onOff(savedValue('focus')) + '  ' + t('（保存した値です。選ぶと保存も切り替わります。/focus はこの窓だけの切替です）')},
       {value: 'focusRounds', group: G.work, label: t('Focus の自動続行の回数'), desc: num('focusRounds')},
       {value: 'focusMinutes', group: G.work, label: t('Focus の自動続行の時間'), desc: num('focusMinutes', n => t('{n} 分', {n}))},
+      {value: 'focusLogLevel', group: G.work, label: t('Focus の判定ログ'), desc: t(FOCUS_LOG_LEVEL_LABELS[focusLogLevel()])},
+      {value: 'worklog', group: G.work, label: t('作業ログを残す'), desc: sw('worklog')},
+      {value: 'worklogDays', group: G.work, label: t('作業ログの保持日数'), desc: num('worklogDays', n => t('{n} 日', {n}))},
+      {value: 'expectMode', group: G.work, label: t('想定外ストップ'), desc: t(EXPECT_MODE_LABELS[expectMode()])},
+      {value: 'lore', group: G.work, label: t('コードの言い伝え（lore）'), desc: sw('lore')},
       {value: 'bangAutoSend', group: G.work, label: t('! の結果を Muse に送る'), desc: sw('bangAutoSend')},
       {value: 'bgAutoResume', group: G.work, label: t('バックグラウンド完了で自動再開'), desc: sw('bgAutoResume')},
       {value: 'maxToolCallsPerTurn', group: G.limits, label: t('1ターンのツール呼び出し上限'), desc: num('maxToolCallsPerTurn', n => t('{n} 回', {n}))},
+      {value: 'maxNodeSlots', group: G.limits, label: t('端末枠の上限'), desc: num('maxNodeSlots', n => t('{n} 個', {n}))},
       {value: 'dailyTurnLimit', group: G.limits, label: t('1日のターン数の警告'), desc: num('dailyTurnLimit', n => n ? t('{n} ターン', {n}) : t('オフ'))},
       {value: 'quotaFallback', group: G.limits, label: t('週の上限で応答がないとき'), desc: t(QUOTA_FALLBACK_LABELS[quotaFallback()])},
       {value: 'mode', group: G.approvals, label: t('承認モード（このフォルダー）'), desc: t(LABELS[a.mode] || a.mode)},
@@ -589,10 +913,11 @@ export class Controller {
       {value: 'footerVersion', group: G.display, label: t('フッターにバージョン'), desc: sw('footerVersion')},
       {value: 'footerClock', group: G.display, label: t('フッターに時刻'), desc: sw('footerClock')},
       {value: 'color', group: G.display, label: t('色を使う'), desc: nextStart('color')},
-      {value: 'kitty', group: G.display, label: t('拡張キー入力（kitty プロトコル）'), desc: nextStart('kitty')},
+      {value: 'kitty', group: G.display, label: t('拡張キー入力'), desc: nextStart('kitty')},
+      {value: 'fullscreen', group: G.display, label: t('全画面表示（スクロールは muser 内）'), desc: nextStart('fullscreen')},
       {value: 'bell', group: G.notify, label: t('承認・完了時のベル'), desc: sw('bell')},
       // A git checkout (npm link while developing) is never checked (src/update.js): "on" alone was not true there.
-      {value: 'updateCheck', group: G.notify, label: t('起動時に更新を確認'), desc: sw('updateCheck') + (switchValue('updateCheck') && update.devCheckout() && process.env.MUSER_UPDATE_CHECK !== '1' ? '  ' + t('（開発用のチェックアウトなので確認しません）') : '')},
+      {value: 'updateCheck', group: G.notify, label: t('起動時に更新を確認'), desc: sw('updateCheck') + '  ' + t('（次回起動から）') + (switchValue('updateCheck') && update.devCheckout() ? '  ' + t('（開発用のチェックアウトなので確認しません）') : '')},
       {value: 'skills', group: G.link, label: t('スキル'), desc: t('{n} 個オン', {n: enabledSkills})},
       {value: 'mcp', group: G.link, label: t('MCP サーバー'), desc: t('{n} 個オン', {n: mcpOn})},
     ];
@@ -622,6 +947,16 @@ export class Controller {
           options: QUOTA_FALLBACKS.map(v => ({value: v, label: t(QUOTA_FALLBACK_LABELS[v]), desc: t(QUOTA_FALLBACK_HELP[v])})), index: QUOTA_FALLBACKS.indexOf(quotaFallback()), current: quotaFallback(),
           pick: v => { try { setQuotaFallback(v, {save: !demo}); } catch (e) { this.note(t('設定を変更できませんでした: {error}', {error: e.message}), 'error'); } this.settingsMenu(at); }});
       }
+      if (key === 'focusLogLevel') {
+        return this.openMenu({title: t('Focus の判定ログ'),
+          options: FOCUS_LOG_LEVELS.map(v => ({value: v, label: t(FOCUS_LOG_LEVEL_LABELS[v]), desc: t(FOCUS_LOG_LEVEL_HELP[v])})), index: FOCUS_LOG_LEVELS.indexOf(focusLogLevel()), current: focusLogLevel(),
+          pick: v => { try { setFocusLogLevel(v, {save: !demo}); } catch (e) { this.note(t('設定を変更できませんでした: {error}', {error: e.message}), 'error'); } this.settingsMenu(at); }});
+      }
+      if (key === 'expectMode') {
+        return this.openMenu({title: t('想定外ストップ'),
+          options: EXPECT_MODES.map(v => ({value: v, label: t(EXPECT_MODE_LABELS[v]), desc: t(EXPECT_MODE_HELP[v])})), index: EXPECT_MODES.indexOf(expectMode()), current: expectMode(),
+          pick: v => { try { setExpectMode(v, {save: !demo}); } catch (e) { this.note(t('設定を変更できませんでした: {error}', {error: e.message}), 'error'); } this.settingsMenu(at); }});
+      }
       if (key === 'defaultMode') {
         return this.openMenu({title: t('新しいフォルダーの承認モード'),
           options: MODES.map(m => ({value: m, label: t(LABELS[m]), desc: t(MODE_HELP[m]), danger: m === 'bypass'})), index: MODES.indexOf(defaultMode()), current: defaultMode(),
@@ -630,8 +965,11 @@ export class Controller {
       if (key === 'focus') {
         if (this.s.busy) { this.note(t('Focus の切替は作業が終わってから行ってください。')); return this.settingsMenu(at); }
         // Saved first, then this window follows: a failed save used to leave the window
-        // switched while the note said nothing had changed.
-        const next = a.focusEnabled === false;
+        // switched while the note said nothing had changed. Wave 14: the flip is of the
+        // SAVED value (the row shows it too), not this window's state — a window that
+        // /focus had switched alone used to flip from its own state and save the
+        // opposite of what the row showed.
+        const next = !savedValue('focus');
         // #180: the /focus route also drops resumeFocus; this route forgot, so an
         // off→on here resurrected a task the user had meant to discard.
         try { setSwitch('focus', next, {save: !demo}); a.focusEnabled = next; a.resumeFocus = null; } catch (e) { this.note(t('設定を変更できませんでした: {error}', {error: e.message}), 'error'); }
@@ -713,11 +1051,18 @@ export class Controller {
     if (!/^[0-9]$/.test(input)) { this.menuBuf = ''; clearTimeout(this.menuTimer); }
     if (k.upArrow) return this.set({menu: {...m, index: (m.index + n - 1) % n}});
     if (k.downArrow || k.tab) return this.set({menu: {...m, index: (m.index + 1) % n}});
+    // A menu with pages to the side (/resume: other folders) turns them with ← / →.
+    if ((k.leftArrow || k.rightArrow) && typeof m.side === 'function') return m.side(k.leftArrow ? -1 : 1);
     // A pick that throws becomes a note instead of an uncaught error that ends muser: the
     // config and sessions stores now refuse to write when another window holds their lock
     // (phase 2), and some picks (/skills on/off) wrote without a catch of their own.
     const failed = e => this.note(t('設定を変更できませんでした: {error}', {error: e?.message || String(e)}), 'error');
-    const pick = i => { this.menuBuf = ''; clearTimeout(this.menuTimer); this.set({menu: null}); try { const r = m.pick(m.options[i].value); if (r && typeof r.catch === 'function') r.catch(failed); } catch (e) { failed(e); } };
+    // The picked option itself rides along as pick's second argument: a menu
+    // whose values are not unique (two /resume entries sharing one session
+    // id, wave 8 (3)) can then act on the very row the user picked instead
+    // of looking its value up again. Picks that take one argument are
+    // unaffected.
+    const pick = i => { this.menuBuf = ''; clearTimeout(this.menuTimer); this.set({menu: null}); try { const r = m.pick(m.options[i].value, m.options[i]); if (r && typeof r.catch === 'function') r.catch(failed); } catch (e) { failed(e); } };
     // Two-digit picks: menus with 10+ options (/skills, /resume) could not be picked by number
     // at all. A first digit that could still grow (1 with 10+ options) is buffered briefly; a
     // second digit — or the timeout — settles it.
@@ -804,6 +1149,19 @@ export class Controller {
     this.set({queue: [...this.queue]});
     this.submit(next);
     return true;
+  }
+  // Wave 16 (4): drop the held queue for a conversation transition (/new,
+  // /resume): the entries were written for the chat being left and must not
+  // be delivered into the new one. The drop is said out loud — how many
+  // were cancelled — never silent.
+  dropQueueForTransition() {
+    const n = this.queue.length;
+    if (!n) return;
+    this.queue = [];
+    this.queuedQuestionAnswers = [];
+    this.agent.focusInputPending = false;
+    this.set({queue: []});
+    this.note(t('前の会話で待っていた {n} 件を取り消しました', {n}));
   }
   // The answer text for one question, from a given state (defaults to the live one):
   // picked labels in option order, then the typed answer, joined the way the reply reads.
@@ -937,12 +1295,55 @@ export class Controller {
   }
   submitReason(text) { const a = this.s.reasonFor; this.set({reasonFor: null}); this.restoreDraft(); a.resolve({allow: false, reason: text.trim()}); this.nextApproval(); }
   // The mode is remembered for this folder (src/permissions.js).
-  setMode(m) { this.agent.mode = m; this.set({mode: m}); if (this.agent.client?.status !== 'demo') permissions.saveMode(this.agent.cwd, m); }
-  cycleMode() { this.setMode(MODES[(MODES.indexOf(this.agent.mode) + 1) % MODES.length]); }
+  // Wave 14: a window started with an explicit --mode (modeExplicit) is
+  // per-window: its mode changes apply to this window only and are NOT
+  // saved to the shared file, so they never rewrite every other window's
+  // (and every future window's) remembered default. Callers that announce
+  // the change check modeExplicit and say it is this window only.
+  // A save can also fail by THROWING (a lock held by another window, an
+  // EEXIST from the lock's mkdir): that is a failed save too — permissions
+  // now reports it as false, and the try here keeps any other throw from
+  // escaping to the screen's generic catch as raw lock text. Either way
+  // the window rolls back to the previous mode and notes the failure.
+  setMode(m) {
+    const prev = this.agent.mode;
+    this.agent.mode = m; this.set({mode: m});
+    if (this.agent.modeExplicit || this.agent.client?.status === 'demo') return true;
+    let saved;
+    try { saved = permissions.saveMode(this.agent.cwd, m); } catch { saved = false; }
+    if (!saved) {
+      this.agent.mode = prev; this.set({mode: prev});
+      this.note(t('承認モードを保存できませんでした。ファイルを確認してください。'));
+      return false;
+    }
+    return true;
+  }
+  cycleMode() {
+    const next = MODES[(MODES.indexOf(this.agent.mode) + 1) % MODES.length];
+    const ok = this.setMode(next);
+    // Cycling is normally silent (the footer shows the new mode), but in a
+    // --mode window the change is this window only — say so, or it looks
+    // like the shared default moved. A failed save already noted itself
+    // (and rolled back) inside setMode.
+    if (ok && this.agent.modeExplicit) this.note(t('承認モード: {label}（この窓だけです）', {label: t(LABELS[next])}));
+    return ok;
+  }
 
   // ---- input ----
   setText(text, pos = text.length) { this.set({text, pos}); }
   insert(t) { const {text, pos} = this.s; const add = t.slice(0, Math.max(0, MAX_INPUT - text.length)); this.setText(text.slice(0, pos) + add + text.slice(pos), pos + add.length); }
+  // Wave 10: the per-entry draft of a history entry being browsed (the shell's
+  // behaviour). An entry recalled with ↑ and then edited used to lose the edit
+  // the moment ↑/↓ moved away — setText simply replaced it. The edit is kept
+  // here, keyed by history index, while browsing lasts; the stored history is
+  // untouched (sending still appends the edited text as a new entry, and the
+  // map is dropped then, since a push can shift the indices it keys on).
+  saveHistEdit() {
+    if (this.hIndex < 0 || this.hIndex >= this.history.length) return;
+    if (this.s.text === this.history[this.hIndex]) { if (this.histEdits) delete this.histEdits[this.hIndex]; }
+    else (this.histEdits ||= {})[this.hIndex] = this.s.text;
+  }
+  histText(i) { return this.histEdits?.[i] ?? this.history[i]; }
   paste(t) {
     if (this.s.limitInput) {
       const edit = this.s.limitInput, digits = t.trim();
@@ -951,12 +1352,16 @@ export class Controller {
     }
     // #158: while a decline reason is being typed the composer belongs to it, even if a
     // menu opened meanwhile — the paste goes to the reason, not nowhere.
-    if (this.s.approval || (this.s.menu && !this.s.reasonFor)) return;
+    // Wave 8 (4): a bracketed paste landing on an approval, a menu or the
+    // question list used to be dropped in silence — the user could not tell
+    // it had not gone anywhere. Refusals now say so on the flash line; the
+    // paste itself still goes nowhere on those screens.
+    if (this.s.approval || (this.s.menu && !this.s.reasonFor)) return this.flash(i18n.t('この画面では貼り付けできません')); // i18n.t: this method's argument is named t
     if (this.s.question) {
       // Into the picker's text modes (type-something / notes); the list itself takes no paste.
       // Sanitised like any paste (stripControls), then flattened to one line, as typed input is.
       const q = this.s.question;
-      if (q.mode === 'list') return;
+      if (q.mode === 'list') return this.flash(i18n.t('この画面では貼り付けできません'));
       return this.setQuestion({...q, typeText: (q.typeText + stripControls(t).replace(/\r\n?/g, ' ').replace(/\n/g, ' ')).slice(0, MAX_INPUT)});
     }
     // Dropping image files into the terminal pastes their paths: attach them instead.
@@ -1030,6 +1435,9 @@ export class Controller {
     if (right && !this.s.approval && !this.s.menu && !this.s.limitInput && !(this.s.question && this.s.question.mode === 'list')) this.pasteFromClipboard();
   }
   key(input, k) {
+    // The events ring records the KIND of key only (src/ui/event-ring.js):
+    // a typed character is 'char', never the character itself.
+    try { this.eventRing?.recordKey(input, k); } catch {}
     if (input && input.includes('\x1b[<')) return this.mouseInput(input);
     if (this.s.approval) return this.approvalKey(input, k);
     if (this.s.question) return this.questionKey(input, k);
@@ -1104,11 +1512,18 @@ export class Controller {
     // into thinking @ selection did not exist. A second Enter (after the pick, caret past
     // the completed path) sends as usual.
     if (k.return && !k.shift && !k.meta) {
+      // Wave 10: the $ and @ completions belong to chat lines only. On a ! line
+      // $ is a shell variable (completing it rewrote the command instead of
+      // running it) and on a / line neither $ nor @ is expanded at submit, so
+      // Enter there must send the line as typed. The line's mode is read the
+      // same way submit reads it: trimStart, then the first mark decides.
+      const lead = text.trimStart();
+      const chatLine = !lead.startsWith('!') && !lead.startsWith('/');
       // Enter while the $skill list is open completes to '$name ' instead of
       // sending, exactly as with @ above.
-      const dctx = this.dollarContext(text, pos);
+      const dctx = chatLine ? this.dollarContext(text, pos) : null;
       if (dctx?.list.length) return this.applyDollarPick(dctx.frag, dctx.list[this.dollarIndex(dctx.frag.fragment, dctx.list.length)]);
-      const ctx = this.atContext(text, pos);
+      const ctx = chatLine ? this.atContext(text, pos) : null;
       const pick = ctx?.list.length ? ctx.list[this.atIndex(ctx.at.fragment, ctx.list.length)] : null;
       // A path already typed out in full sends, as Enter normally does (it took a second Enter).
       if (pick && pick !== ctx.at.fragment) return this.applyAtPick(ctx.at, pick);
@@ -1124,11 +1539,16 @@ export class Controller {
     if (k.return) {
       if (k.shift || k.meta) return this.insert('\n');
       if (text.slice(0, pos).endsWith('\\')) return this.setText(text.slice(0, pos - 1) + '\n' + text.slice(pos), pos);
-      this.setText(''); this.hIndex = -1;
+      this.setText(''); this.hIndex = -1; this.histEdits = {}; // browsing ends; a push below can shift the indices the edits key on
       if (this.s.reasonFor) return this.submitReason(text);
       if (this.s.promptFor) return this.submitPrompt(text);
-      if (!text.trim() && !this.s.attachments.length) return;
-      if (this.history[this.history.length - 1] !== text) { this.history.push(text); if (this.history.length > MAX_HISTORY) this.history = this.history.slice(-MAX_HISTORY); saveHistory(this.history); }
+      if (!text.trim() && !this.s.attachments.length) {
+        // tell: a message that arrived while idle waits for the next turn; an empty Enter
+        // sends it on its own (the arrival line says so). Nothing waiting: Enter does nothing.
+        if (!this.s.busy && this.agent?.pendingTell?.length) return this.submit(t('別の muser から届いた指示を進めてください。'));
+        return;
+      }
+      if (this.history[this.history.length - 1] !== text) { this.history.push(text); if (this.history.length > MAX_HISTORY) this.history = this.history.slice(-MAX_HISTORY); if (this.agent.client?.status !== 'demo' || HISTORY_FILE_GIVEN) saveHistory(this.history); } // wave 15: in the demo the history stays in memory only — a demo run must not write the real history file (an explicitly redirected file is not the real one)
       this.draft = '';
       return this.submit(text);
     }
@@ -1182,12 +1602,31 @@ export class Controller {
       // same unit ←/→ and Backspace already stepped by.
       const col = clusterCount(text.slice(lineStart, pos));
       if (k.upArrow) {
-        if (!lineStart) return;
+        if (!lineStart) {
+          // Wave 8 (5): the text on screen is a recalled history entry
+          // (hIndex >= 0) — line movement owned ↑ on every line, so from
+          // the first line there was no way back to the older entries and
+          // the user was trapped in this one. On the first line, ↑ keeps
+          // browsing history instead, exactly as in a single-line entry.
+          if (this.hIndex > 0) { this.saveHistEdit(); this.hIndex--; return this.setText(this.histText(this.hIndex)); }
+          return;
+        }
         const prevEnd = lineStart - 1, prevStart = text.lastIndexOf('\n', prevEnd - 1) + 1;
         return this.set({pos: prevStart + offsetAtClusterCol(text.slice(prevStart, prevEnd), col)});
       }
       const lineEnd = text.indexOf('\n', pos);
-      if (lineEnd < 0) return;
+      if (lineEnd < 0) {
+        // The way back down mirrors the single-line branch: on the last
+        // line of a recalled entry, ↓ moves to the newer entry (or back
+        // to the draft past the newest), instead of being a dead key.
+        if (this.hIndex >= 0) {
+          this.saveHistEdit();
+          this.hIndex++;
+          if (this.hIndex >= this.history.length) { this.hIndex = -1; return this.setText(this.draft || ''); }
+          return this.setText(this.histText(this.hIndex));
+        }
+        return;
+      }
       const nextStart = lineEnd + 1, nextEnd = text.indexOf('\n', nextStart);
       return this.set({pos: nextStart + offsetAtClusterCol(text.slice(nextStart, nextEnd < 0 ? text.length : nextEnd), col)});
     }
@@ -1195,13 +1634,15 @@ export class Controller {
       if (!this.history.length) return;
       if (k.upArrow) {
         if (this.hIndex < 0) this.draft = text; // keep the in-progress draft for the way back down
+        else this.saveHistEdit(); // an edited entry keeps its edit as its draft (see saveHistEdit)
         this.hIndex = this.hIndex < 0 ? this.history.length - 1 : Math.max(0, this.hIndex - 1);
-        return this.setText(this.history[this.hIndex]);
+        return this.setText(this.histText(this.hIndex));
       }
       if (this.hIndex < 0) return;
+      this.saveHistEdit();
       this.hIndex++;
       if (this.hIndex >= this.history.length) { this.hIndex = -1; return this.setText(this.draft || ''); }
-      return this.setText(this.history[this.hIndex]);
+      return this.setText(this.histText(this.hIndex));
     }
     if (input && !k.ctrl && !k.meta) this.insert(input.replace(/\r\n?/g, '\n'));
   }
@@ -1275,20 +1716,28 @@ export class Controller {
   // way, so the / branch below it never ran for most inputs, and nothing could cycle). Repeated
   // Tab cycles candidates: tabState remembers the applied text and the range it occupies.
   completeTab(text, pos) {
+    // Wave 10 follow-up: Tab gets the same chat-line gate Enter got — $ and @
+    // completion only on a normal chat line (mode read via trimStart, as in
+    // the Enter branch and submit). On a ! line $ is a shell variable and on
+    // a / line neither is expanded, so Tab there must leave the text alone
+    // (! $rev + Tab used to rewrite it to $review ). / completion below is
+    // unchanged, and cycling an already-open / list still works.
+    const lead = text.trimStart();
+    const chatLine = !lead.startsWith('!') && !lead.startsWith('/');
     const prev = this.tabState;
-    if (prev && prev.text === text && prev.end === pos && prev.list.length > 1) {
+    if (prev && prev.text === text && prev.end === pos && prev.list.length > 1 && (prev.kind === 'slash' || chatLine)) {
       const idx = (prev.idx + 1) % prev.list.length, ins = prev.format(prev.list[idx]);
       const nt = text.slice(0, prev.start) + ins + text.slice(prev.end);
       this.tabState = {...prev, idx, text: nt, end: prev.start + ins.length};
       return this.setText(nt, prev.start + ins.length);
     }
-    const dctx = this.dollarContext(text, pos);
+    const dctx = chatLine ? this.dollarContext(text, pos) : null;
     if (dctx) {
       // Tab completes the highlighted $skill to '$name ' (no list, no completion).
       if (!dctx.list.length) return;
       return this.applyDollarPick(dctx.frag, dctx.list[this.dollarIndex(dctx.frag.fragment, dctx.list.length)]);
     }
-    const at = mention.fragmentAt(text, pos);
+    const at = chatLine ? mention.fragmentAt(text, pos) : null;
     if (at) {
       // Tab cycles the same full list atContext returns (see there): cycling
       // only the first 6 made the rest unreachable however often Tab was hit.
@@ -1323,8 +1772,34 @@ export class Controller {
   }
 
   // ---- commands ----
+  // The $name expansion of a typed text: the sentence(s) Muse is sent for
+  // its $skill references, followed by the text as typed. Queue entries hold
+  // the typed text only (that is what the queue line shows); this expansion
+  // is computed where a text is actually sent (submit) or matched against a
+  // text that was sent (the agent's steer queue holds expansions).
+  sendTextFor(text) {
+    const drefs = (() => { try { return skills.dollarRefs(text, this.agent.cwd); } catch { return {names: [], disabled: []}; } })();
+    return drefs.names.length ? drefs.names.map(n => skills.skillSentence(n)).join(' ') + ' ' + text : text;
+  }
   async submit(text, {fromQuestion = false} = {}) {
     this.resumeEpoch = (this.resumeEpoch || 0) + 1; // a send supersedes a resume still loading (#177)
+    // Focus fix: a picker answer held in the queue while an account was
+    // being added (the addingAccount branch below) keeps its fromQuestion
+    // nature when the queue later drains it through a plain submit() —
+    // the drain must not re-route it as a decline reason, a slash command
+    // or a !command, or the queueing below would only delay the loss.
+    if (!fromQuestion && this.queuedQuestionAnswers?.includes(text)) { this.queuedQuestionAnswers.splice(this.queuedQuestionAnswers.indexOf(text), 1); fromQuestion = true; }
+    // Focus fix: in serve mode the picker state lives on this server-side
+    // Controller, but a GUI / phone answer arrives as a plain submit() —
+    // nothing here cleared s.question, so it stayed set forever: later
+    // pickers never opened (the !s.question condition above), the queue
+    // never auto-sent, and bang / shell notes kept waiting. A plain send
+    // while a picker is open IS the user's answer to it: clear the stale
+    // question first (closeQuestion(false): the same state update, without
+    // the queue / bang / shell resumption — this send proceeds as the
+    // resumption itself) and let the send go through normally. A picker
+    // submission (fromQuestion) already closed its question beforehand.
+    if (!fromQuestion && this.s.question) this.closeQuestion(false);
     // #158: a send from any surface (GUI /send included) answers a pending decline
     // reason first — it used to fall through and go to Muse as a chat message.
     // fromQuestion (submitQuestionAnswers) is the one exception, third M25:
@@ -1334,10 +1809,39 @@ export class Controller {
       if (this.s.reasonFor) return this.submitReason(text);
       if (this.s.promptFor) return this.submitPrompt(text);
     }
-    if (this.addingAccount) return this.flash(t('アカウントを追加しています。完了するまでお待ちください。'));
-    if (text.startsWith('/')) return this.slash(text.trim());
-    // Leading spaces too: a "! command" copied from Muse's reply on screen comes with its indent.
-    if (text.trimStart().startsWith('!')) return this.bang(text.trimStart().slice(1).trim());
+    if (this.addingAccount) {
+      // Focus fix: a picker answer (fromQuestion) submitted while an account
+      // add runs used to be dropped here — after submitQuestionAnswers had
+      // already closed the picker, so the answer was lost entirely. Queue it
+      // on the same queue a busy send uses instead; it is delivered after
+      // the add, at the next queue drain. Plain sends still just wait.
+      if (fromQuestion) {
+        if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
+        this.queue.push(text); (this.queuedQuestionAnswers ||= []).push(text); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを追加しています。完了するまでお待ちください。'));
+      }
+      return this.flash(t('アカウントを追加しています。完了するまでお待ちください。'));
+    }
+    // Focus fix: picker answers are plain messages, never commands — their
+    // first line is the QUESTION text (submitQuestionAnswers), so a question
+    // starting with '/' or '!' ran itself as a slash command / !command and
+    // corrupted its own answer. fromQuestion skips both branches entirely.
+    if (!fromQuestion) {
+      // Wave 10: both mode marks skip leading blanks the same way — the / branch used
+      // to test the raw text while ! used trimStart, so ' /help' (or a leading newline)
+      // went to Muse as chat while ' !cmd' ran. One trimStart basis for both.
+      // Wave 16 (2): a slash line used to run BEFORE the account-switch hold
+      // below, so /new (or any command) executed mid-switch, against the
+      // account/session being left. While a switch is in flight on either
+      // side, hold the line in the queue like plain text instead; the
+      // drain re-enters submit() once the switch settles and runs it then.
+      if (text.trimStart().startsWith('/') && (this.accountSwitching || this.agent?._switching)) {
+        if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
+        this.queue.push(text); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを切り替えています。そのあと送ります'));
+      }
+      if (text.trimStart().startsWith('/')) return this.slash(text.trim());
+      // Leading spaces too: a "! command" copied from Muse's reply on screen comes with its indent.
+      if (text.trimStart().startsWith('!')) return this.bang(text.trimStart().slice(1).trim());
+    }
     // $name skill calls (Codex style), here in submit so the resident server's
     // submits from clients expand the same way: Muse gets one 'Use the skill …'
     // sentence per enabled $name followed by the text as typed, while the screen
@@ -1350,9 +1854,16 @@ export class Controller {
     // agent mid-switch (the closing session of the old account, or ahead of
     // the handoff on the new one). Hold it in the queue instead; the switch's
     // completion sends it on the new account (see requestAccountSwitch).
-    if (this.accountSwitching) {
+    // Wave 16 (1): the hold covered only a controller-started switch
+    // (this.accountSwitching). During an AGENT-initiated failover
+    // (agent._switching, e.g. a quota failover inside agent.send) the
+    // message fell through, agent.send rejected it mid-switch, and the
+    // catch below restored the bang/shell notes and attachments but
+    // never the text — the send was lost. Hold on either side's switch,
+    // mirroring sendShellNotes' guard.
+    if (this.accountSwitching || this.agent?._switching) {
       if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
-      this.queue.push(sendText); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを切り替えています。そのあと送ります'));
+      this.queue.push(text); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('アカウントを切り替えています。そのあと送ります'));
     }
     if (this.s.busy) {
       if (this.queue.length >= MAX_QUEUE) { this.note(t('キューがいっぱいです（最大 {max} 件）。', {max: MAX_QUEUE}), 'error'); return this.flash(t('キューがいっぱいです')); }
@@ -1366,7 +1877,7 @@ export class Controller {
       // deep c1 #7: the turn may have ENDED during the postSteer await — then
       // this is a fresh send, not a queue entry. Queueing it anyway left it in
       // a queue nothing drains until some later turn ends.
-      if (this.s.busy) { this.queue.push(sendText); this.agent.queueSteer?.(sendText); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('作業中です。次のツール実行で Muse に伝えます（キュー {n} 件目）', {n: this.queue.length})); }
+      if (this.s.busy) { this.queue.push(text); this.agent.queueSteer?.(sendText); this.agent.focusInputPending = true; this.set({queue: [...this.queue]}); return this.flash(t('作業中です。次のツール実行で Muse に伝えます（キュー {n} 件目）', {n: this.queue.length})); }
     }
     const attachments = this.s.attachments;
     this.agent.clearSteer?.(); // a fresh send supersedes any steer copy whose queue twin is gone
@@ -1395,7 +1906,10 @@ export class Controller {
     // automatic turn whose input then answered the prompt instead. Wait like a busy turn.
     // deep c1 #1: a picker answer or a decline reason in progress is the same
     // kind of wait (#162 covered promptFor only).
-    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor || this.s.question || this.s.reasonFor) { this.bangPending = true; return; }
+    // Wave 16 (6): guard parity with sendShellNotes — an account switch in
+    // flight on either side holds the notes as bangPending too, instead of
+    // starting an automatic turn agent.send refuses mid-switch.
+    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor || this.s.question || this.s.reasonFor || this.accountSwitching || this.agent?._switching) { this.bangPending = true; return; }
     this.bangPending = false;
     const notes = this.bangNotes || [];
     if (!notes.length) return;
@@ -1422,7 +1936,11 @@ export class Controller {
   async sendShellNotes() {
     // deep c1 #1: same guard as sendBangNotes — a picker answer or a decline
     // reason in progress waits, instead of an unrelated automatic turn starting.
-    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor || this.s.question || this.s.reasonFor) { this.shellPending = true; return; }
+    // Wave11 (1): while an account switch is being prepared, do not even try to
+    // send — agent.send refuses mid-switch, and the failed send used to print a
+    // bogus turn-end and leave the note dangling. Hold it as pending; the
+    // 'account' handler then shows it as a screen note only and clears it.
+    if (this.s.busy || this.addingAccount || this.loggingIn || this.s.promptFor || this.s.question || this.s.reasonFor || this.accountSwitching || this.agent?._switching) { this.shellPending = true; return; }
     this.shellPending = false;
     const notes = this.shellNotes || [];
     if (!notes.length) return;
@@ -1434,12 +1952,95 @@ export class Controller {
     try { await this.agent.send(notes.join('\n\n'), {display: cmds.map(c => '⏺ ' + c).join('\n')}); }
     catch (e) { this.shellNotes = [...notes, ...(this.shellNotes || [])]; if (this.s.busy) { this.set({busy: false}); this.push({type: 'end', ok: false, error: e.message}); } }
   }
-  // The full output of a call, for /output (the last 30); returns its line count for the "… N more" hint.
+  // The full output of a call, for /output (the last 30; at most outputsMaxChars of
+  // text is held in memory, the rest spilled to disk — stage 2); returns its line
+  // count for the "… N more" hint.
   keepOutput(call, output) {
-    const text = frames(String(output || '')).trimEnd();
-    if (text) { this.outputs.push({id: call.id, at: Date.now(), command: call.command, summary: call.summary || '', text}); if (this.outputs.length > 30) this.outputs.shift(); }
+    // Sanitised on the way in (frames first, for the \r collapse — see tool-output):
+    // what is kept here is drawn again by /output and ctrl+o as plain terminal text,
+    // so a raw escape kept verbatim (an OSC 52 in command output) would be executed
+    // by the terminal then, long after the call itself finished.
+    const text = stripEmbeds(frames(String(output || ''))).trimEnd();
+    if (text) {
+      this.outputs.push({id: call.id, at: Date.now(), command: call.command, summary: call.summary || '', text});
+      if (this.outputs.length > OUTPUTS_MAX_ITEMS) this.discardOutput(this.outputs.shift());
+      this.spillOutputs();
+    }
     return text ? text.split('\n').length : 0;
   }
+  // Two caps, kept separate. Memory: at most outputsMaxChars of text is held in
+  // memory; past that the oldest in-memory texts spill, oldest first, to this
+  // process's outputs folder (the entry keeps {file, size}) and still read back
+  // in full — no entry is ever dropped to satisfy this cap. A write failure keeps
+  // the text in memory instead: losing output is worse than holding it.
+  // Disk: the spill folder is bounded at 4x outputsMaxChars of spilled bytes
+  // in total — the folder total across every Controller sharing it, counted
+  // in real UTF-8 bytes (wave 18 (C)); past that the oldest SPILLED entries
+  // of this conversation lose their spill — the file is
+  // deleted and the entry remains with neither text nor file, which is how a
+  // kept output whose text is gone already presents (outputText reads it as '').
+  // A single output larger than the disk cap has no truncation convention in
+  // this module — kept outputs are lossless — so it spills whole and stays as
+  // the only spilled entry, alone over the disk cap.
+  spillOutputs() {
+    let held = 0; for (const o of this.outputs) if (o.text) held += o.text.length;
+    for (const o of this.outputs) {
+      if (held <= this.outputsMaxChars) break;
+      if (!o.text) continue;
+      const n = o.text.length;
+      if (this.spillOutput(o)) held -= n;
+    }
+    // Wave 18 (C): the disk cap bounds the FOLDER, not this conversation.
+    // The default outputs dir is per-pid, so every conversation of one
+    // resident Server spills into the same folder; counting only this
+    // Controller's entries let the folder reach the cap times the number of
+    // conversations. Count every spill file in the folder — eviction can
+    // still only drop THIS conversation's files (another conversation's
+    // spills are its own to drop), so the loop also stops when this side is
+    // down to its last spilled entry, as with one oversize entry above.
+    const diskMax = this.outputsMaxChars * 4;
+    let folderBytes = this.spillFolderBytes();
+    while (folderBytes > diskMax) {
+      const spilledEntries = this.outputs.filter(o => o.file);
+      if (spilledEntries.length <= 1) break; // one oversize entry, kept whole (above)
+      const oldest = spilledEntries[0];
+      folderBytes -= oldest.size || 0;
+      this.discardOutput(oldest); delete oldest.file; delete oldest.size;
+    }
+  }
+  // Total bytes of the spill files in this Controller's outputs folder —
+  // this conversation's and every other Controller sharing the folder alike,
+  // measured on disk (real UTF-8 bytes). Falls back to this conversation's
+  // own spilled sizes when the folder cannot be listed.
+  spillFolderBytes() {
+    let names = null;
+    try { names = fs.readdirSync(this.outputsDir); } catch {}
+    if (!names) { let own = 0; for (const o of this.outputs) if (o.file) own += o.size || 0; return own; }
+    let total = 0;
+    for (const name of names) { try { const st = fs.statSync(path.join(this.outputsDir, name)); if (st.isFile()) total += st.size; } catch {} }
+    return total;
+  }
+  spillOutput(o) {
+    try {
+      fs.mkdirSync(this.outputsDir, {recursive: true});
+      const file = path.join(this.outputsDir, String(o.at) + '-' + this.outputTag + '-' + (++this.outputSeq) + '.txt');
+      fs.writeFileSync(file, o.text);
+      // Wave 18 (C): size is the file's real size in UTF-8 bytes, not the
+      // UTF-16 length — Japanese text is 3 bytes per character on disk, so
+      // the length understated it up to 3x and the disk cap under-enforced.
+      o.file = file; o.size = Buffer.byteLength(o.text, 'utf8'); delete o.text;
+      return true;
+    } catch { return false; }
+  }
+  discardOutput(o) { if (o && o.file) { try { fs.unlinkSync(o.file); } catch {} } }
+  // The full text of a kept output, wherever it currently lives.
+  outputText(o) {
+    if (!o) return '';
+    if (typeof o.text === 'string') return o.text;
+    if (o.file) { try { return fs.readFileSync(o.file, 'utf8'); } catch { return ''; } }
+    return '';
+  }
+  cleanupOutputs() { try { fs.rmSync(this.outputsDir, {recursive: true, force: true}); } catch {} }
   // !command: the user's own shell command, run here without Muse or approval. Its output
   // goes to Muse with the next message, as in Claude Code's bash mode.
   async bang(cmd) {
@@ -1459,7 +2060,9 @@ export class Controller {
     // Its own row, not `running`: during a turn Muse's next call took the row over, and the
     // command's end then cleared the row of the call Muse still had running.
     this.set({bangRunning: {call, tail: []}});
-    const onOut = chunk => { const r = this.s.bangRunning; if (!r || r.call !== call) return; const lines = frames(chunk).split('\n').filter(l => l.trim()); this.set({bangRunning: {...r, tail: [...r.tail, ...lines].slice(-5)}}); };
+    // The live tail is sanitised per line, like Muse's streaming tool output: drawn
+    // raw, an escape in the command's output would be executed by the terminal live.
+    const onOut = chunk => { const r = this.s.bangRunning; if (!r || r.call !== call) return; const lines = frames(chunk).split('\n').map(l => stripEmbeds(frames(l))).filter(l => l.trim()); this.set({bangRunning: {...r, tail: [...r.tail, ...lines].slice(-5)}}); };
     try {
       const stop = this.bangStop = new AbortController();
       const r = await LOCAL['system.run'].run({command: cmd}, this.agent.ctx, stop.signal, onOut);
@@ -1467,12 +2070,20 @@ export class Controller {
       mention.invalidate?.(this.agent.cwd); // a !command may have created files too
       // Kept for /output like Muse's commands: past the 12 lines on screen it could not be seen at all.
       const outputLines = this.keepOutput(call, stripEmbeds(frames(r.payload.stdout + (r.payload.stderr ? '\n' + r.payload.stderr : ''))));
-      this.push({type: 'tool', call: {...call, ok: true, outputLines, view: {...r.view, tail: stripEmbeds(frames(r.payload.stdout + r.payload.stderr)).trimEnd().split('\n').slice(-12)}}});
+      // Wave 10: the row's ok follows the exit code, as Muse's own tool rows do —
+      // a command that failed (or was stopped) used to show ok:true whatever happened.
+      // A run adopted into the background on timeout has no exit code yet and is not a failure.
+      const ok = r.payload.backgrounded ? true : r.payload.exit_code === 0;
+      this.push({type: 'tool', call: {...call, ok, outputLines, view: {...r.view, tail: stripEmbeds(frames(r.payload.stdout + r.payload.stderr)).trimEnd().split('\n').slice(-12)}}});
       // The end is kept too, and the cut is said: the first 20,000 characters alone dropped the
       // errors at the bottom of a long build and all of stderr, without a word.
       const out = stripEmbeds(r.payload.stdout + (r.payload.stderr ? '\n' + r.payload.stderr : ''));
       const sent = out.length > BANG_NOTE ? out.slice(0, BANG_NOTE * 0.3) + '\n… (' + (out.length - BANG_NOTE) + ' characters cut here) …\n' + out.slice(-BANG_NOTE * 0.7) : out;
-      (this.bangNotes ||= []).push('[The user ran this in the terminal: ' + cmd + ']\nexit ' + r.payload.exit_code + '\n' + sent);
+      // Wave 10: a command the user stopped reads in the note exactly like any other
+      // nonzero exit, so Muse could not tell "it failed" from "the user stopped it".
+      // Say so, in so many words, ahead of the exit line.
+      const stopped = r.payload.killed === 'cancelled' || r.view?.killed === 'cancelled';
+      (this.bangNotes ||= []).push('[The user ran this in the terminal: ' + cmd + ']\n' + (stopped ? 'The user stopped this command before it finished (cancelled).\n' : '') + 'exit ' + r.payload.exit_code + '\n' + sent);
       if (switchValue('bangAutoSend')) this.sendBangNotes();
     } catch (e) { this.set({bangRunning: null}); this.push({type: 'tool', call: {...call, ok: false, error: e.message}}); }
   }
@@ -1494,24 +2105,47 @@ export class Controller {
     // resumeEpoch (submit / turn-start) — the history is then NOT spliced under the new
     // turn and its todos are not overwritten mid-turn.
     const epoch = this.resumeEpoch = (this.resumeEpoch || 0) + 1;
-    // #175/#176: shell notes and the standing goal belong to the chat being left, the
-    // same as bangNotes/todos already were: the old chat's shell completion must not leak
-    // into the new chat's first message, and the goal shown must be the resumed chat's.
-    if (!startup) { a.session = s; a.ctx.readFiles.clear(); a.ctx.todos = []; this.bangNotes = []; this.shellNotes = []; this.shellPending = false; this.set({todos: [], goal: a.standingGoal?.() || null}); }
+    // Wave 16 (5): the session used to be repointed HERE, synchronously —
+    // a send during the load below then landed in the resumed chat even
+    // when the epoch/busy guard afterwards suppressed the resume display
+    // itself. Remember the session being left instead; the repoint (and
+    // the per-chat clearing under it) happens only after the guard has
+    // passed, so a bailed resume leaves the conversation state exactly
+    // as it was before the call.
+    const prevSession = a.session;
     // Reading the chat from Muse needs the gateway, which may still be connecting at startup.
     if (sessions.transcript(s.id).length < (s.turns || 0)) { try { await a.ensureConnected?.(); } catch {} }
     let res;
     try { res = await transcript.forResume(s, a.client); } catch { res = {turns: sessions.transcript(s.id), from: 'local'}; }
-    if (!startup && (epoch !== this.resumeEpoch || this.s.busy || a.session !== s)) return;
+    if (!startup && (epoch !== this.resumeEpoch || this.s.busy || a.session !== prevSession)) return;
+    // #175/#176: shell notes and the standing goal belong to the chat being left, the
+    // same as bangNotes/todos already were: the old chat's shell completion must not leak
+    // into the new chat's first message, and the goal shown must be the resumed chat's.
+    // Wave 16 (4): attachments and the held queue are the old chat's too —
+    // clear the attachments, and drop the queue with a note saying how
+    // many entries were cancelled (dropQueueForTransition).
+    if (!startup) { a.session = s; a.ctx.readFiles.clear(); a.ctx.todos = []; this.bangNotes = []; this.shellNotes = []; this.shellPending = false; this.dropQueueForTransition(); this.set({todos: [], goal: a.standingGoal?.() || null, attachments: []}); }
     const turns = res.turns, shown = turns.slice(-10);
+    // Wave 13: the local transcript held fewer turns than the conversation
+    // has AND the missing ones could not be fetched either (forResume fell
+    // back to the local file — no client, a failed fetch, an empty reply —
+    // or the fetch stopped at its page cap, res.partial): the header above
+    // still counts the conversation's full turns, so without a note the
+    // short display reads as if nothing were missing. Say how many of the
+    // turns are actually being shown.
+    const missingNote = (s.turns || 0) > turns.length && (res.from !== 'muse' || res.partial)
+      ? ' ' + t('{n} ターンのうち {m} ターンだけ表示しています', {n: s.turns || 0, m: shown.length}) : '';
     if (!startup || turns.length) this.note(t('↺ 再開: {title} · {n} ターン', {title: s.title || s.id, n: Math.max(s.turns || 0, turns.length)}) +
-      (turns.length > shown.length || res.partial ? t('（直近 {n} ターンを表示）', {n: shown.length}) : '') + (res.from === 'muse' ? t(' · Muse から読み込み') : ''));
+      (turns.length > shown.length || res.partial ? t('（直近 {n} ターンを表示）', {n: shown.length}) : '') + (res.from === 'muse' ? t(' · Muse から読み込み') : '') + missingNote);
     for (const t of shown) {
-      this.push({type: 'user', text: t.user || ''});
+      // A body muser itself sent (an automatic Focus / goal continuation) that an older
+      // transcript kept as the turn's user text reads as a short label, not as the
+      // whole English instruction in the user's bubble.
+      this.push({type: 'user', text: transcript.isSynthetic(t.user) ? i18n.t('（自動で続行）') : (t.user || '')});
       if (t.tools?.length || t.steps?.length) this.push({type: 'past', tools: t.tools || [], steps: t.steps || []});
       for (const report of t.progress || []) this.push({type: 'progress', ...report});
       if (t.focus) this.push({type: 'focus', focus: t.focus});
-      if (t.reply) { const md = createMd(); this.push({type: 'md', rows: md.rows(sanitizeEmbeds(String(t.reply).trimEnd()).split('\n')), first: true}, {type: 'gap'}); }
+      if (t.reply) { const md = createMd(), src = sanitizeEmbeds(String(t.reply).trimEnd()); this.push({type: 'md', rows: md.rows(src.split('\n')), src, first: true}, {type: 'gap'}); }
       if (t.error) this.push({type: 'end', ok: false, error: t.error, ms: 0});
     }
     if (!turns.length && (s.turns || 0) > 0) this.note(t('この会話の中身は読み込めませんでした。続きは送れます。'));
@@ -1525,6 +2159,11 @@ export class Controller {
   // `muser login` without leaving the TUI: the Edge window, then the new cookies into the running
   // client, then connect.
   async login() {
+    // Wave 15: the plain demo has no scripted login flow, so /login used to
+    // fall through to the REAL Edge login (login.js). Refuse instead; the
+    // login demo carries its own scripted flow (agent.loginFlow) and is
+    // unaffected.
+    if (this.agent.client?.status === 'demo' && !this.agent.loginFlow) return this.note(t('デモではログインできません。'));
     if (this.loggingIn) return;
     this.loggingIn = true;
     this.flash(t('Edge の窓で muse.ai にログインしてください…'), 300000);
@@ -1606,7 +2245,7 @@ export class Controller {
       // An auth answer (an email, a code) never starts with '/': a slash command typed at
       // one of these prompts is a command, and feeding it to the auth service as a contact
       // or a code only earns a bare HTTP 400. Abort the add instead; the user can rerun it.
-      ask: async (message, opts) => { const v = await this.promptAsk(message, opts); if (String(v).startsWith('/')) throw new Error(t('中止しました。')); return v; },
+      ask: async (message, opts = {}) => { let o = opts; if (opts && opts.initial) { const str = String(opts.initial); const at = str.indexOf('@'); const masked = at > 0 ? str.slice(0, at).slice(0, 2) + '***@' + str.slice(at + 1) : str.slice(0, 2) + '***'; o = {...opts, hint: [opts.hint, t('前回: {masked}', {masked})].filter(Boolean).join(' / ')}; } const v = await this.promptAsk(message, o); if (String(v).startsWith('/')) throw new Error(t('中止しました。')); return v; },
       confirm: message => this.menuPromise({title: message, options: [{value: true, label: t('はい')}, {value: false, label: t('いいえ')}]}),
       pick: (message, items) => this.menuPromise({title: message, options: items.map((it, i) => ({value: i, label: it.label}))}),
       close: () => {},
@@ -1645,13 +2284,26 @@ export class Controller {
       this.flash(t('アカウント {label} を追加します。', {label: name}), 300000);
       try {
         const impl = this.accountAddImpl || (opts => require('../account-add.js').addAccount(opts.label, opts));
-        const {account, same} = await impl({label: name, ui: this.accountUi(), log: s => { const line = String(s).trim().replace(/^…\s*/, ''); if (!this.flowLine(line)) this.flash(line, 300000); }});
+        const {account, same, sameCheckFailed} = await impl({label: name, ui: this.accountUi(), log: s => { const line = String(s).trim().replace(/^…\s*/, ''); if (!this.flowLine(line)) this.flash(line, 300000); }});
         this.flash('');
         this.note(t('アカウント {label} を追加しました。/account で切り替えられます。', {label: account.label}));
-        if (same) this.note(t('注意: {label} は {other} と同じ muse.ai アカウント（同じ Muse）です。使用量は共通なので、別のアカウントでログインし直すか `muser account remove {id}` で消してください。', {label: account.label, other: same.label, id: account.id}));
+        if (same) this.note(t('注意: {label} は {other} と同じ muse.ai アカウントです。使用量は共通なので、別のアカウントでログインし直すか `muser account remove {id}` で消してください。', {label: account.label, other: same.label, id: account.id}));
+        // Wave 15: a duplicate check that never ran is not "no duplicate" —
+        // account-add flags it (sameCheckFailed) and it is said here, while
+        // the user can still act on it.
+        if (sameCheckFailed) this.note(t('注意: 同じ Muse かどうかの確認ができませんでした。別のアカウントと同じ Muse だった場合、使用量は共通です。'));
       } catch (e) {
         this.flash('');
         this.note(t('アカウントを追加できませんでした: {error}', {error: e.message}), 'error');
+        // Wave 15: account-add's attached outcome travels with the error
+        // (src/account-add.js) — show it: an account whose login landed
+        // STAYS (with the command that finishes its device registration),
+        // a rollback leftover is named, and a failed rollback is said too.
+        // Without these the bare failure hid all three, and a retry only
+        // met "that name already exists".
+        if (e.accountKept) this.note(t('アカウント {label} は残っています（ログインは済んでいます）。端末登録の続きは `muser login --account {id}` で行えます。', {label: e.accountKept.label, id: e.accountKept.id}));
+        if (e.rollbackLeftover) this.note(t('巻き戻しで消せなかったものが残っています: {dir}　Edge を閉じてから削除してください。残っていると、同じ名前で追加したときに前のログインが戻ります。', {dir: e.rollbackLeftover}));
+        if (e.rollbackError) this.note(t('巻き戻しにも失敗しました: {error}', {error: e.rollbackError}), 'error');
       } finally { this.addingAccount = false; }
       }
     } finally { this.set({addFlow: null}); }
@@ -1746,10 +2398,18 @@ export class Controller {
     const a = this.agent;
     if (a.busy || this.accountSwitching) return; // a manual switch in flight: the reservation stays for the next turn end (deep c1 #9)
     const target = require('../accounts.js').get(r.id);
-    this.clearAccountReservation();
-    if (!target) { this.note(t('アカウントが見つかりません: {id}', {id: r.label}), 'error'); return; }
+    // Wave11 (4): the reservation is cleared ONLY on success. It used to be
+    // cleared before the attempt, so a failed switch silently abandoned the
+    // (possibly unattended) handover. On failure it stays — with its screen
+    // marker restored — and the next turn end retries it.
+    // Wave 15: the reserved account is GONE (removed after the reservation
+    // was made) — that is settled, not a failure to retry. Keeping the
+    // reservation re-noted this at every later turn end forever; clear it
+    // and say so once.
+    if (!target) { this.clearAccountReservation(); this.note(t('アカウントが見つかりません: {id}', {id: r.label}), 'error'); return; }
     try { await this.switchToAccount(target, {reason: 'reserved'}); }
-    catch (e) { this.note(t('アカウントを切り替えられませんでした: {error}', {error: e.message}), 'error'); return; }
+    catch (e) { this.set({accountReserved: r.label}); this.note(t('アカウントを切り替えられませんでした: {error}', {error: e.message}), 'error'); return; }
+    this.clearAccountReservation();
     return {resume: !!r.auto && turnFailed(this.lastTurnEnd)};
   }
   // After an automatic handover: the first turn on the new account (the handoff note rides it).
@@ -1760,9 +2420,15 @@ export class Controller {
   // on screen, the files being changed, and the last turns of the old chat — everything
   // the other account's Muse needs to pick the work up (src/handoff.js). Best effort:
   // any piece that fails to read is simply left out.
-  buildAccountHandoff(target, fromSession, fromLabel) {
+  buildAccountHandoff(target, fromSession, fromLabel, extra = {}) {
     const a = this.agent;
     const sess = fromSession || a.session;
+    // Wave11 (2): finished-but-uncollected sub-agent results dropped by the switch
+    // are summarised in the note. A manual switch builds the note BEFORE the
+    // switch, so read them live; a failover builds it in the 'account' handler,
+    // after the workers are gone, so the caller passes the switch's summaries.
+    let agents = extra?.agents;
+    if (!agents) { try { agents = fromSession ? (a.lastSwitchOrphans || []) : (typeof a.uncollectedAgentSummaries === 'function' ? a.uncollectedAgentSummaries() : []); } catch { agents = []; } }
     let turns = [];
     try { turns = require('../sessions.js').transcript(sess?.id) || []; } catch {}
     // The full record stays on this PC: hand the new Muse the file's path (only when it
@@ -1782,7 +2448,7 @@ export class Controller {
     } catch {}
     return require('../handoff.js').buildHandoff({
       fromLabel: fromLabel || a.accountLabel || a.accountId || '', toLabel: target.label, cwd: a.cwd,
-      sessionTitle: sess?.title || '', turns, todos: this.s.todos || [], focus, gitLines, recordPath,
+      sessionTitle: sess?.title || '', turns, todos: this.s.todos || [], focus, gitLines, recordPath, agents,
     });
   }
   // From 10 points below the limit (90% by default) every tool call re-reads the plan (one
@@ -1821,6 +2487,23 @@ export class Controller {
     const kept = this.quotaKeep.get(id);
     if (kept && (!kept.resetsAt || Date.now() < kept.resetsAt)) return;
     if (this.s.menu?.quotaChoice) return;
+    // Wave 9 (1): a plan whose resetsAt is already in the past must not become
+    // the keep record's expiry — a past expiry never suppresses, so the
+    // question would come back after every turn. Re-read the plan; a fresh
+    // plan naming a future reset replaces this one. If no future reset can
+    // be learned, "keep" is held in memory only (Infinity): once for this
+    // process, instead of a past timestamp that never holds at all. A
+    // missing resetsAt is different (audit #164): it keeps the day-long hold
+    // in decide() below and needs no re-read.
+    let keepResetsAt = null;
+    if (Number.isFinite(p?.resetsAt) && p.resetsAt <= Date.now()) {
+      let fresh = null;
+      try { fresh = await this.refreshPlan(); } catch {}
+      if (a.accountId !== id || this.accountSwitchReservation || this.s.menu?.quotaChoice) return;
+      if (this.s.approval || this.s.reasonFor || this.s.question || this.s.menu || this.s.text || this.s.promptFor || this.s.limitInput) return;
+      if (fresh && Number.isFinite(fresh.resetsAt) && fresh.resetsAt > Date.now()) p = fresh;
+      else keepResetsAt = Infinity;
+    }
     let multi = false;
     try { multi = require('../account-pool.js').multi(); } catch {}
     if (!multi) return;
@@ -1831,9 +2514,51 @@ export class Controller {
     const accounts = require('../accounts.js');
     const target = next ? accounts.get(next.id) : null;
     const label = a.accountLabel || id;
+    // Wave 8 (1): with nowhere to hand over to, the hint lumped every cause
+    // together ("all at their limit or not set up") and never said when any
+    // account comes back. Say the breakdown instead — which accounts are at
+    // their weekly limit, which have a lapsed login — plus the earliest
+    // reset among the exhausted ones, when one is known. peek() only names
+    // a winner, so the breakdown reads every status; a pool without
+    // statuses() (or a status that fits neither cause) keeps the lumped
+    // wording rather than guessing.
+    let deadHint = null;
+    if (!target && typeof a.accountPool.statuses === 'function') {
+      let all = null;
+      try { all = await a.accountPool.statuses(); } catch {}
+      if (a.accountId !== id || this.accountSwitchReservation || this.s.menu?.quotaChoice) return;
+      if (this.s.approval || this.s.reasonFor || this.s.question || this.s.menu || this.s.text || this.s.promptFor || this.s.limitInput) return;
+      if (Array.isArray(all)) {
+        const others = all.filter(s => s && s.id !== id);
+        // Wave 15: an account whose store files cannot be read (statuses()
+        // marks it unreadable) is BROKEN, not logged out — its jar reads as
+        // empty, so it used to land in the login-lapsed bucket and the hint
+        // prescribed a login that would stop on the same broken file. It
+        // gets its own bucket, as the /account list already shows it
+        // (「壊れています」).
+        const brokenDead = others.filter(s => s.unreadable || (Array.isArray(s.unreadableFiles) && s.unreadableFiles.length));
+        const loginDead = others.filter(s => !brokenDead.includes(s) && (s.available === false || s.hasLogin === false || s.device === false));
+        const quotaDead = others.filter(s => !brokenDead.includes(s) && !loginDead.includes(s) && accounts.exhausted(s));
+        if (others.length && quotaDead.length + loginDead.length + brokenDead.length === others.length) {
+          const parts = [];
+          if (quotaDead.length) parts.push(t('上限に到達: {list}', {list: quotaDead.map(s => s.label || s.id).join('、')}));
+          if (loginDead.length) parts.push(t('ログイン切れ: {list}', {list: loginDead.map(s => s.label || s.id).join('、')}));
+          if (brokenDead.length) parts.push(t('壊れています: {list}', {list: brokenDead.map(s => s.label || s.id).join('、')}));
+          deadHint = t('引き継げるアカウントがありません（{breakdown}）', {breakdown: parts.join('／')});
+          const resets = [p.resetsAt, ...quotaDead.map(s => s.plan?.resetsAt ?? s.resetsAt)].filter(v => Number.isFinite(v) && v > 0);
+          if (resets.length) deadHint += ' · ' + t('最も早いリセットは {at} です', {at: new Date(Math.min(...resets)).toLocaleString(i18n.lang(), {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'})});
+        }
+      }
+    }
     // Muse's own line for the extra ("0% used (3B tokens left)"); none bought is said plainly.
     const extra = p.topupBalance === 0 ? t('（追加購入分はありません）') : p.topupValue ? t('（追加: {value}）', {value: p.topupValue}) : '';
-    const options = [{value: 'keep', label: t('このまま追加を利用する'), desc: t('{label} で続けます。追加購入分を使います', {label}) + extra}];
+    // Wave 8 (1): with no extra bought, the keep option contradicted itself —
+    // its label and description both said "use the extra" and the description
+    // then appended "(no extra was bought)". With none bought it says
+    // plainly: go on here, and the work may stop at the limit.
+    const options = [p.topupBalance === 0
+      ? {value: 'keep', label: t('このまま続ける'), desc: t('{label} で続けます（追加購入分はありません。上限で止まることがあります）', {label})}
+      : {value: 'keep', label: t('このまま追加を利用する'), desc: t('{label} で続けます。追加購入分を使います', {label}) + extra}];
     // Mid-task the switch waits for the turn's end (a running turn lives on this account's Muse).
     if (target) options.push({value: 'switch', label: t('新しいアカウントで引き継ぐ'), desc: (this.s.busy || a.busy ? t('この作業が終わったら {label} に切り替え、引き継いだ新しいチャットで続けます', {label: target.label}) : t('{label} に切り替え、ここまでの作業を引き継いだ新しいチャットで続けます', {label: target.label})) + (typeof next.percentUsed === 'number' ? t('（週 {n}%）', {n: next.percentUsed}) : '')});
     // Unattended windows: after quotaWaitMs (60 s) without an answer, the /settings choice
@@ -1848,7 +2573,7 @@ export class Controller {
         // #164: with no resetsAt on the plan, "keep" used to hold FOREVER (the check
         // above treats a null resetsAt as unexpired) — one answer silenced the question
         // across week boundaries. Without a known reset, hold for a day and ask again.
-        this.quotaKeep.set(id, {resetsAt: p.resetsAt || Date.now() + 24 * 3600 * 1000});
+        this.quotaKeep.set(id, {resetsAt: keepResetsAt ?? (p.resetsAt || Date.now() + 24 * 3600 * 1000)});
         // With nothing bought (and nowhere to hand over to), "using the extra" was not true.
         if (p.topupBalance === 0) return this.note(auto ? t('{n} 秒答えがなかったので、{label} でこのまま続けます（追加購入分はないため、上限で止まることがあります）。', waited) : t('{label} でこのまま続けます（追加購入分はないため、上限で止まることがあります）。', {label}));
         return this.note(auto ? t('{n} 秒答えがなかったので、{label} でこのまま続けます（追加購入分を使います）。', waited) : t('{label} でこのまま続けます（追加購入分を使います）。', {label}));
@@ -1860,8 +2585,19 @@ export class Controller {
     };
     const fallbackLabel = fallback && options.find(o => o.value === fallback)?.label;
     const token = Symbol('quota');
-    this.openMenu({quotaChoice: token, title: t('週間リミットが {n}% に到達しました', {n: p.percentUsed ?? 100}),
-      hint: (target ? t('このまま追加を利用するか、新しいアカウントで引き継ぐか選んでください') : t('引き継げるアカウントがありません（どれも上限か未設定です。追加は `muser account add <名前>`）'))
+    // The title must match WHY this is exhausted (accounts.exhausted): the percent
+    // reaching the threshold is only one basis — a quotaStatus other than SUFFICIENT
+    // reaches it on its own, at 42% or with the percent unreadable. The old title
+    // always claimed the percent ('週間リミットが 42% に到達') and fabricated 100%
+    // when percentUsed was null. Say the percent reached it only when it did; a
+    // status-only reach names the usage as a fact, and an unknown percent is not shown.
+    const quotaTitle = typeof p.percentUsed === 'number' && p.percentUsed >= accounts.threshold()
+      ? t('週間リミットが {n}% に到達しました', {n: p.percentUsed})
+      : typeof p.percentUsed === 'number'
+        ? t('週間リミットに到達しました（週の使用量 {n}%）', {n: p.percentUsed})
+        : t('週間リミットに到達しました');
+    this.openMenu({quotaChoice: token, title: quotaTitle,
+      hint: (target ? (p.topupBalance === 0 ? t('このまま続けるか、新しいアカウントで引き継ぐか選んでください') : t('このまま追加を利用するか、新しいアカウントで引き継ぐか選んでください')) : deadHint || t('引き継げるアカウントがありません（どれも上限か未設定です。追加は `muser account add <名前>`）'))
         + (fallbackLabel ? ' · ' + t('{n} 秒答えがなければ「{action}」', {n: Math.ceil(this.quotaWaitMs / 1000), action: fallbackLabel}) : ''),
       options, pick: v => decide(v)});
     clearTimeout(this.quotaTimer);
@@ -1890,6 +2626,10 @@ export class Controller {
     if (accounts.exhausted({percentUsed: p.percentUsed, quotaStatus: p.quotaStatus}, threshold)) return;
     const warned = this.quotaWarnedFor.get(a.accountId);
     if (warned && (!warned.resetsAt || Date.now() < warned.resetsAt)) return;
+    // Wave 9 (1): whether this plan's resetsAt is already past is judged
+    // HERE, on the plan as handed in — a reset still in the future at this
+    // point is this week's key even if it lapses during the peek below.
+    const planStale = Number.isFinite(p?.resetsAt) && p.resetsAt <= Date.now();
     let multi = false;
     try { multi = require('../account-pool.js').multi(); } catch {}
     if (!multi) return;
@@ -1897,10 +2637,23 @@ export class Controller {
     try { next = a.accountPool.peek ? await a.accountPool.peek(new Set([a.accountId])) : null; } catch {}
     // A switch during the read: this plan and this prediction belong to the old account.
     if (accountId && accountId !== a.accountId) return;
+    // Wave 9 (1): a stale plan (planStale above) must not be saved as the
+    // record's expiry — a past timestamp never suppresses, so the warning
+    // would repeat after every turn. Re-read the plan and save the fresh
+    // future reset when one is known; when none is, hold the warning in
+    // memory only (Infinity): once for this process.
+    let resetsAt = p.resetsAt;
+    if (planStale) {
+      let fresh = null;
+      try { fresh = await this.refreshPlan(); } catch {}
+      if (accountId && accountId !== a.accountId) return; // a switch during the re-read: do not eat the warning
+      if (fresh && Number.isFinite(fresh.resetsAt) && fresh.resetsAt > Date.now()) resetsAt = fresh.resetsAt;
+      else resetsAt = Infinity;
+    }
     // deep c1 #3: without a resetsAt the record used to hold forever (the guard
     // above treats null as unexpired), so the warning never came again — across
     // week boundaries, until a restart. quotaKeep's #164 fix is the twin: a day.
-    this.quotaWarnedFor.set(a.accountId, {resetsAt: p.resetsAt || Date.now() + 24 * 3600 * 1000});
+    this.quotaWarnedFor.set(a.accountId, {resetsAt: resetsAt || Date.now() + 24 * 3600 * 1000});
     const base = {label: a.accountLabel || a.accountId, n: p.percentUsed, threshold};
     this.note(next ? t('{label} の週の使用量が {n}% です（{threshold}% で、続けるか引き継ぐかを確認します）。引き継ぐなら {next} が軽いです。', {...base, next: next.label})
                    : t('{label} の週の使用量が {n}% です（{threshold}% で、続けるか引き継ぐかを確認します）。', base));
@@ -1922,65 +2675,228 @@ export class Controller {
   // /output: a tool call's whole output. Saved to a file every time; shown in full up to 400 lines,
   // else its last 200 lines and where the file is.
   showOutput(o) {
+    const text = this.outputText(o); // a spilled output (stage 2) is read back from its file
     let file = '';
     try {
       const dir = path.join(os.tmpdir(), 'muser-output'); fs.mkdirSync(dir, {recursive: true});
       file = path.join(dir, new Date(o.at).toISOString().replace(/[:.]/g, '-') + '-' + o.command.replace(/[^\w.-]/g, '') + '.txt');
-      fs.writeFileSync(file, o.text + '\n');
+      fs.writeFileSync(file, text + '\n');
     } catch {}
-    const lines = o.text.split('\n'), long = lines.length > 400;
+    const lines = text.split('\n'), long = lines.length > 400;
     this.note([c.bold(o.command + '  ' + o.summary), ...(long ? [c.faint(t('… 先頭の {n} 行は省略', {n: lines.length - 200}))] : []), ...(long ? lines.slice(-200) : lines),
       ...(file ? ['', c.faint(t('全文: {file}', {file}))] : [])]);
   }
   // At every start (src/update.js): the footer says "checking for updates…", then shows a newer
   // version until /update installs it. A failed check just clears the footer.
+  // Wave 12 throttling: the last check (time + outcome) is recorded in
+  // ~/.muser/update-check.json, and while it is fresh — 6 h after a success,
+  // 1 h after a failure — this automatic check is skipped and the recorded
+  // result stands in for it, so an offline stretch does not re-pay the
+  // registry timeout on every start. /update (runUpdate) never consults the
+  // record: a manual check always asks the registry.
   checkUpdate() {
     if (!update.enabled()) return Promise.resolve(null);
+    const recent = update.recentCheck();
+    if (recent) {
+      this.set({update: recent.ok && update.newer(recent.latest, this.version) ? {latest: recent.latest} : null});
+      return Promise.resolve(recent.ok ? recent.latest : null);
+    }
     this.set({update: {checking: true}});
-    return update.latest().then(v => { this.set({update: update.newer(v, this.version) ? {latest: v} : null}); return v; }, () => { this.set({update: null}); return null; });
+    return update.latest().then(v => { update.recordCheck({ok: true, latest: v}); this.set({update: update.newer(v, this.version) ? {latest: v} : null}); return v; }, () => { update.recordCheck({ok: false}); this.set({update: null}); return null; });
   }
   async runUpdate() {
+    // Wave 15: /update installs for real — in the demo it refuses, like the
+    // other demo guards, before anything is checked or installed.
+    if (this.agent.client?.status === 'demo') return this.note(t('デモでは更新できません。'));
     if (update.devCheckout()) return this.note(t('この muser は git から動いている開発用なので、/update では更新しません（git pull で更新してください）。'));
+    // Like the other heavy commands (/export, /reload): never install over
+    // work in flight — say so instead of running anyway (wave 7).
+    if (this.s.busy || this.agent.busy) return this.note(t('作業中は更新できません。終わってから /update してください。'));
     if (this.updating) return;
+    // A successful install does not change THIS window: it keeps running the
+    // old version until it is reopened. Remember the installed version, so a
+    // second /update in the same window prompts a restart instead of
+    // installing all over again (wave 7).
+    if (this.updatedVersion) return this.note(t('すでに {version} に更新済みです。muser を再起動して開き直してください。', {version: 'v' + this.updatedVersion}));
     this.updating = true;
     try {
       // Ask npm first: "already the latest" and "could not check" read the same before.
       this.flash(t('新しい版を確認しています…'), 20000);
       let v;
-      try { v = await update.latest(); }
-      catch (e) { this.flash(''); return this.note(t('npm で新しい版を確認できませんでした（{error}）。', {error: e.message}), 'error'); }
-      if (!update.newer(v, this.version)) { this.flash(''); this.set({update: null}); return this.note(t('muser は最新版です（v{version}）。', {version: this.version})); }
-      this.flash(t('muser を更新しています（npm install -g muser-cli@latest）…'), 300000);
-      const r = await update.install();
+      try { v = await update.latest(); update.recordCheck({ok: true, latest: v}); }
+      catch (e) { update.recordCheck({ok: false}); this.flash(''); return this.note(t('npm で新しい版を確認できませんでした（{error}）。', {error: e.message}), 'error'); }
+      if (!update.newer(v, this.version)) {
+        this.flash(''); this.set({update: null});
+        // The registry behind this build (a private / pre-release build, or a
+        // registry rollback): say the local version is AHEAD of it, instead of
+        // calling it "the latest" (wave 7).
+        if (v && update.newer(this.version, v)) return this.note(t('レジストリより新しい版を使っています（v{version}。レジストリの最新は v{registry} です）。', {version: this.version, registry: v}));
+        return this.note(t('muser は最新版です（v{version}）。', {version: this.version}));
+      }
+      // Wave 12: install the version just checked and shown, pinned — not the
+      // floating @latest, which can move between the check and the install
+      // and would leave the completion note naming a version that never landed.
+      this.flash(t('muser を更新しています（npm install -g muser-cli@{version}）…', {version: v}), 300000);
+      const r = await update.install({version: v});
       this.flash('');
-      if (!r.ok) return this.note([t('更新できませんでした:'), ...r.output.split('\n').slice(-6)], 'error');
+      if (!r.ok) {
+        const lines = String(r.output || '').split('\n');
+        // Only the last 6 lines are shown: say how much was left out,
+        // instead of cutting the rest silently (wave 7).
+        return this.note([t('更新できませんでした:'), ...(lines.length > 6 ? [t('… 先頭の {n} 行は省略', {n: lines.length - 6})] : []), ...lines.slice(-6)], 'error');
+      }
       this.set({update: null});
-      this.note(t('muser を {version} に更新しました。muser -c で開き直すと新しい版で続きから使えます。', {version: v ? 'v' + v : t('最新版')}));
+      // Say the version that actually landed, as install() read it back —
+      // not just the version the check saw (wave 12).
+      const installed = r.installedVersion || v;
+      this.updatedVersion = installed || null;
+      const id = this.agent.session?.id;
+      // A window attached to the resident Server (a hosted Controller has no
+      // onReload of its own: serve / the Server build it that way) keeps
+      // talking to the Server's old code — reopening the window alone does
+      // not make it the new version. Name the way back into this conversation.
+      // Wave 12: the resume guidance names what is resumed — this folder's
+      // previous conversation — and its ID when there is one: `muser -c`
+      // resumes by folder, so opening again from another folder would resume
+      // a different conversation, and the ID is the unambiguous way back.
+      if (!this.onReload) {
+        return this.note([t('muser を {version} に更新しました。', {version: installed ? 'v' + installed : t('最新版')}),
+          t('この窓は常駐 Server に繋がっているため、Server を入れ直すまで新版にはなりません。'),
+          ...(id ? [t('このフォルダーの直前の会話の続きから再開するには: muser resume {id}', {id})] : [t('このフォルダーの直前の会話は、muser -c で開き直すと再開できます。')])]);
+      }
+      this.note(id
+        ? t('muser を {version} に更新しました。muser -c で開き直すと、新しい版でこのフォルダーの直前の会話から使えます（会話 ID: {id}）。', {version: installed ? 'v' + installed : t('最新版'), id})
+        : t('muser を {version} に更新しました。muser -c で開き直すと、新しい版でこのフォルダーの直前の会話から使えます。', {version: installed ? 'v' + installed : t('最新版')}));
     } finally { this.updating = false; }
   }
   // /skills: every skill found (muser's own, the project's, Claude Code's, Codex's), each one a
-  // toggle; whole sources can be switched off too. Changes apply to chats started afterwards.
+  // toggle; whole sources can be switched off too. What a toggle changes, and when (wave 10):
+  // the preamble's list is built when a conversation starts, so the LIST follows from the next
+  // conversation; skill.read and the $name candidates call load() again on every use, so
+  // reading and candidates follow at once, in this conversation too. The old hint said only
+  // 'from the next conversation', which hid the immediate half.
   skillsMenu() {
     const a = this.agent, all = skills.load(a.cwd);
-    if (!all.length) return this.note([t('スキルがありません。'), t('~/.muser/skills/<名前>/SKILL.md に置くか、Claude Code（~/.claude/skills）や Codex（~/.codex/skills）のスキルがあればそのまま読みます。')]);
+    // Skills load() skipped (a same-name loser, oversized, unreadable, a link out of its
+    // source): the menu used to just not have them, so a skipped skill looked like a
+    // missing one. They get rows of their own, with the reason and the folder, so the
+    // user can find the file; picking a row only explains — it toggles nothing.
+    const skipped = skills.diagnostics().filter(d => ['name-collision', 'too-large', 'read-error', 'linked-folder'].includes(d.reason));
+    if (!all.length && !skipped.length) return this.note([t('スキルがありません。'), t('~/.muser/skills/<名前>/SKILL.md に置くか、Claude Code（~/.claude/skills）や Codex（~/.codex/skills）のスキルがあればそのまま読みます。')]);
     const bySource = {};
     for (const s of all) (bySource[s.source] ||= []).push(s);
+    // Descriptions are cut the way preambleLines cuts them (140 chars, wave 10): the menu
+    // used to carry the full text, so one long description pushed the other rows away.
+    const cutDesc = d => d.length > 140 ? d.slice(0, 139) + '…' : d;
+    const skipReason = d => d.reason === 'name-collision' ? t('同名のスキルが優先されたため読み込まれませんでした（保持されたフォルダー: {dir}）', {dir: d.keptDir || ''})
+      : d.reason === 'too-large' ? t('SKILL.md が大きすぎるため読み込まれませんでした')
+      : d.reason === 'read-error' ? t('SKILL.md を読めなかったため読み込まれませんでした')
+      : d.reason === 'linked-folder' ? t('スキルフォルダーが読み込み元フォルダーの外へのリンクのため読み込まれませんでした')
+      : d.reason;
     const options = [
-      ...all.map(s => ({value: 'skill:' + s.name, label: (s.enabled ? '● ' : '○ ') + s.name, desc: '[' + s.source + '] ' + s.description})),
+      ...all.map(s => ({value: 'skill:' + s.name, label: (s.enabled ? '● ' : '○ ') + s.name, desc: '[' + s.source + '] ' + cutDesc(s.description)})),
+      ...skipped.map((d, i) => ({value: 'skipped:' + i, label: '✕ ' + d.name + t('（スキップ）'), desc: '[' + (d.source || '') + '] ' + skipReason(d) + (d.dir ? ' ' + d.dir : '')})),
       ...Object.entries(bySource).map(([src, list]) => {
         const on = list.some(s => s.enabled);
         return {value: 'source:' + src + ':' + (on ? 'off' : 'on'), label: t(on ? '{source} をまとめてオフ' : '{source} をまとめてオン', {source: src}), desc: t('{n} 件', {n: list.length})};
       }),
     ];
-    return this.openMenu({title: t('スキル'), hint: t('新しい会話から反映'), options, index: 0, pick: v => {
+    return this.openMenu({title: t('スキル'), hint: t('一覧は次の会話から、読み込みと候補はすぐ反映'), options, index: 0, pick: v => {
       const [kind, id, mode] = v.split(':');
-      if (kind === 'skill') { const s = skills.load(a.cwd).find(x => x.name === id); if (s) { skills.setEnabled(id, !s.enabled); this.note(t(s.enabled ? '{name} をオフにしました' : '{name} をオンにしました', {name: id})); } }
-      else { skills.setSourceEnabled(id, mode === 'on'); this.note(t(mode === 'on' ? '{source} のスキルをオンにしました' : '{source} のスキルをオフにしました', {source: id})); }
+      // A skipped row is an explanation, not a setting: it writes nothing, in demo too.
+      if (kind === 'skipped') { const d = skipped[Number(id)]; if (d) this.note(d.name + ': ' + skipReason(d)); return this.skillsMenu(); }
+      // W2F-6: skills.setEnabled / setSourceEnabled always write the real
+      // config (they have no save flag), so in demo the toggle is refused
+      // like the other settings paths refuse to persist.
+      if (a.client?.status === 'demo') { this.note(t('デモでは設定を保存しません。')); return this.skillsMenu(); }
+      if (kind === 'skill') { const s = skills.load(a.cwd).find(x => x.name === id); if (s) { skills.setEnabled(id, !s.enabled); this.note(t(s.enabled ? '{name} をオフにしました（一覧は次の会話から、読み込みと候補は今の会話でもすぐ効きます）' : '{name} をオンにしました（一覧は次の会話から、読み込みと候補は今の会話でもすぐ効きます）', {name: id})); } }
+      else { skills.setSourceEnabled(id, mode === 'on'); this.note(t(mode === 'on' ? '{source} のスキルをオンにしました（一覧は次の会話から、読み込みと候補は今の会話でもすぐ効きます）' : '{source} のスキルをオフにしました（一覧は次の会話から、読み込みと候補は今の会話でもすぐ効きます）', {source: id})); }
       this.skillsMenu();
     }});
   }
+  // /export: build this conversation's bug report (src/export.js), show what
+  // it holds section by section, and let its owner choose: send it (with or
+  // without the conversation text), save it to a file instead, or drop it.
+  // The confirmation is a menu on purpose: menus travel the snapshot
+  // protocol, so the GUI and the phone can answer exactly like this window
+  // (fullscreen and classic share this Controller). Where a confirmation
+  // cannot be shown — another menu / question / approval is already up, a
+  // turn is running, or this is the demo — the command refuses instead of
+  // sending anything unseen.
+  async exportReport() {
+    const exporter = require('../export.js');
+    const a = this.agent;
+    if (this.exporting) return;
+    if (a.client?.status === 'demo') return this.note(t('デモではレポートは送れません。'));
+    if (!a.session?.id) return this.note(t('送る会話がまだありません。'));
+    if (this.s.busy || a.busy) return this.note(t('作業中は送れません。終わってから /export してください。'));
+    if (this.s.menu || this.s.question || this.s.approval || this.s.promptFor || this.s.limitInput) return this.note(t('確認の画面が出せないため送りません。開いている選択や確認を終わらせてから /export してください。'));
+    this.exporting = true;
+    try {
+      const session = {...a.session, cwd: a.cwd || a.session.cwd, account: a.accountId || a.session.account};
+      const uiMode = switchValue('fullscreen') ? 'fullscreen' : 'classic';
+      const events = (() => { try { return this.eventRing?.list(); } catch { return undefined; } })();
+      const base = exporter.buildReport({session, includeConversation: false, uiMode, events});
+      const full = exporter.buildReport({session, includeConversation: true, uiMode, events});
+      const conversationBytes = Math.max(0, exporter.sectionSizes(full).total - exporter.sectionSizes(base).total);
+      this.note([t('送るレポートの中身（会話 {id}）:', {id: String(a.session.id).slice(0, 8)}), ...exporter.sizeLines(base, {conversationBytes})]);
+      let pick;
+      try {
+        pick = await this.menuPromise({title: t('レポートを開発者に送りますか？'), hint: t('秘密（トークン・メールアドレス・ユーザー名）は除いてあります'), options: [
+          {value: 'send', label: t('送る（会話の本文は含めない）')},
+          {value: 'send-body', label: t('会話の本文も含めて送る'), desc: t('あなたの頼みと Muse の返事も入ります')},
+          {value: 'save', label: t('送らずにファイルに保存して中身を見る')},
+          {value: 'save-body', label: t('会話の本文も含めてファイルに保存')},
+          {value: 'cancel', label: t('やめる')},
+        ]});
+      } catch { return this.note(t('送りませんでした。')); }
+      if (pick === 'cancel') return this.note(t('送りませんでした。'));
+      const report = pick === 'send-body' || pick === 'save-body' ? full : base;
+      if (pick === 'save' || pick === 'save-body') {
+        try { const file = exporter.saveReport(report); return this.note([t('送らずにファイルに書きました: {file}', {file}), t('中身を確認してから、必要なら送ってください。')]); }
+        catch (e) { return this.note(t('ファイルに書けませんでした: {error}', {error: e.message}), 'error'); }
+      }
+      this.flash(t('レポートを送っています…'), 30000);
+      try { const {id} = await exporter.sendReport(report); this.flash(''); return this.note(exporter.sentMessage(id)); }
+      catch (e) { this.flash(''); return this.note(exporter.failureMessage(e), 'error'); }
+    } catch (e) {
+      return this.note(t('レポートを作れませんでした: {error}', {error: e.message}), 'error');
+    } finally { this.exporting = false; }
+  }
   // level: 'error' notes render red in the view; plain notes are gray.
   note(lines, level) { this.push({type: 'note', lines: [].concat(lines), ...(level ? {level} : {})}); }
+  // /parity (environment comparison, stage 1; docs/design/new-features.md §10):
+  // this PC's fingerprint, saved under %LOCALAPPDATA%\muser\parity so it can
+  // be carried to another PC and diffed there (or here, with /parity diff).
+  // Naming the other PC is stage 2, which is not built: it is explained, not
+  // fetched — nothing leaves this PC.
+  parityCommand(arg) {
+    const parity = require('../parity.js');
+    const a = this.agent;
+    if (!arg || arg === 'snapshot') {
+      // Wave 15: taking the snapshot SAVES it under %LOCALAPPDATA%\muser\parity
+      // — in the demo it refuses, like the other demo guards. /parity diff
+      // below only reads files and stays available.
+      if (a.client?.status === 'demo') return this.note(t('デモでは環境の指紋を保存しません。'));
+      let snap, file;
+      try { snap = parity.collectSnapshot({cwd: a.cwd}); file = parity.saveSnapshot(snap); }
+      catch (err) { return this.note(t('環境の指紋を取れませんでした: {error}', {error: err.message}), 'error'); }
+      return this.push({type: 'parity', title: t('環境比較（この PC）'), sections: parity.snapshotSections(snap, file)});
+    }
+    if (arg === 'diff' || arg.startsWith('diff ')) {
+      const files = arg.slice(4).trim().split(/\s+/).filter(Boolean);
+      if (files.length !== 2) return this.note(t('使い方: /parity diff <A.json> <B.json>'));
+      try {
+        const pa = parity.readSnapshotFile(path.resolve(a.cwd, files[0]));
+        const pb = parity.readSnapshotFile(path.resolve(a.cwd, files[1]));
+        const items = parity.diffSnapshots(pa, pb);
+        if (!items.length) return this.note(t('違いはありません。'));
+        return this.push({type: 'parity', title: t('環境比較: {a} と {b}（違い {n} 件）', {a: files[0], b: files[1], n: items.length}), sections: parity.diffSections(items)});
+      } catch (err) { return this.note(err.message, 'error'); }
+    }
+    if (!/\s/.test(arg)) return this.note([t('「{name}」の指紋の取り寄せは段階 2 で、まだ作っていません。', {name: arg}), t('相手の PC で muser parity snapshot --out <ファイル> を実行し、そのファイルを持ってきて比べてください: /parity diff <A.json> <B.json>')]);
+    return this.note(t('使い方: /parity（この PC の指紋） /parity diff <A.json> <B.json>'));
+  }
   // /reload: restart on the current code and pick this conversation back up, so a fix made
   // during the session stops waiting for a manual restart. Work in flight would be cut
   // (and the queue lost), so it waits for a quiet moment instead of forcing it.
@@ -1997,12 +2913,228 @@ export class Controller {
     this.note(t('再起動します…'));
     return this.onReload();
   }
+  // /proof (design §2/§3): judge the last reply (or /proof <turn>) against
+  // this conversation's worklog and show the badges; when the turn added a
+  // regression test, offer the counter-proof run first (it executes tests,
+  // so it asks — /proof --yes skips the asking).
+  proofCommand(arg) {
+    const proofCore = require('../proof/index.js');
+    if (this.s.busy) return this.note(t('作業が終わってから裏取りしてください。'));
+    const id = this.agent.session?.id;
+    if (!id) return this.note(t('この会話の作業ログはありません。'));
+    const {turn, yes} = proofCore.parseProofArg(arg);
+    // The just-finished turn's lines may still sit in the writer's batch:
+    // flush first (as /worklog does), or the badges judge the previous
+    // turn's record (features-debug #41).
+    try { this.agent.flushWorklogs?.(); } catch {}
+    const r = proofCore.proofConversation(id, {turn});
+    if (r.missing) return this.note(proofCore.noWorklogLine());
+    if (r.empty) return this.note(t('その会話の作業ログは空です。'));
+    if (r.outOfRange) return this.note(proofCore.outOfRangeLine(r.want, r.count));
+    if (r.noReply) return this.note(proofCore.noReplyLine());
+    this.push({type: 'proof', title: r.lines[0], lines: r.lines.slice(1)});
+    if (r.counterPlan && r.counterPlan.status === 'ready') {
+      if (yes) { this.runCounterProof(r); return; }
+      return this.openMenu({title: t('反証テストを流しますか'), hint: r.counterPlan.command,
+        options: [{value: 'run', label: t('流す'), desc: r.counterPlan.command}, {value: 'skip', label: t('流さない'), desc: t('裏取りだけにします')}],
+        pick: v => { if (v === 'run') this.runCounterProof(r); }});
+    }
+  }
+  async runCounterProof(r) {
+    const proofCounter = require('../proof/counter.js');
+    this.flash(t('反証テストを流しています…'), 120000);
+    try {
+      const res = await proofCounter.runCounterProof({turn: r.turn, cwd: this.agent.cwd, confirmed: true});
+      this.flash('');
+      this.note(proofCounter.formatCounter(res));
+    } catch (e) { this.flash(''); this.note(e.message, 'error'); }
+  }
+  // /lore and /why: this folder's code memory (src/lore.js). Reading folds any
+  // new work-log edits into records first (best effort, local only).
+  loreSync() { try { if (switchValue('lore')) require('../lore.js').syncFromWorklog(this.agent.cwd); } catch {} }
+  loreShow(lines) { this.push({type: 'lore', title: t('言い伝え'), lines: [].concat(lines)}); }
+  loreCommand(arg) {
+    const lore = require('../lore.js');
+    if (!switchValue('lore')) return this.note(t('言い伝えは /settings でオフになっています。'));
+    const cwd = this.agent.cwd;
+    // Wave 15 (demo guards): loreSync folds the work log into records — a
+    // write — and hunch / share on|off / forget write or delete records.
+    // In the demo none of them touch the real store; the read subcommands
+    // (list, scars, graves, hunches, story, share with no argument) work.
+    const demo = this.agent.client?.status === 'demo';
+    if (!demo) this.loreSync();
+    const [sub, ...rest] = String(arg || '').split(/\s+/).filter(Boolean);
+    try {
+      if (!sub) {
+        const records = lore.readRecords(cwd), ctx = lore.repoContext(cwd);
+        const count = k => records.filter(r => r.kind === k).length;
+        return this.loreShow([
+          t('why {why} / 傷跡 {scar} / 墓標 {grave} / 仮説付箋 {hunch}', {why: count('why'), scar: count('scar'), grave: count('grave'), hunch: count('hunch')}),
+          t('置き場所: {place}', {place: ctx.shared ? t('リポジトリの .muser/lore.jsonl（共有）') : ctx.localFile}),
+          t('使い方: /lore scars /lore graves /lore hunches /lore story <ファイル> /why <ファイル>:<行>'),
+        ]);
+      }
+      if (sub === 'scars' || sub === 'graves' || sub === 'hunches') {
+        const hits = lore.listKind(cwd, {scars: 'scar', graves: 'grave', hunches: 'hunch'}[sub]);
+        if (!hits.length) return this.note(t('まだありません。'));
+        return this.loreShow(hits.slice(0, 20).map(x => lore.formatRecord(x.rec, x.loc)));
+      }
+      if (sub === 'story') {
+        if (!rest[0]) return this.note(t('使い方: /lore story <ファイル>'));
+        const hits = lore.storyFor(cwd, rest[0]);
+        if (!hits.length) return this.note(t('そのファイルの言い伝えはまだありません。'));
+        return this.loreShow(hits.map(x => lore.formatRecord(x.rec, x.loc)));
+      }
+      if (sub === 'hunch') {
+        if (demo) return this.note(t('デモでは言い伝えを変更できません。'));
+        const target = lore.parseFileLine(rest[0]), text = rest.slice(1).join(' ');
+        if (!target || !text) return this.note(t('使い方: /lore hunch <ファイル>:<行> <前提>'));
+        const rec = lore.addHunch(cwd, {path: target.file, line: target.start, text});
+        return rec ? this.note(t('仮説付箋を書きました: {id}', {id: rec.id})) : this.note(t('仮説付箋を書けませんでした（機密ファイルには書きません）。'), 'error');
+      }
+      if (sub === 'share') {
+        if (rest[0] === 'on' || rest[0] === 'off') {
+          if (demo) return this.note(t('デモでは言い伝えを変更できません。'));
+          const ctx = lore.setShared(cwd, rest[0] === 'on');
+          return this.note(ctx.shared ? t('これからの言い伝えはリポジトリの .muser/lore.jsonl に書きます（秘密は書く前に無害化します）。') : t('これからの言い伝えはこの PC の中にだけ書きます。'));
+        }
+        const ctx = lore.repoContext(cwd);
+        return this.note(ctx.shared ? t('共有: オン（リポジトリの .muser/lore.jsonl）') : t('共有: オフ（この PC の中だけ）'));
+      }
+      if (sub === 'forget') {
+        if (demo) return this.note(t('デモでは言い伝えを変更できません。'));
+        // A word swallowed as another flag's value is not itself a flag:
+        // in `forget --path --all` the `--all` is the path's value, so it
+        // must not set off a delete-everything. Scan in order and let the
+        // value-taking flags consume the word after them.
+        const opts = {all: false};
+        for (let i = 0; i < rest.length; i++) { if (rest[i] === '--all') opts.all = true; else if (rest[i] === '--kind') opts.kind = rest[++i]; else if (rest[i] === '--path') opts.path = rest[++i]; else if (rest[i] === '--id') opts.id = rest[++i]; }
+        if (!opts.all && !opts.kind && !opts.path && !opts.id) return this.note(t('使い方: /lore forget --all | --kind <種類> | --path <ファイル> | --id <id>'));
+        if (opts.path) opts.path = lore.relOf(lore.repoRoot(cwd), opts.path);
+        return this.note(t('{n} 件消しました。', {n: lore.forget(cwd, opts)}));
+      }
+      return this.note(t('使い方: /lore [scars|graves|hunches|story <ファイル>|hunch <ファイル>:<行> <前提>|share [on|off]|forget …]'));
+    } catch (e) { return this.note(t('言い伝えを扱えませんでした: {error}', {error: e.message}), 'error'); }
+  }
+  whyCommand(arg) {
+    const lore = require('../lore.js');
+    if (!switchValue('lore')) return this.note(t('言い伝えは /settings でオフになっています。'));
+    const cwd = this.agent.cwd, target = lore.parseFileLine(arg);
+    if (!target) return this.note(t('使い方: /why <ファイル>:<行>'));
+    this.loreSync();
+    try {
+      const hits = lore.whyFor(cwd, target.file, target.start), b = lore.blame(cwd, target.file, target.start), lines = [];
+      if (b) lines.push(t('git blame: {author} {date} {summary}', {author: b.author, date: b.date, summary: b.summary}));
+      if (!hits.length) lines.push(t('その行の言い伝えはまだありません。'));
+      for (const x of hits) lines.push(lore.formatRecord(x.rec, x.loc));
+      return this.loreShow(lines);
+    } catch (e) { return this.note(t('言い伝えを扱えませんでした: {error}', {error: e.message}), 'error'); }
+  }
+  // ---- bug hunt (/hunt; design §6, the core lives in src/hunt.js) ----
+  // The runner the hunt core drives: one spawned agent per assignment,
+  // polled through the same snapshots /agents shows. Audit uses the
+  // read-only explore type; fixing uses general.
+  huntRunAgent() {
+    const a = this.agent;
+    return async ({prompt, kind, tag}) => {
+      const w = a.spawn(prompt, {by: 'hunt', type: kind === 'fix' ? 'general' : 'explore', title: t('バグ狩り {tag}', {tag: tag || ''})});
+      const deadline = Date.now() + 30 * 60 * 1000;
+      for (;;) {
+        await new Promise(r => setTimeout(r, 1000));
+        const snap = a.agents().find(x => x.tag === w.tag);
+        if (!snap) throw new Error('hunt agent not found: ' + w.tag);
+        if (snap.state === 'done') return snap.result || '';
+        if (snap.state === 'failed' || snap.state === 'stopped') throw new Error(snap.error || ('hunt agent ' + snap.state + ': ' + w.tag));
+        if (Date.now() > deadline) { try { a.stopAgent(w.tag); } catch {} throw new Error('hunt agent timed out: ' + w.tag); }
+      }
+    };
+  }
+  huntCommand(arg) {
+    const hunt = require('../hunt.js');
+    const a = this.agent;
+    const words = String(arg || '').trim();
+    if (!words || words === 'status') {
+      // While a hunt runs, its state.json on disk is the freshest picture.
+      const state = hunt.readStatus(a.cwd) || this.huntState;
+      return this.push({type: 'hunt', lines: hunt.formatStatusLines(state)});
+    }
+    if (this.huntRunning) return this.note(t('バグ狩りが実行中です。'));
+    if (this.s.busy || a.busy) return this.note(t('作業中はバグ狩りを始められません。'));
+    const fixMatch = /^fix(?:\s+(\S+))?$/.exec(words);
+    if (fixMatch) {
+      let prepared;
+      try { prepared = hunt.prepareFix({cwd: a.cwd, level: fixMatch[1] || 'High'}); } catch (e) { return this.note(e.message, 'error'); }
+      if (!prepared.targets.length) return this.note(t('修正できる所見がありません。'));
+      prepared.estimate.account = a.accountLabel || a.accountId || 'default';
+      return this.openMenu({title: t('バグ狩りの修正を開始しますか？'),
+        options: [{value: 'start', label: t('開始する'), desc: hunt.formatEstimateLines(prepared.estimate)[0] + ' · ' + (prepared.targets.length === 1 ? t('対象 1 件') : t('対象 {n} 件', {n: prepared.targets.length}))},
+          {value: 'cancel', label: t('やめる')}],
+        pick: v => { if (v === 'start') this.startHuntFix(prepared); }});
+    }
+    let prepared;
+    try { prepared = hunt.prepareAudit({cwd: a.cwd, scope: words, account: a.accountId, accountLabel: a.accountLabel || a.accountId}); } catch (e) { return this.note(e.message, 'error'); }
+    return this.openMenu({title: t('バグ狩りを開始しますか？'),
+      options: [{value: 'start', label: t('開始する'), desc: hunt.formatEstimateLines(prepared.estimate)[0]},
+        {value: 'cancel', label: t('やめる')}],
+      pick: v => { if (v === 'start') this.startHuntAudit(prepared); }});
+  }
+  startHuntAudit(prepared) {
+    const hunt = require('../hunt.js');
+    const a = this.agent;
+    this.huntRunning = true;
+    this.note(prepared.estimate.agents === 1 ? t('バグ狩りを開始しました（エージェント 1 体）。') : t('バグ狩りを開始しました（エージェント {agents} 体）。', {agents: prepared.estimate.agents}));
+    hunt.runAudit(prepared, {runAgent: this.huntRunAgent(), quota: hunt.makeDefaultQuota(), account: a.accountId})
+      .then(state => { this.huntRunning = false; this.huntState = state; this.push({type: 'hunt', lines: hunt.formatStatusLines(state)}); this.note(t('バグ狩りが終わりました。')); })
+      .catch(e => { this.huntRunning = false; this.note(e.message, 'error'); });
+  }
+  startHuntFix(prepared) {
+    const hunt = require('../hunt.js');
+    const a = this.agent;
+    this.huntRunning = true;
+    this.note(prepared.targets.length === 1 ? t('修正を開始しました（対象 1 件）。') : t('修正を開始しました（対象 {n} 件）。', {n: prepared.targets.length}));
+    hunt.runFix(prepared, {runAgent: this.huntRunAgent(), quota: hunt.makeDefaultQuota(), account: a.accountId})
+      .then(r => { this.huntRunning = false; this.huntState = r.state; hunt.offerScarsToLore(r.outcomes, a.cwd); this.push({type: 'hunt', lines: hunt.formatFixSummaryLines(r.summary)}); this.note(t('修正が終わりました。')); })
+      .catch(e => { this.huntRunning = false; this.note(e.message, 'error'); });
+  }
+  // /crash [プロセス名]: line the recent falls up with the changes that came
+  // before them (src/crash-investigate.js) and hand the whole thing to Muse
+  // as a turn, as the design asks. The panel is pushed first, so the user
+  // sees the same lines even while the turn queues behind work in flight;
+  // when nothing fell, the panel is all there is (no turn is started).
+  crashCommand(arg) {
+    const crashInvestigate = require('../crash-investigate.js');
+    const filter = String(arg || '').trim();
+    this.flash(t('クラッシュを調べています…'), 20000);
+    return crashInvestigate.investigate({process: filter || undefined, cwd: this.agent.cwd}).then(rep => {
+      this.flash('');
+      this.push({type: 'crash', lines: crashInvestigate.formatLines(rep)});
+      if (rep.crashes.length) return this.submit(crashInvestigate.formatPrompt(rep));
+    }).catch(e => {
+      this.flash('');
+      this.note(t('クラッシュ調査に失敗しました: {error}', {error: e.message}), 'error');
+    });
+  }
   slash(line) {
     // The argument is the rest of the line as typed: a multi-line task after /agent or /skill had
     // its line breaks and indentation squeezed into single spaces.
     const m = /^(\S+)\s*([\s\S]*)$/.exec(line), cmd = m[1], arg = m[2], a = this.agent;
     if (cmd === '/exit' || cmd === '/quit') return this.onExit();
     if (cmd === '/help') return this.push({type: 'help'});
+    // Wave 15: commands whose work lives in agent methods the demo's
+    // scripted agent does not have (/goal → setGoal, /agent → types/spawn,
+    // /agents → agents, /hunt → spawn/agents, /focus carry → adoptFocus)
+    // used to die with a raw TypeError in the demo. They answer with the
+    // demo refusal instead. The check is the method's absence, so a
+    // stand-in that HAS the method is unaffected.
+    if (a.client?.status === 'demo') {
+      const needs = cmd === '/goal' ? ['setGoal']
+        : cmd === '/agent' || cmd === '/spawn' ? ['types', 'spawn']
+        : cmd === '/agents' ? ['agents']
+        : cmd === '/hunt' ? ['spawn', 'agents']
+        : cmd === '/focus' && (arg === 'carry' || arg.startsWith('carry ')) ? ['adoptFocus']
+        : null;
+      if (needs && needs.some(n => typeof a[n] !== 'function')) return this.note(t('デモでは {cmd} は使えません。', {cmd}));
+    }
     if (cmd === '/settings') return arg === 'agents' ? this.agentLimitsMenu() : this.settingsMenu();
     if (cmd === '/focus') {
       if (arg === 'off' || arg === 'on') {
@@ -2011,11 +3143,61 @@ export class Controller {
         a.resumeFocus = null; // an unfinished task from before the switch is not picked up by a later message
         return this.note(t('Focus 自動管理: {state}（このウィンドウのみ）', {state: a.focusEnabled ? 'on' : 'off'}));
       }
-      if (arg) return this.note(t('使い方: /focus（状態） /focus on /focus off'));
+      // Weakness 5 (2026-11-06): carry an unfinished task saved under another
+      // conversation into this one (after that conversation's Muse started
+      // refusing the work). The next message resumes it from where it stopped.
+      if (arg === 'carry' || arg.startsWith('carry ')) {
+        const ref = arg.slice('carry'.length).trim();
+        if (!ref) return this.note(t('使い方: /focus carry <会話の ID>'));
+        if (this.s.busy) return this.note(t('作業が終わってから引き継いでください。'));
+        const r = a.adoptFocus(ref);
+        if (r.ok) { this.push({type: 'focus', focus: r.focus, full: true}); return this.note(t('タスクを引き継ぎました。次のメッセージで続きから再開します。')); }
+        if (r.error === 'ambiguous') return this.note(t('その ID にあてはまる会話が複数あります。もう少し長く指定してください。'));
+        if (r.error === 'not-found') return this.note(t('その会話が見つかりません。'));
+        return this.note(t('その会話に引き継げるタスクがありません。'));
+      }
+      if (arg) return this.note(t('使い方: /focus（状態） /focus on /focus off /focus carry <会話の ID>'));
       const focus = a.focusStatus?.();
       if (focus && focus.status !== 'inactive') return this.push({type: 'focus', focus, full: true});
       return this.note(t('Focus: {state}', {state: a.focusEnabled === false ? 'off' : 'on'}));
     }
+    if (cmd === '/proof') return this.proofCommand(arg);
+    if (cmd === '/debug') {
+      // Weakness 9: this conversation's recent decision log — the last 20
+      // lines, in file order (oldest first).
+      if (arg === 'log') {
+        const id = a.session?.id;
+        if (!id) return this.note(t('この会話の判定ログはありません。'));
+        const entries = FocusLog.readFile(logFile(id), {limit: 20});
+        if (!entries.length) return this.note(t('この会話の判定ログはまだありません。Focus のタスクを実行すると記録されます。'));
+        return this.note([t('この会話の判定ログ（最新 {n} 件）:', {n: entries.length}), ...FocusLog.format(entries)]);
+      }
+      // Measurement subcommands (docs/design/memory.md, stage 0); COMMANDS now names mem/heap too (wave 6: they were hidden slashes).
+      if (arg === 'mem') return this.note(memReportLines({entries: this.s.entries, outputs: this.outputs, mem: process.memoryUsage()}));
+      if (arg === 'heap') {
+        try { const {file, bytes} = writeHeapSnapshot(); return this.note(t('ヒープスナップショットを保存しました: {file}（{mb} MB）', {file, mb: (bytes / 1024 / 1024).toFixed(1)})); }
+        catch (e) { return this.note(t('ヒープスナップショットを保存できませんでした: {error}', {error: e.message}), 'error'); }
+      }
+      return this.note([t('使い方: /debug log（この会話の判定ログ）'), t('使い方: /debug mem（メモリの内訳） /debug heap（ヒープスナップショットを保存）')]);
+    }
+    if (cmd === '/worklog') {
+      // No arguments (like /export): an argument used to be silently ignored
+      // and the log shown anyway, so a typo looked like an empty log.
+      if (arg) return this.note(t('使い方: /worklog（引数はありません）'));
+      // This conversation's work log (design §1): the last 20 events, in
+      // file order — the same shape as /debug log for the decision log.
+      // This window's own writer batches its appends, so flush it first;
+      // another window's writes to the same conversation may still be queued there.
+      const id = a.session?.id;
+      if (!id) return this.note(t('この会話の作業ログはありません。'));
+      try { a.worklogFor?.(a.main)?.flush(); } catch {}
+      const {Worklog} = require('../worklog.js');
+      const entries = Worklog.read(id).slice(-20);
+      if (!entries.length) return this.note(t('この会話の作業ログはまだありません。'));
+      return this.note([t('この会話の作業ログ（最新 {n} 件）:', {n: entries.length}), ...Worklog.format(entries)]);
+    }
+    if (cmd === '/lore') return this.loreCommand(arg);
+    if (cmd === '/why') return this.whyCommand(arg);
     if (cmd === '/goal') {
       const g = a.standingGoal?.();
       if (!arg) return this.note(g ? [t('現在のゴール: {goal}', {goal: g.text}), t('（自動続行 {legs} leg ／ 解除は /goal clear）', {legs: g.legs || 0})] : t('ゴールは設定されていません。/goal <テキスト> で設定します'));
@@ -2034,7 +3216,7 @@ export class Controller {
       if (!this.outputs.length) return this.note(t('まだ PC 操作の出力はありません。'));
       const list = [...this.outputs].reverse();
       return this.openMenu({title: t('PC 操作の出力'), index: 0,
-        options: list.map((o, i) => ({value: i, label: o.command.replace(/^code\./, '') + '  ' + String(o.summary).slice(0, 60), desc: t('{n} 行', {n: o.text.split('\n').length})})),
+        options: list.map((o, i) => ({value: i, label: o.command.replace(/^code\./, '') + '  ' + String(o.summary).slice(0, 60), desc: t('{n} 行', {n: this.outputText(o).split('\n').length})})),
         pick: i => this.showOutput(list[i])});
     }
     if (cmd === '/usage') {
@@ -2044,34 +3226,75 @@ export class Controller {
         this.note([...(p ? usage.formatPlan(p).split('\n') : [t('Muse の利用状況を読み込めませんでした（muse.ai で確認できます）')]), '', ...usage.formatSummary().split('\n')]);
       });
     }
+    if (cmd === '/export') {
+      if (arg) return this.note(t('使い方: /export（引数はありません）'));
+      return this.exportReport();
+    }
     if (cmd === '/lang') {
       // With MUSER_LANG set the environment wins on the next start, so a change here is only
       // for this run — say so, instead of letting the user think it was saved for good.
-      const langNote = v => t('言語を {lang} に切り替えました', {lang: v === 'en' ? 'English' : '日本語'}) +
+      // W2F-6: in demo the switch applies to this run only — setLang's save
+      // is off, like the other settings paths ({save: !demo}).
+      const demo = a.client?.status === 'demo';
+      const langNote = (v, saved = true) => t('言語を {lang} に切り替えました', {lang: v === 'en' ? 'English' : '日本語'}) +
+        // Wave 7: in demo the switch is not saved either — say so, like the
+        // MUSER_LANG note below, instead of letting it look saved.
+        (demo ? ' ' + t('（デモでは保存されません）') : '') +
+        // Wave 14: a save that FAILED says so too — the window has switched, but
+        // nothing was written, so the next start goes back (setLang now reports it).
+        (!demo && !saved ? ' ' + t('（保存できませんでした。この窓では切り替わりましたが、次回起動では元に戻ります）') : '') +
         (process.env.MUSER_LANG ? ' ' + t('（MUSER_LANG が設定されているため、環境変数が優先されます。この切り替えは今回の実行中だけです）') : '');
       // /lang en switches at once (the argument used to be ignored and the menu opened).
       const want = ({en: 'en', english: 'en', ja: 'ja', jp: 'ja', japanese: 'ja', '日本語': 'ja'})[arg.toLowerCase()];
-      if (want) { i18n.setLang(want); this.set({}); return this.note(langNote(want)); }
+      if (want) { const saved = i18n.setLang(want, {save: !demo}); this.set({}); return this.note(langNote(want, saved)); }
       return this.openMenu({
         title: t('表示言語'),
         options: [{value: 'en', label: 'English', desc: t('英語で表示')}, {value: 'ja', label: '日本語', desc: t('日本語で表示')}],
         index: i18n.lang() === 'en' ? 0 : 1, current: i18n.lang(),
-        pick: v => { i18n.setLang(v); this.set({}); this.note(langNote(v)); },
+        pick: v => { const saved = i18n.setLang(v, {save: !demo}); this.set({}); this.note(langNote(v, saved)); },
       });
     }
     if (cmd === '/mode' || cmd === '/permissions' || cmd === '/perm') {
       // Any case, and the words people use for them (/mode Bypass, /mode auto, /mode readonly).
       const want = arg && modeFrom(arg);
       if (arg && !want) return this.note(t('モードは {modes}', {modes: MODES.join(' / ')}));
-      if (want) { this.setMode(want); return this.note(t('承認モード: {label}', {label: t(LABELS[a.mode])})); }
+      // Wave 14: only announce the mode when setMode actually took it. A
+      // failed save already noted the failure and rolled back; following it
+      // with this success-shaped note (naming the rolled-back old mode)
+      // read as if the change had landed. In a --mode window the change is
+      // this window only — the note says so instead of implying a save.
+      if (want) { if (!this.setMode(want)) return; return this.note(a.modeExplicit ? t('承認モード: {label}（この窓だけです）', {label: t(LABELS[a.mode])}) : t('承認モード: {label}', {label: t(LABELS[a.mode])})); }
+      // Wave 13 (3): the menu — above all the 「記憶した許可を消す」 entry — is
+      // built from the permissions file's latest state, not this window's
+      // startup snapshot: keys another window remembered since then are
+      // listed here (and clearable from here), and keys it revoked are gone.
+      // The agent's refreshPermissions does the sync when it has one; a
+      // plainer agent (demo, tests) is synced straight from the file here.
+      if (a.client?.status !== 'demo') {
+        if (typeof a.refreshPermissions === 'function') a.refreshPermissions();
+        else { try { const fresh = permissions.load(a.cwd); a.allowAlways.clear(); for (const k of fresh.allow || []) a.allowAlways.add(k); if (!a.modeExplicit && fresh.mode && fresh.mode !== a.mode) { a.mode = fresh.mode; this.set({mode: fresh.mode}); } } catch {} }
+      }
       return this.openMenu({
         title: t('承認モード（権限）'),
         options: [...MODES.map(m => ({value: m, label: t(LABELS[m]), desc: t(MODE_HELP[m]), danger: m === 'bypass'})),
           ...(a.allowAlways.size ? [{value: '__forget', label: t('記憶した許可を消す'), desc: t('{n} 件: {list}', {n: a.allowAlways.size, list: [...a.allowAlways].map(k => k.replace(/^exec:/, '').replace(/^mcp:/, 'MCP ')).join(' · ').slice(0, 120)})}] : [])],
         index: MODES.indexOf(a.mode), current: a.mode,
         pick: m => {
-          if (m === '__forget') { a.allowAlways.clear(); permissions.clearAllow(a.cwd); return this.note(t('このフォルダーで記憶した許可を消しました。')); }
-          this.setMode(m); this.note(t('承認モード: {label}（このフォルダーで覚えておきます）', {label: t(LABELS[m])}));
+          if (m === '__forget') {
+            // Wave 14: a clear that THROWS (lock contention, EEXIST) is a
+            // failed clear too — permissions reports it as false now, and
+            // the try keeps any other throw from reaching the menu's
+            // generic catch as raw text. Nothing is forgotten then: the
+            // in-memory keys stay and the failure is noted, as for false.
+            let cleared = true;
+            if (a.client?.status !== 'demo') { try { cleared = permissions.clearAllow(a.cwd); } catch { cleared = false; } }
+            if (!cleared) return this.note(t('記憶した許可をファイルから消せませんでした。'));
+            a.allowAlways.clear(); return this.note(t('このフォルダーで記憶した許可を消しました。'));
+          }
+          // Wave 14: in a --mode window setMode saved nothing (this window
+          // only), so the remembered-for-this-folder note would be a lie;
+          // say it is this window only. A failed save already noted itself.
+          if (this.setMode(m)) this.note(a.modeExplicit ? t('承認モード: {label}（この窓だけです）', {label: t(LABELS[m])}) : t('承認モード: {label}（このフォルダーで覚えておきます）', {label: t(LABELS[m])}));
         },
       });
     }
@@ -2082,7 +3305,12 @@ export class Controller {
       // left behind, so its shell completion leaked into the new chat's first message
       // and its goal stayed on screen (auto-continuing) in a chat that never set it.
       a.session = sessions.create(a.cwd); a.ctx.readFiles.clear(); a.ctx.todos = []; this.bangNotes = []; this.shellNotes = []; this.shellPending = false; this.bangPending = false; // allowAlways belongs to the folder, not the chat
-      this.set({todos: [], focus: null, goal: a.standingGoal?.() || null});
+      // Wave 16 (4): attachments and the held queue belong to the old chat
+      // too — an image composed for it was silently sent into the new chat,
+      // and queued text for it was delivered there. Clear the attachments,
+      // and drop the queue with a note saying how many were cancelled.
+      this.dropQueueForTransition();
+      this.set({todos: [], focus: null, goal: a.standingGoal?.() || null, attachments: []});
       if (cmd === '/clear') return this.set({clearCount: this.s.clearCount + 1, entries: [{id: nextId++, type: 'banner'}]});
       return this.note(t('新しい会話を始めます。'));
     }
@@ -2095,11 +3323,40 @@ export class Controller {
       // digit buffer picks 10+ by number, so no slice is needed here — with
       // it, chats past the ninth were silently unreachable from the menu.
       const list = sessions.recent(a.cwd).filter(s => s.turns);
-      if (!list.length) return this.note(t('このフォルダーの過去の会話はありません。'));
       // Another account's chat is marked before it is picked (it cannot be continued here; see showResumed).
       const elsewhere = s => { const id = s.account || 'default'; if (!a.accountId || id === a.accountId) return ''; try { return ' · ' + t('アカウント {label}', {label: require('../accounts.js').get(id)?.label || id}); } catch { return ''; } };
-      if (!arg) return this.openMenu({title: t('会話を再開'), options: list.map(s => ({value: s.id, label: s.title || s.id, desc: new Date(s.updated).toLocaleString() + ' · ' + t('{n} ターン', {n: s.turns}) + elsewhere(s)})),
-        pick: id => this.showResumed(sessions.find(id))});
+      if (!arg) {
+        // Every folder's chats, a page per folder: this folder first, then the others by their
+        // newest chat; ← / → turn the pages (the list only ever showed this exact folder, so
+        // chats from a window opened elsewhere looked lost).
+        const here = String(a.cwd || '').toLowerCase(), byFolder = new Map();
+        for (const s of sessions.recent().filter(x => x.turns)) {
+          const key = String(s.cwd || '').toLowerCase();
+          if (!byFolder.has(key)) byFolder.set(key, {cwd: s.cwd || '', list: []});
+          byFolder.get(key).list.push(s);
+        }
+        const folders = [...byFolder.values()], hi = folders.findIndex(f => f.cwd.toLowerCase() === here);
+        if (hi > 0) folders.unshift(folders.splice(hi, 1)[0]);
+        if (!folders.length) return this.note(t('このフォルダーの過去の会話はありません。'));
+        const page = fi => {
+          const f = folders[fi], other = f.cwd.toLowerCase() !== here;
+          const where = other ? (f.cwd || t('（フォルダー不明）')) : t('このフォルダー');
+          this.openMenu({title: t('会話を再開') + ' · ' + where + (folders.length > 1 ? '  (' + (fi + 1) + '/' + folders.length + ')' : ''),
+            hint: [folders.length > 1 ? t('← → でほかのフォルダー') : '', other ? t('ほかのフォルダーの会話は、この窓のフォルダーで続きます') : ''].filter(Boolean).join(' · ') || undefined,
+            // Wave 8 (3): the row itself is the resume target (carried on the
+            // option, handed back by menuKey as pick's second argument). The
+            // old pick re-looked the id up with sessions.find, which refuses
+            // an id held by two entries as ambiguous and returns null — so
+            // with a duplicated id in the list, picking either row silently
+            // resumed nothing. The id lookup stays only as a fallback for a
+            // pick invoked without its option.
+            options: f.list.map(s => ({value: s.id, session: s, label: s.title || s.id, desc: new Date(s.updated).toLocaleString(i18n.lang()) + ' · ' + t('{n} ターン', {n: s.turns}) + elsewhere(s)})),
+            pick: (id, opt) => this.showResumed(opt?.session || sessions.find(id)),
+            side: d => page((fi + d + folders.length) % folders.length)});
+        };
+        return page(0);
+      }
+      if (!list.length) return this.note(t('このフォルダーの過去の会話はありません。'));
       // A number is a line of the list; an id is looked up among this folder's chats only ("/resume 12"
       // matched any session whose id began with 12, another project's included).
       // #178: the hand-rolled prefix find silently resumed the NEWEST match, bypassing
@@ -2110,21 +3367,49 @@ export class Controller {
       // the list is no longer cut at 9); a number past the range falls
       // through to the id lookup, as a digit-led id prefix did before.
       const matches = /^\d+$/.test(arg) && Number(arg) >= 1 && Number(arg) <= list.length ? [list[Number(arg) - 1]] : recentAll.filter(x => x.id === arg || x.id.startsWith(arg));
+      // W13-14: an exact id shared by 2+ of this folder's chats (a hand-edited /
+      // merged index) must not silently pick the newest exact match below —
+      // no longer spelling can tell them apart either. Refuse, naming the
+      // sharing, in the same style as the ambiguous-prefix note below. (The
+      // number path above yields a single row, so it is unaffected, as is the
+      // no-argument menu, whose rows carry their own session object.)
+      const exactMatches = matches.filter(x => x.id === arg);
+      if (exactMatches.length > 1) return this.note(t('候補が複数あります: {list} — その ID はこのフォルダーの {n} 件の会話で共有されています', {list: exactMatches.map(x => x.id).join(', '), n: exactMatches.length}), 'error');
       const s = matches.find(x => x.id === arg) || (matches.length === 1 ? matches[0] : null);
       if (!s && matches.length > 1) return this.note(t('候補が複数あります: {list} — もう少し長く指定してください', {list: matches.map(x => x.id).join(', ')}), 'error');
-      if (!s) return this.note(t('見つかりません: {arg}', {arg}));
+      if (!s) {
+        // W13-14 remainder: the arg is not an id in this folder (the numeric,
+        // exact-id, duplicate-guard and prefix-ambiguity outcomes above are
+        // all settled) — fall back to title/body search in this folder. A
+        // pure-digit arg fell through from the numeric path and is not
+        // treated as search text. Several hits open a menu whose options
+        // carry their session object, so a duplicated id still resumes the
+        // row picked, never a re-lookup by id.
+        if (!/^\d+$/.test(arg) && typeof sessions.search === 'function') {
+          const hits = sessions.search(arg, {cwd: a.cwd});
+          if (hits.length === 1) return this.showResumed(hits[0].session);
+          if (hits.length > 1) return this.openMenu({title: t('検索: {q}', {q: arg}), options: hits.map(h => { const hs = h.session; return {value: hs.id, session: hs, label: hs.title || hs.id, desc: new Date(hs.updated).toLocaleString(i18n.lang()) + ' · ' + t('{n} ターン', {n: hs.turns}) + elsewhere(hs) + (h.matchedIn === 'body' && h.snippet ? ' · ' + h.snippet : '')}; }), pick: (id, opt) => this.showResumed(opt?.session || sessions.find(id))});
+        }
+        return this.note(t('見つかりません: {arg}', {arg}));
+      }
       return this.showResumed(s);
     }
     if (cmd === '/mcp') return this.mcpMenu();
     if (cmd === '/bg' || cmd === '/shells') {
       const [sub, id] = arg.split(/\s+/);
-      if (sub === 'kill' && id) { try { a.shells.kill(id); return this.note(t('{id} を止めました', {id})); } catch (e) { return this.note(e.message, 'error'); } }
+      // Wave 8 (2): Shells.kill reports whether the kill actually landed
+      // ({killed}) — a shell that had already finished (or whose pid was
+      // already gone) answers killed:false, and the old code announced
+      // "stopped it" anyway. Only a landed kill is announced as one.
+      if (sub === 'kill' && id) { try { const r = a.shells.kill(id); return r?.killed ? this.note(t('{id} を止めました', {id})) : this.note(t('{id} はすでに終わっています', {id})); } catch (e) { return this.note(e.message, 'error'); } }
       const list = a.shells.all();
       if (!list.length) return this.note(t('バックグラウンドの処理はありません。'));
-      return this.openMenu({title: t('バックグラウンドの処理'), hint: t('/bg kill <id> で停止'), options: list.map(x => ({value: x.id, label: x.id + '  ' + x.command.slice(0, 22), desc: (x.running ? t('● 実行中 ') : t('○ 終了 exit {exit} ', {exit: x.exit})) + (x.tail.filter(Boolean).pop() || '')})),
+      return this.openMenu({title: t('バックグラウンドの処理'), hint: t('/bg kill <id> で停止'), options: list.map(x => ({value: x.id, label: x.id + '  ' + x.command.slice(0, 22), desc: (x.running ? t('● 実行中 ') : t('○ 終了 exit {exit} ', {exit: x.exit})) + stripEmbeds(x.tail.filter(Boolean).pop() || '')})),
         pick: async id => {
           const r = await a.shells.output(id, {since: 0, maxChars: 200000});
-          const full = frames(r.output).trimEnd();
+          // Sanitised like any other command output shown on screen: the shellout
+          // entry below draws these lines as-is, escapes and all otherwise.
+          const full = stripEmbeds(frames(r.output)).trimEnd();
           // The whole output is kept for /output; on screen only the last 30 lines, with the cut said.
           this.keepOutput({id: 'bg-' + id + '-' + Date.now(), command: 'shell.output', summary: id}, full);
           const lines = full.split('\n');
@@ -2158,17 +3443,155 @@ export class Controller {
     if (cmd === '/skills') return this.skillsMenu();
     if (cmd === '/skill') {
       const [, name, request] = /^(\S*)\s*([\s\S]*)$/.exec(arg);
-      const all = skills.load(a.cwd), s = all.find(x => x.name === String(name || '').toLowerCase());
+      // The name is matched the way skill.read matches it — skills.normalizeName, the one
+      // normalisation load() registers under (wave 10). The old toLowerCase-only lookup
+      // missed names whose non-name characters became '-' at load ('Foo@Bar' is registered
+      // 'foo-bar'), so /skill said there was no such skill for one skill.read finds.
+      const all = skills.load(a.cwd), s = all.find(x => x.name === skills.normalizeName(name));
       if (!name || !s) return this.note([t('使い方: /skill <名前> <頼みたいこと>'), t('スキル: {list}', {list: all.filter(x => x.enabled).map(x => x.name).join(', ') || t('（ありません）')})]);
       if (!s.enabled) return this.note(t('{name} はオフです（/skills でオンにできます）', {name: s.name}));
       return this.submit(skills.skillSentence(s.name) + ' ' + request);
     }
     if (cmd === '/status') return this.push({type: 'status'});
+    if (cmd === '/hunt') return this.huntCommand(arg);
+    if (cmd === '/crash') return this.crashCommand(arg);
+    if (cmd === '/parity') return this.parityCommand(arg);
     // In the user's language: it is their message in the chat, and AGENTS.md came out in Japanese for English users.
     if (cmd === '/init') return this.submit(t('このリポジトリを調べて、AGENTS.md を作ってください（ビルド・テスト方法、構成、規約、注意点を簡潔に）。既にあれば足りないところを更新してください。'));
+    if (cmd === '/race') return this.raceCommand(arg);
+    if (cmd === '/overnight') {
+      // Night work (src/overnight/cli.js, shared with `muser overnight`). add /
+      // list / remove / report answer at once as an 'overnight' entry; start
+      // runs in the background (its own muser exec children, in worktrees)
+      // and the morning report lands as another entry when it finishes.
+      const words = arg ? arg.split(/\s+/).filter(Boolean) : [];
+      // Wave 15: the write subcommands (add / remove / clear / start /
+      // config) touch the real queue and config — in the demo they refuse,
+      // like the other demo guards. list / estimate / report only read.
+      if (a.client?.status === 'demo' && ['add', 'remove', 'clear', 'start', 'config'].includes(words[0] || 'list')) return this.note(t('デモでは夜間作業を変更できません。'));
+      const {overnightCli} = require('../overnight/cli.js');
+      if ((words[0] || 'list') === 'start') {
+        // W2F-4: no guard existed — a second start ran concurrently. The
+        // flag stands synchronously at the entrance, before any await.
+        if (this.overnightRun) return this.note(t('夜間作業は実行中です。終わるまで待ってください。'), 'error');
+        this.overnightRun = true;
+        this.note(t('夜間作業を開始しました。終わったら報告をここに出します。'));
+        return overnightCli(['start', ...words.slice(1)], {cwd: a.cwd}).then(r => this.push({type: 'overnight', lines: r.lines})).catch(e => this.note(String(e.message || e), 'error')).finally(() => { this.overnightRun = false; });
+      }
+      return overnightCli(words.length ? words : ['list'], {cwd: a.cwd}).then(r => this.push({type: 'overnight', lines: r.lines})).catch(e => this.note(String(e.message || e), 'error'));
+    }
     const near = nearSlashCommand(cmd);
     if (near) return this.note(t('知らないコマンド: {cmd}。もしかして: {near}（/help で一覧）', {cmd, near}), 'error');
     this.note(t('知らないコマンド: {cmd}  （/help で一覧）', {cmd}), 'error');
+  }
+  // /race <頼み> （競争, src/race.js): show the estimate first and confirm in
+  // a menu, then run the race behind this window (child `muser exec`
+  // processes in their own worktrees). The result lands as a 'race' entry;
+  // the worktrees stay until the user picks a winner or discards them.
+  raceCommand(arg) {
+    // Wave 15: a race runs real child processes in real worktrees (and
+    // apply / clean write and delete there) — in the demo it refuses, like
+    // the other demo guards, before any of that is touched.
+    if (this.agent.client?.status === 'demo') return this.note(t('デモでは競争は使えません。'));
+    const race = require('../race.js');
+    // `apply <id> [n]` / `clean <id>` finish a race that was left standing
+    // (the CLI's `muser race apply/clean`): they name a stored race, not a
+    // new task — parseRaceArgs below would read them as task text and show
+    // the new-race start menu. They also work while another race runs here.
+    const words = String(arg || '').split(/\s+/).filter(Boolean);
+    if (words[0] === 'apply' || words[0] === 'clean') return this.raceApplyCommand(race, words);
+    if (this.raceRun) return this.note(t('競争は実行中です。終わるまで待ってください。'), 'error');
+    const opts = race.parseRaceArgs(arg);
+    if (!opts.task) return this.note(t('使い方: /race [--n 3] [--accounts a,b] [--max-tokens N] [--yes] <頼み>'));
+    // W2F-4: reserve synchronously here, at the entrance. The flag used to
+    // stand only inside start(), which runs after the async dirtyFiles /
+    // estimate / menu steps — a second /race --yes in that window passed
+    // the guard above and started a second race. Released by start()'s
+    // finally, by cancelling the confirm menu, or if the estimate fails.
+    this.raceRun = true;
+    const cwd = this.agent.cwd;
+    const start = async includeDirty => {
+      this.raceRun = true;
+      this.note(t('競争を始めます: {task}', {task: opts.task.slice(0, 60)}));
+      try {
+        const result = await race.runRace({cwd, task: opts.task, n: opts.n || 3, accounts: opts.accounts, maxTokens: opts.maxTokens, includeDirty, onProgress: m => this.flash(m, 4000)});
+        this.racePending = result;
+        this.push({type: 'race', lines: race.formatRaceResult(result)});
+        this.raceWinnerMenu(result);
+      } catch (e) { this.note(t('競争に失敗しました: {error}', {error: e.message}), 'error'); }
+      finally { this.raceRun = false; }
+    };
+    race.dirtyFiles(cwd).then(dirty => {
+      const lines = [...race.estimate({n: opts.n || 3, accounts: opts.accounts, maxTokens: opts.maxTokens}).lines];
+      if (dirty.length) lines.push(t('未コミットの変更が {n} 件あります。含めた状態から始めます。', {n: dirty.length}));
+      this.note(lines);
+      if (opts.yes) return start(dirty.length > 0);
+      this.openMenu({title: t('競争を始めますか？'), options: [
+        {value: 'start', label: t('始める')},
+        {value: 'cancel', label: t('やめる')},
+      ], pick: v => { if (v === 'start') start(dirty.length > 0); else this.raceRun = false; }, cancel: () => { this.raceRun = false; }});
+    }).catch(e => { this.raceRun = false; this.note(e.message, 'error'); });
+  }
+  // /race apply <id> [n] [--yes] and /race clean <id>: the slash form of the
+  // CLI's finish-a-standing-race path (bin/muser.js raceCommand). With a
+  // racer number, the diff is shown and confirmed here — the same second
+  // step raceWinnerMenu takes after a pick, without opening that menu too.
+  // Without a number, the winner menu itself opens on the loaded race.
+  raceApplyCommand(race, words) {
+    const yes = words.includes('--yes');
+    const [id, num] = words.slice(1).filter(w => w !== '--yes');
+    if (!id) return this.note(t('使い方: /race apply <ID> <番号> /race clean <ID>'));
+    const result = race.loadRace(id);
+    if (!result) return this.note(t('競争が見つかりません: {id}', {id}), 'error');
+    if (words[0] === 'clean') {
+      return race.cleanupRace(result).then(() => {
+        if (this.racePending?.id === result.id) this.racePending = null;
+        this.note(t('片付けました: {id}', {id: result.id}));
+      }).catch(e => this.note(e.message, 'error'));
+    }
+    if (num === undefined) { this.racePending = result; return this.raceWinnerMenu(result); }
+    const index = Number(num);
+    if (!result.racers.some(r => r.index === index)) return this.note(t('競争が見つかりません: {id}', {id: num}), 'error');
+    const apply = async () => {
+      const applied = await race.applyWinner(result, index);
+      if (!applied.ok) return this.note(applied.error || t('当てられませんでした。'), 'error');
+      await race.cleanupRace(result);
+      if (this.racePending?.id === result.id) this.racePending = null;
+      // applyWinner reports empty for a winner whose patch is empty (it changed
+      // nothing): '当てました' claimed a change that never happened.
+      this.note(applied.empty ? t('変更はありませんでした。作業フォルダーを片付けました。') : t('当てました。作業フォルダーを片付けました。'));
+    };
+    const diff = race.diffText(result, index);
+    if (diff) this.note([t('{n} の差分:', {n: index}), ...diff.split('\n').slice(0, 60)]);
+    if (yes) return apply().catch(e => this.note(e.message, 'error'));
+    return this.openMenu({title: t('この差分を当てますか？'), options: [
+      {value: 'apply', label: t('当てる')},
+      {value: 'keep', label: t('当てずに残す')},
+    ], pick: async w => {
+      if (w !== 'apply') return this.note(t('当てずに残してあります: {dir}', {dir: result.dir}));
+      try { await apply(); } catch (e) { this.note(e.message, 'error'); }
+    }});
+  }
+  raceWinnerMenu(result) {
+    const race = require('../race.js');
+    this.openMenu({title: t('競争の結果が出ました。どれを使いますか？'), options: [
+      ...result.racers.filter(r => r.status !== 'skipped').map(r => ({value: r.index, label: t('{n}. {strategy}', {n: r.index, strategy: t(r.strategy.label)}), desc: t('差分 {files} ファイル +{added} −{removed}', {files: r.diff?.files || 0, added: r.diff?.added || 0, removed: r.diff?.removed || 0})})),
+      {value: 0, label: t('どれも使わない（片付ける）')},
+    ], pick: async v => {
+      if (!v) { await race.cleanupRace(result); this.racePending = null; return this.note(t('片付けました: {id}', {id: result.id})); }
+      const diff = race.diffText(result, v);
+      if (diff) this.note([t('{n} の差分:', {n: v}), ...diff.split('\n').slice(0, 60)]);
+      this.openMenu({title: t('この差分を当てますか？'), options: [
+        {value: 'apply', label: t('当てる')},
+        {value: 'keep', label: t('当てずに残す')},
+      ], pick: async w => {
+        if (w !== 'apply') return this.note(t('当てずに残してあります: {dir}', {dir: result.dir}));
+        const applied = await race.applyWinner(result, v);
+        if (!applied.ok) return this.note(applied.error || t('当てられませんでした。'), 'error');
+        await race.cleanupRace(result); this.racePending = null;
+        this.note(applied.empty ? t('変更はありませんでした。作業フォルダーを片付けました。') : t('当てました。作業フォルダーを片付けました。'));
+      }});
+    }});
   }
 }
 

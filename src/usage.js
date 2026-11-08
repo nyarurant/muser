@@ -23,6 +23,28 @@ function dayKey(d = new Date()) {
 function emptyDay() { return {turns: 0, toolCalls: 0, inChars: 0, outChars: 0}; }
 function fresh() { return {version: 1, days: {}, minutes: {}, totals: {realInTokens: 0, realOutTokens: 0}, updatedAt: null}; }
 
+// The fields this version knows, per shape. Anything else found in a stored
+// file belongs to another version's format and is carried through untouched
+// (wave 18): parseStore() used to keep only the known fields and save() then
+// rewrote the file from those alone, so a single record() from this version
+// silently erased every field a newer version had added — its day/totals
+// extras and its top-level fields — with no backup and no warning. Refusing
+// the file instead (the exec-status answer to an unknown version) is wrong
+// here: the tally must keep counting while versions are mixed, or counts
+// are lost for as long as an old window stays open. So unknown fields — and
+// an unknown version number itself — round-trip: load() carries them on
+// the store and save() writes them back verbatim.
+const REAL_KEYS = new Set(['realInTokens', 'realOutTokens']);
+const DAY_KEYS = new Set(['turns', 'toolCalls', 'inChars', 'outChars', 'inTokens', 'outTokens', 'inTextChars', 'outTextChars', 'realInTokens', 'realOutTokens']);
+const STORE_KEYS = new Set(['version', 'days', 'minutes', 'totals', 'realSince', 'updatedAt']);
+function unknownFields(obj, known) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+  return Object.fromEntries(Object.entries(obj).filter(([k]) => !known.has(k)));
+}
+// The version a store is written back as: this version's own 1, or the
+// number/string a file already carried — never a downgrade of a newer file.
+function keptVersion(v) { return typeof v === 'number' || typeof v === 'string' ? v : 1; }
+
 // Real-token windows beyond the day buckets (src/turn-usage.js numbers only):
 // a per-minute tally makes "the last hour" a real trailing window, and a
 // running total makes "all time" — the day buckets are pruned after a month,
@@ -47,7 +69,7 @@ function firstRealDay(days) {
 }
 function cleanReal(b) {
   const d = b && typeof b === 'object' && !Array.isArray(b) ? b : {};
-  return {realInTokens: num(d.realInTokens), realOutTokens: num(d.realOutTokens)};
+  return {...unknownFields(d, REAL_KEYS), realInTokens: num(d.realInTokens), realOutTokens: num(d.realOutTokens)};
 }
 
 // A corrupt store must never be silently wiped: move the bad file aside with a
@@ -63,7 +85,7 @@ function backupCorrupt(f) {
 // field goes through num(): numeric strings become numbers, junk becomes 0.
 function cleanDay(day) {
   const d = day && typeof day === 'object' && !Array.isArray(day) ? day : {};
-  const out = {turns: num(d.turns), toolCalls: num(d.toolCalls), inChars: num(d.inChars), outChars: num(d.outChars)};
+  const out = {...unknownFields(d, DAY_KEYS), turns: num(d.turns), toolCalls: num(d.toolCalls), inChars: num(d.inChars), outChars: num(d.outChars)};
   if (d.inTokens !== undefined) out.inTokens = num(d.inTokens);
   if (d.outTokens !== undefined) out.outTokens = num(d.outTokens);
   // How many of the characters the text-based estimate covers (c19 #1): the
@@ -77,16 +99,13 @@ function cleanDay(day) {
   return out;
 }
 
-function load() {
-  const f = file();
-  let raw;
-  // Only "there is no store yet" may start fresh. Any other read failure
-  // (EACCES/EPERM while another window or a scanner holds the file) used to
-  // be read as an empty store, and record() then saved that empty store plus
-  // one turn over a month of history and the all-time total (fifth f1-2).
-  // Throw instead: record() drops this one count, the data survives.
-  try { raw = fs.readFileSync(f, 'utf8'); }
-  catch (e) { if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return fresh(); throw e; }
+// Parse one store's raw text into the healed in-memory shape load()
+// returns, or null when the text is not a usable store at all (bad JSON, or
+// JSON of the wrong shape). Shared by load() and peek(): the healing rules
+// (cleanDay, legacy minute keys, totals seeded from the kept days) must be
+// exactly the same on both paths, or a peek would judge a store differently
+// from the load that follows it.
+function parseStore(raw) {
   try {
     const data = JSON.parse(raw);
     if (data && typeof data === 'object' && data.days && typeof data.days === 'object' && !Array.isArray(data.days)) {
@@ -98,7 +117,7 @@ function load() {
           const key = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z$/.test(k) ? k : legacyMinute(k);
           if (!key) continue;
           const b = cleanReal(v), had = minutes[key];
-          minutes[key] = had ? {realInTokens: had.realInTokens + b.realInTokens, realOutTokens: had.realOutTokens + b.realOutTokens} : b;
+          minutes[key] = had ? {...had, ...b, realInTokens: had.realInTokens + b.realInTokens, realOutTokens: had.realOutTokens + b.realOutTokens} : b;
         }
       }
       // A store written before the windows existed has no totals: seed them from
@@ -109,11 +128,45 @@ function load() {
       else { totals = {realInTokens: 0, realOutTokens: 0}; for (const d of Object.values(days)) { totals.realInTokens += d.realInTokens || 0; totals.realOutTokens += d.realOutTokens || 0; } }
       // When real counting began: kept once known, so it survives the month of days being pruned.
       const realSince = typeof data.realSince === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.realSince) ? data.realSince : firstRealDay(days);
-      return {version: 1, days, minutes, totals, realSince, updatedAt: data.updatedAt || null};
+      return {version: keptVersion(data.version), ...unknownFields(data, STORE_KEYS), days, minutes, totals, realSince, updatedAt: data.updatedAt || null};
     }
   } catch {}
+  return null;
+}
+
+function load() {
+  const f = file();
+  let raw;
+  // Only "there is no store yet" may start fresh. Any other read failure
+  // (EACCES/EPERM while another window or a scanner holds the file) used to
+  // be read as an empty store, and record() then saved that empty store plus
+  // one turn over a month of history and the all-time total (fifth f1-2).
+  // Throw instead: record() drops this one count, the data survives.
+  try { raw = fs.readFileSync(f, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return fresh(); throw e; }
+  const store = parseStore(raw);
+  if (store) return store;
+  // A corrupt store must never be silently wiped: move the bad file aside
+  // (backupCorrupt) and only then start empty, so the original bytes survive.
   backupCorrupt(f);
   return fresh();
+}
+
+// Read-only look at the store, for checks that must not change anything
+// (muser doctor, wave 13 F1): load() moves a corrupt usage.json aside as a
+// side effect, so a mere inspection renamed the user's file and then
+// reported a clean "0 turns" over the wreckage. peek() never writes,
+// renames or deletes: it returns the parsed store (fresh() when there is
+// none or it is unusable) plus whether a file is there and whether it is
+// corrupt, so the caller can SAY it is broken instead of hiding it. A read
+// failure other than "no store yet" throws, exactly as load() does.
+function peek() {
+  const f = file();
+  let raw;
+  try { raw = fs.readFileSync(f, 'utf8'); }
+  catch (e) { if (e.code === 'ENOENT' || e.code === 'ENOTDIR') return {store: fresh(), exists: false, corrupt: false}; throw e; }
+  const store = parseStore(raw);
+  return store ? {store, exists: true, corrupt: false} : {store: fresh(), exists: true, corrupt: true};
 }
 
 // Atomic save: uniquely named temp file + rename, so a crash mid-write can
@@ -121,7 +174,11 @@ function load() {
 function save(store) {
   const f = file();
   fs.mkdirSync(path.dirname(f), {recursive: true});
-  const data = {version: 1, days: store.days || {}, minutes: store.minutes || {}, totals: cleanReal(store.totals), ...(store.realSince ? {realSince: store.realSince} : {}), updatedAt: new Date().toISOString()};
+  // What load() carried from another version's file is written back with it
+  // (wave 18): its version number and its unknown top-level fields — the
+  // day/minute/totals extras ride inside those buckets themselves, healed
+  // only in their known fields by cleanDay/cleanReal.
+  const data = {version: keptVersion(store.version), ...unknownFields(store, STORE_KEYS), days: store.days || {}, minutes: store.minutes || {}, totals: cleanReal(store.totals), ...(store.realSince ? {realSince: store.realSince} : {}), updatedAt: new Date().toISOString()};
   const temp = f + '.tmp-' + crypto.randomBytes(6).toString('hex');
   try {
     fs.writeFileSync(temp, JSON.stringify(data, null, 1));
@@ -275,11 +332,17 @@ function recordUnlocked(delta = {}) {
   // summary reads only the last 7. Keep a month (day keys sort as dates), pruned on record.
   const cutoffDate = new Date(); cutoffDate.setDate(cutoffDate.getDate() - 31);
   const cutoff = dayKey(cutoffDate);
-  for (const k of Object.keys(store.days)) if (/^\d{4}-\d{2}-\d{2}$/.test(k) && k < cutoff) delete store.days[k];
+  // Buckets far in the future are clock-skew garbage (written while the clock
+  // was forward): without a future-side prune they survive until real time
+  // reaches them and then resurrect as genuine today/last-hour data.
+  const futureDate = new Date(); futureDate.setDate(futureDate.getDate() + 2);
+  const futureCutoff = dayKey(futureDate);
+  for (const k of Object.keys(store.days)) if (/^\d{4}-\d{2}-\d{2}$/.test(k) && (k < cutoff || k > futureCutoff)) delete store.days[k];
   // Minute buckets only serve the last-hour window: keep a few hours of them
   // (keys sort as datetimes, like the day keys above).
   const mCutoff = minuteKey(new Date(Date.now() - 3 * 60 * 60 * 1000));
-  for (const k of Object.keys(store.minutes)) if (k < mCutoff) delete store.minutes[k];
+  const mFuture = minuteKey(new Date(Date.now() + 10 * 60 * 1000));
+  for (const k of Object.keys(store.minutes)) if (k < mCutoff || k > mFuture) delete store.minutes[k];
   save(store);
   return day;
 }
@@ -291,7 +354,16 @@ function withTokens(day) {
 }
 
 function summary() {
-  const store = load();
+  return summarize(load());
+}
+// summary() over a peek()ed store instead of a load()ed one: same numbers,
+// no side effects, and the peek's corrupt/exists flags ride along so a
+// read-only caller (doctor) can report a broken store as broken.
+function peekSummary() {
+  const p = peek();
+  return {...summarize(p.store), corrupt: p.corrupt, exists: p.exists};
+}
+function summarize(store) {
   const today = withTokens(store.days[dayKey()]);
   const last7 = emptyDay();
   let approxIn = 0, approxOut = 0, realIn = 0, realOut = 0; // summed per day, so text-estimated days and count-only days mix correctly
@@ -347,11 +419,14 @@ function bucketLine(b) {
 function formatSummary() {
   const s = summary();
   const lim = limits();
-  const {formatTokens} = require('./turn-usage');
+  const {formatUsage} = require('./turn-usage');
   // A window's real line, only when that window measured anything: the estimate
-  // lines stand alone otherwise (as today's real line always behaved).
+  // lines stand alone otherwise (as today's real line always behaved). The
+  // counts go through formatUsage so the in/out words follow the UI language
+  // too: they were built here as fixed English ('130.8k in / 395 out') and
+  // stayed English in the Japanese UI (wave 7).
   const realLine = (label, b, since) => (b.realInTokens || b.realOutTokens)
-    ? [t(label, {formatted: formatTokens(b.realInTokens || 0) + ' in / ' + formatTokens(b.realOutTokens || 0) + ' out'}) + (since ? t('（{date} から記録）', {date: sinceLabel(since)}) : '')] : [];
+    ? [t(label, {formatted: formatUsage({inputTokens: b.realInTokens || 0, outputTokens: b.realOutTokens || 0})}) + (since ? t('（{date} から記録）', {date: sinceLabel(since)}) : '')] : [];
   return [
     t('muser の記録（この PC で数えた目安）'),
     t('今日: {line}', {line: bucketLine(s.today)}),
@@ -495,14 +570,34 @@ async function plan(web) {
   throw new Error(t('Muse の利用状況を読み込めませんでした'));
 }
 
+// The Android formatPercent guard (Models.kt), ported: clamp to 0–100, at
+// most one decimal, and never round up to a 100 the value has not reached
+// nor down to a 0 it has passed. The raw server value used to be printed
+// as-is, so 99.999 / 100.4 / -3 / 0.04 all reached the screen (W6D-07).
+function formatPercent(v) {
+  if (!Number.isFinite(v)) return '0';
+  const c = Math.min(100, Math.max(0, v));
+  let s = Number.isInteger(c) ? String(c) : c.toFixed(1).replace(/\.0$/, '');
+  if (s === '100' && c < 100) s = '99.9';
+  if (s === '0' && c > 0) s = '0.1';
+  return s;
+}
+
 function formatPlan(p) {
   const locale = require('./i18n').lang() === 'en' ? 'en-US' : 'ja-JP'; // the date was Japanese in the English UI too
   const at = p.resetsAt ? new Date(p.resetsAt).toLocaleString(locale, {month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '?';
+  // A reset time already in the past was still printed in the future form
+  // '〜にリセット', as if it were still to come (W6D-11): say the scheduled
+  // time has passed instead.
+  const past = Number.isFinite(p.resetsAt) && p.resetsAt < Date.now();
+  const vars = {plan: p.plan || t('プラン不明'), percent: p.percentUsed == null ? '?' : formatPercent(p.percentUsed), at, quota: p.quotaStatus && p.quotaStatus !== 'SUFFICIENT' ? ' · ' + p.quotaStatus : ''};
   return [
     t('Muse の利用状況（muse.ai と同じ値）'),
-    t('{plan} · 週の使用量 {percent}%（{at} にリセット）{quota}', {plan: p.plan || t('プラン不明'), percent: p.percentUsed ?? '?', at, quota: p.quotaStatus && p.quotaStatus !== 'SUFFICIENT' ? ' · ' + p.quotaStatus : ''}),
+    past
+      ? t('{plan} · 週の使用量 {percent}%（リセット日時 {at} は過ぎています）{quota}', vars)
+      : t('{plan} · 週の使用量 {percent}%（{at} にリセット）{quota}', vars),
     ...(p.topupValue ? [t('追加分: {value}', {value: p.topupValue})] : []),
   ].join('\n');
 }
 
-module.exports = {record, load, save, summary, limits, formatSummary, file, dayKey, minuteKey, sinceLabel, plan, resetWeb, formatPlan, parseSubscription, shapePlan, findAction, withLock, estTokens, cleanDay};
+module.exports = {record, load, peek, save, summary, peekSummary, limits, formatSummary, file, dayKey, minuteKey, sinceLabel, plan, resetWeb, formatPlan, formatPercent, parseSubscription, shapePlan, findAction, withLock, estTokens, cleanDay};

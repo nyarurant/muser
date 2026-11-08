@@ -61,7 +61,7 @@ muser
 | Ctrl+O | 直近のツール出力を全文表示（/output で一覧から）。`--client` では出力がサーバー側にあり、クライアントは取得しないため Ctrl+O は常に空です。サーバーへ転送される `/output` を使ってください |
 | ↑↓ | 入力履歴（次回起動後も残ります） |
 
-主なスラッシュコマンド: `/help` `/settings` `/focus` `/goal` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/lang` `/login` `/account` `/update` `/reload` `/status` `/init` `/skills` `/skill` `/output` `/exit`
+主なスラッシュコマンド: `/help` `/settings` `/focus` `/goal` `/new` `/clear` `/resume` `/permissions` `/agent` `/agents` `/bg` `/mcp` `/image` `/todos` `/usage` `/export` `/lang` `/login` `/account` `/update` `/reload` `/status` `/init` `/skills` `/skill` `/output` `/exit` `/debug` `/worklog` `/proof` `/lore` `/why` `/hunt` `/race` `/overnight` `/crash` `/parity`
 
 `/settings` では、すべての設定を今の値つきで1画面にまとめて見られます（エージェント上限、Focus とその自動続行の回数・時間、1ターンのツール呼び出し上限、1日のターン数の警告、このフォルダーと新しいフォルダーの承認モード、表示言語、ベル、起動時の更新確認、スピナーのアニメーション、長いコード行の折り返し、色、kitty キー入力（この2つは次回起動から）、スキル、MCP サーバー）。オン・オフの項目は選ぶと切り替わり、数値は範囲内の整数を入力します。どれも `~/.muser/config.json`（`focus`、`focusRounds`、`focusMinutes`、`maxToolCallsPerTurn`、`dailyTurnLimit`、`defaultMode`、`bell`、`updateCheck`、`motion`、`codeWrap`、`color`、`kitty`）に保存されます。`MUSER_NO_BELL=1`、`NO_COLOR`、`MUSER_MAX_TOOL_CALLS_PER_TURN` などの環境変数があればそちらが優先され、画面にもそう表示されます。`/settings agents` でエージェント上限を直接開けます。ここでは、起動中にエージェントの同時実行数と1タスクでの合計起動数を変更できます。0以上の整数（0 は無制限）を入力し、「今回だけ適用」か「適用して既定値として保存」を選びます。実行中のエージェントはそのまま動き、新しく起動するときから制限が反映されます。保存先は `~/.muser/config.json` で、次回起動時は起動オプション・環境変数が優先されます。
 
@@ -105,7 +105,17 @@ muser
 | `muser serve [--port N]` | GUI とスマホアプリがつなぐ常駐 Muser Server を起動（127.0.0.1 のみ。接続情報は `~/.muser/gui.json` と `~/.muser/server.json` に書かれます） |
 | `muser server` / `muser server status` / `muser server stop` / `muser server autostart on\|off` | 常駐サーバーをその名前で操作: 起動 / 状態と開いている会話の表示 / 停止 / ログオン時の自動起動 |
 | `muser link` / `muser link pair [--wifi]` / `muser link revoke <名前>` / `muser link autostart on\|off` | スマホ連携: 状態とペアリング済み端末の表示 / ペアリング（QR コード、`--wifi` で同じ Wi-Fi 向けのコード方式） / 端末の取り消し / ログオン時に Server（連携込み）を起動 |
-| `muser --client` | 単独で起動せず、動いている Muser Server の会話につないで対話（サーバーが動いていなければエラー） |
+| `muser --client` | 動いている Muser Server の会話につないで対話（サーバーが動いていなければエラー）。ふつうの `muser` も Server 経由が既定で（GUI やスマホと同じ会話になります）、つなげないときだけ単独で動きます |
+| `muser --direct` | Muser Server を使わずに単独で起動（会話は GUI やスマホと共有されません） |
+| `muser peers` / `muser tell <相手> "…"` | この PC で動いているほかの muser の会話（名前・フォルダー・担当中のファイル）の一覧 / そのどれかに指示を送る。`MUSER_TELL=0` で止まります |
+| `muser log [会話]` | 会話の作業ログ（ID なしで最近の会話の一覧。`--clear` で作業ログを消す） |
+| `muser hunt [範囲]` / `muser hunt status` / `muser hunt --fix <重さ>` | バグ狩り: 並列エージェントが範囲を調べ、所見を `.muser/hunt/<時刻>/` に書く / 最新のバグ狩りの様子 / その重さ（Critical / High / Medium）の所見を直す |
+| `muser race "…"` / `muser race apply <ID> <番号>` | 同じ作業を N 個の別々の worktree で（アカウントとやり方を変えて）走らせて比べる / 勝者の差分を見る・当てる。作業中のフォルダーには触りません |
+| `muser overnight add "…"` / `muser overnight start` / `muser overnight report` | 夜の作業を並べる / 順に流す / 朝の報告を見る |
+| `muser lore …` | コードの記憶: その行がなぜそうなっているか（`why <ファイル>:<行>`）、過去に壊れた所・消したコード。この PC に残します |
+| `muser crash [プロセス]` | 最近の落ち方と、その直前の変更を並べる |
+| `muser parity snapshot` / `muser parity diff <A> <B>` | この PC の環境の指紋（OS・ツールの版・PATH・ロックファイル）/ 2 つの違いを、原因らしい順に |
+| `muser exec --proof "…"` | 返事に証拠バッジを付ける（本当に確かめたこと、その方法） |
 
 | オプション | 説明 |
 |---|---|
@@ -163,6 +173,8 @@ Muse には各スキルの名前と短い説明だけを渡し、必要になっ
 ## 利用状況
 
 `/usage`・`muser usage`・画面下部に、muse.ai と同じ **Muse の週の使用量（%）、リセット時刻、追加分の残り**を出します。作業が終わるたびに取り直し、増えていれば「この作業で +2%」と知らせます。トークン数そのものは Muse が公開していないため出せません。
+
+**不具合の報告:** `/export`（または `muser export`）で、開発者に送るレポートを作ります。中身は版・OS・端末、設定、この会話の道具の記録と Focus の判定ログ、直近の落ちた記録で、秘密・メールアドレス・Windows のユーザー名は除いてあります。会話の本文は、含めると選んだときだけ入ります。送る前に中身を項目ごとに見せ、「送る」を選ぶまでは何も送りません（送らずにファイルに保存して読むこともできます）。送れたら ID が出るので、不具合を伝えるときにその ID を添えてください。
 
 **複数アカウント:** `muser account add <名前>` で別の Muse アカウントを追加できます（Edge プロファイル・ログイン・端末登録はアカウントごとに分離）。2つ以上あると、起動時は週の使用量が少ない方を選び、今のアカウントのログインが切れたら別アカウントへ自動で切り替えて、画面に知らせます。週の上限に達したときは「このまま追加を利用する」か「新しいアカウントで引き継ぐ」かを選べます（90% からはツールの使用ごとに確認。60 秒答えがなければ `/settings` の「週の上限で応答がないとき」に従い、既定では追加購入分が残っていれば続け、なければ引き継いで、終わっていない作業をそのまま再開します）。切替先の Muse は会話を見ていないので、切替は常に新しいチャット（ここまでの作業の引き継ぎメモ付き）から始まり、作業の途中では切り替えません。既定のアカウント（`muser login` などが対象にするもの）は最初のアカウントのままで、変えるのは `muser account use <名前>` だけです（自動選択や切替、追加では変わりません）。`/account` で一覧と手動切替、`--account <名前>` で固定、`MUSER_NO_ACCOUNT_AUTO=1`（または `muser account auto off`）で自動選択を止められます。
 

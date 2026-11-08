@@ -115,22 +115,41 @@ test('fix1 #5: revoking a device closes its live channel on the next message', {
   assert.equal(store.remove(device.id)?.id, device.id);
   assert.equal(store.findByStatic(keyPair.publicKey), null);
   // The very next message — even a ping that used to just get a pong — ends it.
+  // app-debug #1: the phone is TOLD ({t:'revoked'}) before the close, because a
+  // bare 4403 does not survive the relay (it becomes 1000) and the app cannot
+  // otherwise tell revocation from a dropped connection.
   phone.send({t: 'ping'});
+  assert.deepEqual(await phone.recv(), {t: 'revoked'});
   await phone.closed;
   const outcome = await results[0];
   assert.equal(outcome.ok, false);
   assert.equal(outcome.reason, 'revoked');
 });
 
+test('app-debug #1: an unpaired phone is told {t:revoked} before the 4403 close', {timeout: 30000}, async t => {
+  const store = tmpStore();
+  const keys = pcKeys();
+  const {results, url} = await channelServer(t, {keys, remoteStore: store, proxy: stubProxy, pairing: null});
+  const phone = await new Phone(url, {}).start(); // unknown static key, never paired
+  assert.deepEqual(await phone.recv(), {t: 'revoked'});
+  await phone.closed;
+  const outcome = await results[0];
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, 'unpaired');
+});
+
 // --- #6: channel allowlist ------------------------------------------------------
 test('fix1 #6: unit allowlist — /api/server/* always denied, ordinary serve API allowed', () => {
-  for (const [m, p] of [['POST', '/api/server/link/pair'], ['POST', '/api/server/stop'], ['POST', '/api/server/link/revoke'], ['GET', '/api/server'], ['GET', '/api/server/events'], ['GET', '/api/server/link'], ['POST', '/api/server/link/pair?x=1']]) {
+  for (const [m, p] of [['POST', '/api/server/link/pair'], ['POST', '/api/server/stop'], ['POST', '/api/server/link/revoke'], ['POST', '/api/server'], ['GET', '/api/server/events'], ['GET', '/api/server/link'], ['POST', '/api/server/link/pair?x=1']]) {
     assert.equal(isAllowedChannelRequest(m, p), false, m + ' ' + p);
   }
-  for (const [m, p] of [['GET', '/api/state'], ['GET', '/api/entries'], ['GET', '/api/outputs'], ['GET', '/api/complete'], ['GET', '/api/changes'], ['POST', '/api/send'], ['POST', '/api/approval'], ['POST', '/api/menu'], ['POST', '/api/limit'], ['POST', '/api/mode'], ['POST', '/api/interrupt'], ['POST', '/api/shell-kill'], ['GET', '/api/s/abc/state'], ['POST', '/api/s/abc/send'], ['POST', '/api/s/abc/menu'], ['GET', '/api/sessions'], ['POST', '/api/sessions'], ['POST', '/api/sessions/xyz/open'], ['POST', '/api/sessions/xyz/close'], ['GET', '/api/state?full=1']]) {
+  // android-ui: GET /api/server (the exact path only) is the read-only
+  // standing view the GUI uses for accounts/version; setup stays denied —
+  // its answers carry credentials (gui-server says so itself).
+  for (const [m, p] of [['GET', '/api/state'], ['GET', '/api/entries'], ['GET', '/api/outputs'], ['GET', '/api/complete'], ['GET', '/api/changes'], ['POST', '/api/send'], ['POST', '/api/approval'], ['POST', '/api/menu'], ['POST', '/api/limit'], ['POST', '/api/mode'], ['POST', '/api/interrupt'], ['POST', '/api/shell-kill'], ['GET', '/api/s/abc/state'], ['POST', '/api/s/abc/send'], ['POST', '/api/s/abc/menu'], ['GET', '/api/sessions'], ['POST', '/api/sessions'], ['POST', '/api/sessions/xyz/open'], ['POST', '/api/sessions/xyz/close'], ['GET', '/api/state?full=1'], ['GET', '/api/server'], ['GET', '/api/server?x=1'], ['GET', '/api/image?path=shot.png'], ['GET', '/api/s/abc/image?path=shot.png'], ['GET', '/api/accounts'], ['POST', '/api/accounts/default'], ['POST', '/api/accounts/auto'], ['POST', '/api/accounts/rename'], ['POST', '/api/accounts/remove'], ['POST', '/api/account'], ['POST', '/api/s/abc/account'], ['POST', '/api/prompt'], ['POST', '/api/s/abc/prompt']]) {
     assert.equal(isAllowedChannelRequest(m, p), true, m + ' ' + p);
   }
-  for (const [m, p] of [['DELETE', '/api/state'], ['GET', '/api/send'], ['POST', '/api/state'], ['GET', '/api/unknown'], ['GET', '/api/%2e%2e/server/stop'], ['GET', '//api/state'], ['GET', 'http://127.0.0.1/api/state'], ['POST', '/api/sessions/xyz/delete']]) {
+  for (const [m, p] of [['DELETE', '/api/state'], ['GET', '/api/send'], ['POST', '/api/state'], ['GET', '/api/unknown'], ['GET', '/api/%2e%2e/server/stop'], ['GET', '//api/state'], ['GET', 'http://127.0.0.1/api/state'], ['POST', '/api/sessions/xyz/delete'], ['GET', '/api/setup'], ['POST', '/api/setup/answer'], ['POST', '/api/setup/start'], ['POST', '/api/setup/cancel'], ['DELETE', '/api/server'], ['PUT', '/api/server'], ['POST', '/api/accounts'], ['GET', '/api/accounts/remove'], ['POST', '/api/accounts/delete'], ['GET', '/api/account']]) {
     assert.equal(isAllowedChannelRequest(m, p), false, m + ' ' + p);
   }
   assert.equal(isAllowedChannelSubscription('/api/events'), true);
@@ -149,7 +168,7 @@ test('fix1 #6: a paired phone cannot tunnel server-admin paths, ordinary API sti
   const phone = await new Phone(url, {keyPair}).start();
   let id = 0;
   const req = async (method, p, body) => { phone.send({t: 'req', id: ++id, method, path: p, body}); return phone.recv(); };
-  for (const [m, p] of [['POST', '/api/server/link/pair'], ['POST', '/api/server/stop'], ['POST', '/api/server/link/revoke'], ['GET', '/api/server'], ['GET', '/api/server/events']]) {
+  for (const [m, p] of [['POST', '/api/server/link/pair'], ['POST', '/api/server/stop'], ['POST', '/api/server/link/revoke'], ['POST', '/api/server'], ['GET', '/api/server/events']]) {
     const res = await req(m, p, {mode: 'qr'});
     assert.equal(res.status, 403, m + ' ' + p);
     assert.equal(res.body.code, 'channel-forbidden');
@@ -164,9 +183,11 @@ test('fix1 #6: a paired phone cannot tunnel server-admin paths, ordinary API sti
   assert.equal((await req('POST', '/api/send', {text: 'hi'})).status, 200);
   assert.equal((await req('GET', '/api/s/abc123/state')).status, 200);
   assert.equal((await req('GET', '/api/sessions')).status, 200);
+  // android-ui: the read-only standing view (accounts/version) flows too.
+  assert.equal((await req('GET', '/api/server')).status, 200);
   phone.send({t: 'sub', id: 91, path: '/api/events'});
   assert.equal((await phone.recv()).t, 'ev');
-  assert.deepEqual(calls, ['POST /api/send', 'GET /api/s/abc123/state', 'GET /api/sessions']);
+  assert.deepEqual(calls, ['POST /api/send', 'GET /api/s/abc123/state', 'GET /api/sessions', 'GET /api/server']);
   assert.deepEqual(subCalls, ['/api/events']);
   phone.close();
   await phone.closed;

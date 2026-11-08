@@ -190,7 +190,17 @@ async function forResume(session, client) {
       turns = out;
     } catch {}
   }
-  return {turns, from: 'muse', partial: more && !keptUnmatched.length};
+  // Wave 15: `partial` must say "the display is missing turns the session
+  // has" in BOTH shapes the controller's missingNote relies on it for:
+  // - the fetch stopped at the page cap (more): Muse holds older turns
+  //   these pages never reached. Unmatched local turns riding along in the
+  //   merge do NOT make the fetch complete — the old
+  //   `more && !keptUnmatched.length` went silent exactly there.
+  // - the fetch completed (no more) yet the merged result still holds fewer
+  //   turns than the session counts: some turns are simply not in either
+  //   source, and with from:'muse' + partial:false the header counted the
+  //   full session.turns with no note at all.
+  return {turns, from: 'muse', partial: more || turns.length < (session.turns || 0)};
 }
 
-module.exports = {forResume, turnsFromHistory, userText};
+module.exports = {forResume, turnsFromHistory, userText, isSynthetic};

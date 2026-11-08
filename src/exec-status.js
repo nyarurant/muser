@@ -16,10 +16,19 @@
 //
 // Default place: %LOCALAPPDATA%\muser\exec\<started>-<pid>.json (the newest 50 kept);
 // `muser exec --status-file <path>` puts it where the caller wants it.
+//
+// The file is a shared surface — whatever launched the run (and anything else that can
+// read %LOCALAPPDATA%) can poll it — so free text never lands in it raw: write() passes
+// the data through the work log's sanitiser (src/worklog.js), the same redaction the
+// worklog applies to a turn, a tool summary and a reply before it keeps them. Only
+// secret-shaped values are dropped; what the run did (commands, paths, the wording
+// around a redaction) stays, so a poller still sees the shape of the work.
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const store = require('./secure-store');
 const {renameRetry} = require('./config');
+const {sanitizeText, sanitizeDeep} = require('./worklog');
 
 const KEEP = 50;
 const HEARTBEAT_MS = 10000;
@@ -28,6 +37,35 @@ const HEARTBEAT_MS = 10000;
 const STALE_MS = HEARTBEAT_MS * 3;
 const CAPS = {log: 300, toolLog: 100, steps: 50, progress: 30};
 const push = (list, item, cap) => { list.push(item); if (list.length > cap) list.splice(0, list.length - cap); };
+
+// The copy of a run's data that may reach the file (see the header): every free-text
+// field — the prompt, the last-tool line, the error, the reply, and each entry of the
+// log / progress / steps / toolLog / todos lists — goes through sanitizeText, and the
+// two structured payloads (focus, proof — its rows quote the reply sentence by
+// sentence) through sanitizeDeep, exactly as the worklog keeps them. Sanitising here,
+// at the single write, covers every way text gets in (constructor, tool(), log(),
+// progress(), step(), todos(), update(), finish()) instead of relying on each caller.
+// Identifiers a reader matches on are NOT free text and pass through untouched:
+// sanitizeDeep redacts a key named "session" outright, which would break sessionIds()
+// and the session line of summary(); state / mode / account are the same kind of
+// value. Numbers, flags and the usage counters are not text either and stay as they are.
+const ID_KEYS = new Set(['session', 'account', 'mode', 'state', 'owner']);
+function sanitizedData(d) {
+  const out = {};
+  for (const [k, v] of Object.entries(d)) out[k] = typeof v === 'string' && !ID_KEYS.has(k) ? sanitizeText(v) : v;
+  if (Array.isArray(out.log)) out.log = out.log.map(l => sanitizeText(l));
+  if (Array.isArray(out.progress)) out.progress = out.progress.map(p => p && typeof p === 'object' ? {...p, message: sanitizeText(p.message ?? '')} : p);
+  if (Array.isArray(out.steps)) out.steps = out.steps.map(s => s && typeof s === 'object'
+    ? {...s, ...(typeof s.title === 'string' ? {title: sanitizeText(s.title)} : {}), ...(typeof s.detail === 'string' ? {detail: sanitizeText(s.detail)} : {})} : s);
+  if (Array.isArray(out.toolLog)) out.toolLog = out.toolLog.map(t => t && typeof t === 'object'
+    ? {...t, ...(typeof t.command === 'string' ? {command: sanitizeText(t.command)} : {}), ...(typeof t.summary === 'string' ? {summary: sanitizeText(t.summary)} : {}), ...(typeof t.error === 'string' ? {error: sanitizeText(t.error)} : {})} : t);
+  if (Array.isArray(out.todos)) out.todos = out.todos.map(t => t && typeof t === 'object' ? {...t, ...(typeof t.content === 'string' ? {content: sanitizeText(t.content)} : {})} : t);
+  if (out.focus) out.focus = sanitizeDeep(out.focus);
+  if (out.proof) out.proof = sanitizeDeep(out.proof);
+  if (Array.isArray(out.sources)) out.sources = out.sources.map(s => s && typeof s === 'object'
+    ? {...s, ...(typeof s.label === 'string' ? {label: sanitizeText(s.label)} : {}), ...(typeof s.uri === 'string' ? {uri: sanitizeText(s.uri)} : {})} : s);
+  return out;
+}
 
 function dir() { return path.join(store.DIR, 'exec'); }
 function defaultFile(now = new Date()) {
@@ -42,34 +80,89 @@ function defaultFile(now = new Date()) {
 // "…-9999" above "…-10000", so runs started in the same second could be ordered
 // (and pruned, and picked as latest) wrong — latest() had this fixed; prune() had not.
 function nameSort(a, b) { const pa = a.split('-'), pb = b.split('-'); const sa = pa[0] + pa[1], sb = pb[0] + pb[1]; if (sa !== sb) return sa < sb ? -1 : 1; return (parseInt(pa[2], 10) || 0) - (parseInt(pb[2], 10) || 0); }
+const STATUS_NAME = /^\d{8}-\d{6}-\d+\.json$/;
+const STATUS_TMP_NAME = /^\d{8}-\d{6}-\d+\.json\.tmp-.+$/;
+// The UTC stamp embedded in a default status file's name, as ms (null when the
+// name carries none). defaultFile() stamps UTC, so parse it as UTC.
+function nameStampMs(name) {
+  const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/.exec(name);
+  if (!m) return null;
+  const t = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  return Number.isFinite(t) ? t : null;
+}
+// When a run started, for ordering (latest / prune): the file's own startedAt
+// first — a name is only a label, and a clock set forward then back leaves a
+// future-named file whose run is actually old (wave-9: prune deleted the truly
+// newest run and kept the future-named old one). The name's stamp is the
+// fallback for files whose content cannot be read or has no usable startedAt,
+// then the file's mtime.
+function startedMs(name, file, v, now = Date.now()) {
+  // A stamp in the future is not trusted (wave 15): a clock set forward when a
+  // run started and corrected afterwards left that run's startedAt ahead of
+  // every real run, so latest() crowned the old run and prune() ordered by a
+  // start that has not happened yet. Fall through to the next stamp instead —
+  // the name, then the mtime (clamped to now) — exactly as for an unusable one.
+  if (v && typeof v === 'object') { const t = Date.parse(v.startedAt); if (Number.isFinite(t) && t <= now) return t; }
+  const ns = nameStampMs(name);
+  if (ns !== null && ns <= now) return ns;
+  try { const m = fs.statSync(file).mtimeMs; if (Number.isFinite(m)) return Math.min(m, now); } catch {}
+  return ns !== null ? ns : 0;
+}
+// One retry: a reader or AV holding the file for a moment (fifth f1-5) must not
+// demote a live run's file to "unreadable" — the retry reads it fine. A file that
+// still cannot be parsed after the retry is unreadable for this sweep.
+function readStatus(file) { for (let i = 0; i < 2; i++) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch {} } return null; }
 // Only files of the default folder are pruned, never a --status-file of the caller's.
-function prune() {
+function prune(now = Date.now()) {
+  const d = dir();
   let names = [];
-  try { names = fs.readdirSync(dir()).filter(n => /^\d{8}-\d{6}-\d+\.json$/.test(n)).sort(nameSort); } catch { return; }
-  for (const n of names.slice(0, Math.max(0, names.length - KEEP))) {
-    const file = path.join(dir(), n);
+  try { names = fs.readdirSync(d); } catch { return; }
+  const items = [];
+  for (const n of names) {
+    const isTmp = STATUS_TMP_NAME.test(n);
+    if (!isTmp && !STATUS_NAME.test(n)) continue; // not a default run's file (e.g. a caller's own file): left alone
+    const file = path.join(d, n);
+    let st = null;
+    try { st = fs.statSync(file); } catch {}
+    if (st && !st.isFile()) continue; // a folder wearing a status name is not a run's file
+    // A .tmp-* file younger than the stale window may be a live write in another
+    // process (write() renames it within moments); only settled leftovers — a
+    // write whose process died mid-way — join the sweep.
+    if (isTmp && st && now - st.mtimeMs < STALE_MS) continue;
+    // Wave-9: an unreadable or unparseable file is a prune candidate too. The
+    // old rule (fifth f1-5) skipped anything it could not parse, so a corrupt
+    // file was exempt forever and the folder grew past KEEP without bound; it
+    // is ordered by its name's stamp (mtime when the name has none) and only
+    // ever goes with the oldest excess, so a transiently locked live file —
+    // recent by name — is not the one taken.
+    const v = isTmp ? null : readStatus(file);
+    items.push({name: n, file, v, ms: isTmp ? (nameStampMs(n) ?? (st ? st.mtimeMs : 0)) : startedMs(n, file, v, now)});
+  }
+  items.sort((a, b) => a.ms - b.ms || nameSort(a.name, b.name));
+  let excess = items.length - KEEP;
+  for (const it of items) {
+    if (excess <= 0) break;
     // A still-running run's file is the only handle its poller has: deleting it (a long run is
-    // old by name, so it pruned first) makes a live run look "gone" (exit 5) until it finishes.
+    // old, so it prunes first) makes a live run look "gone" (exit 5) until it finishes.
     // No-longer-running files prune as before.
-    // Fifth f1-5: a file that cannot be read or parsed right now is NOT pruned. The read
-    // can fail transiently (a reader/AV holding the file on Windows) while its run is
-    // alive; treating "unreadable" as "dead" deleted a live run's file and its poller
-    // then saw gone/5 and could re-submit a non-idempotent prompt. An unreadable file
-    // stays until a later prune can actually read it.
-    let v;
-    try { v = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
-    if (v && v.state === 'running' && verdict(v) === 'running') continue;
-    try { fs.unlinkSync(file); } catch {}
+    if (it.v && it.v.state === 'running' && verdict(it.v, {now}) === 'running') continue;
+    try { fs.unlinkSync(it.file); excess--; } catch {}
   }
 }
 
 class ExecStatus {
   constructor({file, prompt, cwd, mode}) {
     this.file = path.resolve(file || defaultFile());
-    this.data = {version: 1, state: 'running', pid: process.pid, cwd, mode: mode || null, prompt: String(prompt || '').slice(0, 500),
+    // The owner token (wave 15): two runs can be pointed at one --status-file,
+    // and without a mark of whose file it is, the older run's heartbeat and
+    // finish overwrote the newer run's state — its result simply disappeared
+    // for the poller. The token is this run's from birth and rides every write.
+    this.owner = crypto.randomBytes(16).toString('hex');
+    this.claimed = false; // true once this run's own write has landed on the file
+    this.data = {version: 1, state: 'running', pid: process.pid, owner: this.owner, cwd, mode: mode || null, prompt: String(prompt || '').slice(0, 500),
       session: null, account: null, startedAt: new Date().toISOString(), updatedAt: null, tools: 0, last: null, focus: null,
       todos: [], progress: [], steps: [], toolLog: [], log: []};
-    this.finished = false; this.timer = null; this.writeError = null; this.onSigint = null; this.onSigterm = null;
+    this.finished = false; this.timer = null; this.writeError = null; this.reportedWriteError = null; this.onSigint = null; this.onSigterm = null; this.onSigbreak = null;
     this.finishTimer = null; this.finalWritePending = false; this.finishTries = 0;
   }
   // A status file never breaks the run, but a failed write is not silent either: it is kept on
@@ -77,23 +170,52 @@ class ExecStatus {
   // be written" instead of polling a missing file forever.
   write() {
     this.data.updatedAt = new Date().toISOString();
+    // Ownership (wave 15): once this run has claimed the file, a file that now
+    // carries another run's owner token — or no token at all — was written by
+    // someone else (a second run started on the same --status-file and claimed
+    // it, or a hand edit). Writing over it would erase that writer's result,
+    // so this run stops writing and says why on writeError instead. A file
+    // that cannot be read or parsed proves nothing either way (a reader or AV
+    // holding it for a moment) and is written as before. A run that has not
+    // claimed the file yet may still claim it: that first write is how a new
+    // run takes over a path its caller reused.
+    if (this.claimed) {
+      const existing = readStatus(this.file);
+      if (existing && typeof existing === 'object' && existing.owner !== this.owner) {
+        this.writeError = '状態ファイルはほかの実行のものになっているため、書き込みを止めました';
+        return false;
+      }
+    }
     const temp = this.file + '.tmp-' + process.pid + '-' + Date.now();
     try {
       fs.mkdirSync(path.dirname(this.file), {recursive: true});
-      fs.writeFileSync(temp, JSON.stringify(this.data, null, 1));
+      fs.writeFileSync(temp, JSON.stringify(sanitizedData(this.data), null, 1));
       renameRetry(temp, this.file);
-      this.writeError = null;
+      this.claimed = true;
+      this.writeError = null; this.reportedWriteError = null; // a failure after a recovery is a new incident, worth one new warning
       // A later write (a finish retry, a log line after finish) that finally lands clears
       // the pending final write: stop retrying it and drop the exit/signal listeners.
       if (this.finalWritePending) { this.finalWritePending = false; this._clearFinishRetry(); this._removeListeners(); }
       return true;
     } catch (e) { this.writeError = e && e.message ? e.message : String(e); try { fs.unlinkSync(temp); } catch {} return false; }
   }
+  // The current write failure, handed out ONCE per distinct failure (wave-9): the caller
+  // warns when the status is created and again when the run finishes, and while the same
+  // failure lasts both checks saw the same writeError, so the user was told twice that the
+  // file could not be written. Taking the error here marks it reported; a later take gets
+  // null until the failure changes or a write succeeds and a new failure follows.
+  // writeError itself stays readable for callers that only need the state.
+  takeWriteError() {
+    if (!this.writeError || this.writeError === this.reportedWriteError) return null;
+    this.reportedWriteError = this.writeError;
+    return this.writeError;
+  }
   _clearFinishRetry() { if (this.finishTimer) { clearInterval(this.finishTimer); this.finishTimer = null; } }
   _removeListeners() {
     if (this.onExit) process.removeListener('exit', this.onExit);
     if (this.onSigint) process.removeListener('SIGINT', this.onSigint);
     if (this.onSigterm) process.removeListener('SIGTERM', this.onSigterm);
+    if (this.onSigbreak) process.removeListener('SIGBREAK', this.onSigbreak);
   }
   start() {
     this.write();
@@ -116,6 +238,16 @@ class ExecStatus {
     this.onSigterm = onSignal('SIGTERM', 143);
     process.on('SIGINT', this.onSigint);
     process.on('SIGTERM', this.onSigterm);
+    // SIGBREAK is Ctrl+Break on Windows: Node delivers it there only, and with
+    // no listener the console kills the process outright (0xC000013A), so the
+    // file was left "running" exactly as an unhandled Ctrl+C once left it.
+    // Give it SIGINT's cleanup (interrupted, 130). Registered only on Windows:
+    // the signal does not exist on other platforms, where asking for it would
+    // be an unknown-signal error instead of a harmless no-op.
+    if (process.platform === 'win32') {
+      this.onSigbreak = onSignal('SIGBREAK', 130);
+      process.on('SIGBREAK', this.onSigbreak);
+    }
     return this;
   }
   update(patch) { if (this.finished) return; Object.assign(this.data, patch); this.write(); }
@@ -165,9 +297,29 @@ class ExecStatus {
 // runs started in the same second could resolve to the older one.
 function latest() {
   let names = [];
-  try { names = fs.readdirSync(dir()).filter(n => /^\d{8}-\d{6}-\d+\.json$/.test(n)); } catch {}
-  names.sort(nameSort);
-  return names.length ? path.join(dir(), names[names.length - 1]) : null;
+  try { names = fs.readdirSync(dir()).filter(n => STATUS_NAME.test(n)); } catch {}
+  if (!names.length) return null;
+  // Ordered like prune(): the content's startedAt decides, the name is only the
+  // fallback (and the tie-break, pid compared numerically by nameSort) — a
+  // future-named file whose run is actually old must not win as "latest".
+  // An unreadable candidate (wave 12) — a corrupt file, a directory wearing a
+  // status name, a file gone since the listing — is skipped, not crowned: it
+  // ordered by its name's stamp, so a future-named corrupt file used to win
+  // and the poller got "gone" although an older, readable run was right there.
+  // The next readable run is the latest one there is to read.
+  let best = null;
+  for (const n of names) {
+    const file = path.join(dir(), n);
+    let st = null;
+    try { st = fs.statSync(file); } catch { continue; }
+    if (!st || !st.isFile()) continue;
+    const v = readStatus(file);
+    if (!v || typeof v !== 'object') continue;
+    if (v.version !== undefined && v.version !== 1) continue; // a format this build does not know is not accepted as a run (wave 15)
+    const ms = startedMs(n, file, v);
+    if (!best || ms > best.ms || (ms === best.ms && nameSort(n, best.name) > 0)) best = {name: n, ms};
+  }
+  return best ? path.join(dir(), best.name) : null;
 }
 function read(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 function alive(pid) { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }
@@ -179,7 +331,17 @@ function verdict(v, {isAlive = alive, now = Date.now(), staleMs = STALE_MS} = {}
   // A file that parses but is not a status object (null, a string, fields of the wrong type)
   // is a gone run, not an exception for the poller: --status documents exit 5 for it.
   if (!v || typeof v !== 'object' || typeof v.state !== 'string') return 'dead';
+  // A version this build does not know is not accepted (wave 15): a newer
+  // format's "running" / "done" need not mean what they mean in version 1, so
+  // the file reads as gone rather than as a verdict in a language the poller
+  // cannot trust. A file with no version at all is a legacy file and is read
+  // as before.
+  if (v.version !== undefined && v.version !== 1) return 'dead';
   if (v.state === 'running') {
+    // Only a real pid can be a live process (wave 15): 0 passes kill(pid, 0)
+    // by naming the caller's own process group, and a string / fraction /
+    // negative pid is not a process at all — none of them is "running".
+    if (!Number.isInteger(v.pid) || v.pid <= 0) return 'dead';
     if (!isAlive(v.pid)) return 'dead';
     // The heartbeat is the liveness proof the format promises (see the header): a pid that is
     // alive proves nothing once it can be reused, so a heartbeat stopped for staleMs is dead
@@ -212,7 +374,11 @@ function summary(v, {now = Date.now(), isAlive = alive, logLines = 3} = {}) {
   if (!v || typeof v !== 'object' || typeof v.state !== 'string') return 'gone · unreadable status file';
   const s = verdict(v, {isAlive, now});
   const head = [s, s === 'running' || s === 'dead' ? 'for ' + ago(v.startedAt, now) : 'took ' + Math.round((v.durationMs || 0) / 1000) + 's'];
-  if (v.exit !== undefined && s !== 'running') head.push('exit ' + v.exit + (v.exit === 2 ? ' (Focus criteria not met)' : ''));
+  // The exit line (wave 12): only a run that actually ended has one, and only
+  // when the file's exit is a finite integer — a dead run (a "running" file
+  // whose process is gone) or a hand-written file carrying exit: "0" / 1.5 /
+  // null used to print that raw value next to a state it did not belong to.
+  if (['done', 'interrupted', 'failed'].includes(s) && Number.isInteger(v.exit)) head.push('exit ' + v.exit + (v.exit === 2 ? ' (Focus criteria not met)' : ''));
   if (v.account) head.push('account ' + v.account);
   if (v.session) head.push('session ' + v.session);
   head.push('tools ' + (v.tools || 0));
@@ -230,8 +396,39 @@ function summary(v, {now = Date.now(), isAlive = alive, logLines = 3} = {}) {
     if (tail.length) out.push('log:', ...tail.map(l => '  ' + l));
   }
   if (v.error) out.push('error: ' + v.error);
-  if (v.reply !== undefined && s !== 'running') out.push('reply:', v.reply);
+  if (v.reply !== undefined && s !== 'running') {
+    // A reply can be a whole turn's answer (wave 12): the summary is the few
+    // lines that answer "is it done", so it is capped at about 500
+    // characters with the cut said out loud, like the other caps here.
+    // Counted in code points so a surrogate pair is never split in half.
+    const reply = typeof v.reply === 'string' ? v.reply : String(v.reply);
+    const chars = [...reply];
+    out.push('reply:', chars.length > 500 ? chars.slice(0, 500).join('') + '\n… (truncated)' : reply);
+  }
   return out.join('\n');
 }
 
-module.exports = {ExecStatus, defaultFile, dir, prune, KEEP, HEARTBEAT_MS, STALE_MS, CAPS, latest, read, summary, code, verdict, RUNNING, GONE};
+// The conversations the exec runs on record (the default status files, newest KEEP) belong to.
+// Exec conversations made before sessions carried origin: 'exec' have no other trace of being
+// exec work, and conversation lists (GUI, phone) leave exec work out. Read at most every few
+// seconds: a list request may come often and the folder holds up to KEEP small files.
+let idsCache = null;
+function sessionIds({now = Date.now(), ttlMs = 5000} = {}) {
+  const d = dir();
+  if (idsCache && idsCache.dir === d && now - idsCache.at < ttlMs) return idsCache.ids;
+  const ids = new Set();
+  let names = [];
+  try { names = fs.readdirSync(d).filter(n => n.endsWith('.json')); } catch {}
+  for (const n of names) {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(d, n), 'utf8'));
+      if (j.version !== undefined && j.version !== 1) continue; // unknown format: not accepted (wave 15, as in verdict/latest)
+      const id = typeof j.session === 'string' ? j.session : (j.session && typeof j.session.id === 'string' ? j.session.id : null);
+      if (id) ids.add(id);
+    } catch {}
+  }
+  idsCache = {dir: d, at: now, ids};
+  return ids;
+}
+
+module.exports = {sessionIds, ExecStatus, defaultFile, dir, prune, KEEP, HEARTBEAT_MS, STALE_MS, CAPS, latest, read, summary, code, verdict, RUNNING, GONE};

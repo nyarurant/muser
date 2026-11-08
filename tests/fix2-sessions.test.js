@@ -57,7 +57,9 @@ test('c15 #3: an unreadable lock sleeps to the deadline and throws — no busy s
   let calls = 0;
   fs.readFileSync = (...a) => { if (String(a[0]) === lock) { calls++; const e = new Error('sharing violation'); e.code = 'EPERM'; throw e; } return origRead(...a); };
   const s = sessions.create('C:/spin');
-  try { assert.throws(() => sessions.touch(s, 'x'), /locked by another muser window/); }
+  // Wave 6 wording update: the sessions lock error is worded in Japanese now
+  // (was the English 'sessions index is locked by another muser window').
+  try { assert.throws(() => sessions.touch(s, 'x'), /会話の一覧が別の muser の窓で使用中です/); }
   finally { fs.readFileSync = origRead; fs.rmSync(lock, {force: true}); }
   assert.ok(calls > 10 && calls < 2000, `retries slept instead of spinning (read attempts: ${calls})`);
 });
@@ -138,7 +140,8 @@ test('third M24 (sessions side): writeTranscript takes the sessions lock', {time
   assert.deepEqual(sessions.transcript(s.id).map(t => t.user), ['u1'], 'unlocked path works as before');
   const lock = FILE + '.lock';
   fs.writeFileSync(lock, 'otherwindow:' + process.pid); // live holder, fresh
-  try { assert.throws(() => sessions.writeTranscript(s.id, [{v: 1, at: 2, user: 'u2', reply: 'r2'}]), /locked by another muser window/, 'a merge-back must not overwrite while another window holds the lock'); }
+  // Wave 6 wording update: same Japanese lock wording as above (was English).
+  try { assert.throws(() => sessions.writeTranscript(s.id, [{v: 1, at: 2, user: 'u2', reply: 'r2'}]), /会話の一覧が別の muser の窓で使用中です/, 'a merge-back must not overwrite while another window holds the lock'); }
   finally { fs.rmSync(lock, {force: true}); }
   assert.deepEqual(sessions.transcript(s.id).map(t => t.user), ['u1'], 'the blocked rewrite changed nothing');
 });
@@ -303,4 +306,22 @@ test('third M24 (sessions side): appendTurn compaction re-reads inside the lock 
   sessions.writeTranscript('big-1', [{v: 1, at: 1, user: 'old', reply: 'y'.repeat(2_200_000)}]);
   sessions.appendTurn('big-1', {v: 1, at: 2, user: 'newest', reply: 'small'});
   assert.deepEqual(sessions.transcript('big-1').map(t => t.user), ['newest'], 'over the byte cap the oldest drops, the newest turn is never the one cut');
+});
+
+test('every session is kept: past 200 user and 50 agent sessions nothing is dropped and no transcript is deleted', () => {
+  resetStore();
+  // The first chat is the user's own, with a transcript and a Focus side file; a day of exec
+  // runs and agent sessions follow it. The index used to drop it and delete both files.
+  const first = sessions.create('C:/Users/me');
+  sessions.touch(first, 'my own chat');
+  sessions.appendTurn(first.id, {user: 'my own chat', reply: 'ok'});
+  sessions.saveFocus(first.id, {goal: 'g', criteria: [], status: 'needs_input'});
+  for (let i = 0; i < 230; i++) sessions.touch(sessions.create('C:/Temp/lab-' + i), 'exec ' + i);
+  for (let i = 0; i < 60; i++) { const a = sessions.create('C:/Temp/lab'); a.parent = first.id; sessions.touch(a, 'agent ' + i); }
+  const ids = new Set(disk().map(s => s.id));
+  assert.equal(ids.size, 1 + 230 + 60, 'all sessions stay in the index');
+  assert.ok(ids.has(first.id), 'the oldest user chat is still there');
+  assert.ok(fs.existsSync(sessions.transcriptFile(first.id)), 'its transcript was not deleted');
+  assert.ok(fs.existsSync(sessions.focusFile(first.id)), 'its Focus file was not deleted');
+  assert.ok(sessions.recent('C:/Users/me').some(s => s.id === first.id), '/resume still lists it');
 });

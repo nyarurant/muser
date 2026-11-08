@@ -67,6 +67,52 @@ test('deep#243: a pair deletion is still honoured when the disk holds the pair b
   assert.equal(disk.device, undefined, 'the only window dropping its own pair still deletes it');
 });
 
+// The real store returns a FRESH object on every load. With one shared object the identity
+// check above happened to work, which hid that a dead pair could never be dropped for real.
+const freshLoads = initial => {
+  let disk = initial;
+  return {get disk() { return disk; }, load: () => JSON.parse(JSON.stringify(disk)), save: v => { disk = JSON.parse(JSON.stringify(v)); }};
+};
+
+test('revoked pair: a deletion is honoured when the disk holds the same pair as a fresh copy', () => {
+  const st = freshLoads({sdkToken: 's', device: {access_token: 'a1', refresh_token: 'r:1', access_token_saved_at: 100}});
+  const a = new PcAuth({load: st.load, save: st.save, request: async () => {}, listSdk: async () => {}, issueSdk: async () => {}, expectedVm: async () => 'vm1'});
+  a.persist({device: undefined});
+  assert.equal(st.disk.device, undefined, 'the same pair read back as a new object is still the pair being dropped');
+});
+
+test('revoked pair: a newer pair from another window still survives a stale delete with fresh-copy loads', () => {
+  const st = freshLoads({sdkToken: 's', device: {access_token: 'a1', refresh_token: 'r:1', access_token_saved_at: 100}});
+  const mk = () => new PcAuth({load: st.load, save: st.save, request: async () => {}, listSdk: async () => {}, issueSdk: async () => {}, expectedVm: async () => 'vm1'});
+  const stale = mk();
+  mk().persist({device: {access_token: 'a2', refresh_token: 'r:2', access_token_saved_at: 200}});
+  stale.persist({device: undefined});
+  assert.equal(st.disk.device.access_token, 'a2');
+});
+
+test('revoked pair (unlinked on muse.ai): start() drops it and the login goes on instead of "already registered"', async () => {
+  const st = freshLoads({sdkToken: 'mgst_x', nodeId: 'homelink-abc123', device: {access_token: 'old', refresh_token: 'hatch:old', access_token_saved_at: 1700000000}});
+  const paths = [];
+  const a = new PcAuth({
+    load: st.load, save: st.save,
+    request: async (scope, p) => {
+      paths.push(p);
+      if (p === '/fetch_vms' || p === '/device_token/refresh') throw Object.assign(new Error('HTTP 401'), {status: 401});
+      if (p === '/hatch/auth/start') return {access_token: 'login'};
+      if (p === '/hatch/auth/login_options') return {};
+      if (p === '/hatch/auth/send_otp') return {auth_state: 'st'};
+      throw new Error('unexpected ' + p);
+    },
+    listSdk: async () => ({tokens: [], maxActiveTokens: 3}), issueSdk: async () => ({token: 'mgst_new'}), expectedVm: async () => 'vm1',
+  });
+  const s = await a.start(true);
+  assert.equal(s.phase, 'contact', 'the dead pair is gone, so the login asks for the contact');
+  assert.equal(st.disk.device, undefined);
+  await a.send('someone@example.com'); // used to throw "この PC は認証済みです。" here, again and again
+  assert.equal(a.snapshot().phase, 'code');
+  assert.deepEqual(paths.slice(0, 2), ['/fetch_vms', '/device_token/refresh']);
+});
+
 test('deep#243: on a same-second stamp tie an unrelated persist does not roll the disk pair back', () => {
   let disk = {sdkToken: 's', device: {access_token: 'a1', refresh_token: 'r:1', access_token_saved_at: 200}};
   const stale = new PcAuth({load: () => disk, save: v => { disk = v; }, request: async () => {}, listSdk: async () => {}, issueSdk: async () => {}, expectedVm: async () => 'vm1'});
@@ -74,6 +120,18 @@ test('deep#243: on a same-second stamp tie an unrelated persist does not roll th
   stale.persist({nodeId: 'n-x'});
   assert.equal(disk.device.access_token, 'a2', 'the disk pair wins the tie');
   assert.equal(disk.nodeId, 'n-x');
+});
+
+test('master-debug #13: a stale persist does not roll back another window\'s newer sdkToken or clear sdkIssuePending', () => {
+  let disk = {sdkToken: 'old-token', sdkTokenId: 'id-old'};
+  const mk = () => new PcAuth({load: () => disk, save: v => { disk = v; }, request: async () => {}, listSdk: async () => {}, issueSdk: async () => {}, expectedVm: async () => 'vm1'});
+  const stale = mk();
+  mk().persist({sdkToken: 'new-token', sdkTokenId: 'id-new', sdkIssuePending: true});
+  stale.persist({nodeId: 'n-x'});
+  assert.equal(disk.sdkToken, 'new-token', 'the newer sdkToken survived');
+  assert.equal(disk.sdkTokenId, 'id-new');
+  assert.equal(disk.sdkIssuePending, true, 'sdkIssuePending was not cleared by the stale snapshot');
+  assert.equal(disk.nodeId, 'n-x', 'the stale window\'s own update still lands');
 });
 
 test('deep#243: start() in a stale window adopts the newer disk pair instead of falling through to a fresh login', async () => {
@@ -192,6 +250,15 @@ test('deep#246: select and twoFactor reject malformed elements with stage errors
   b.login = {token: 'x', deviceId: 'd', waterfall: 'w'};
   b.phase = 'two_factor'; b.pending = {two_factor_methods: [null], two_factor_state: 'ts'};
   await assert.rejects(b.twoFactor(0), e => !(e instanceof TypeError) && /追加認証の方法を確認できません/.test(e.message));
+});
+
+test('master-debug #18: twoFactor rejects a method without a usable method_id locally, without a request', async () => {
+  let calls = 0;
+  const {a} = auth({disk: {sdkToken: 'mgst_x'}, request: async () => { calls++; return {}; }});
+  a.login = {token: 'x', deviceId: 'd', waterfall: 'w'};
+  a.phase = 'two_factor'; a.pending = {two_factor_methods: [{}], two_factor_state: 'ts'};
+  await assert.rejects(a.twoFactor(0), /追加認証の方法を確認できません/);
+  assert.equal(calls, 0, 'no request was sent with an unchecked method_id');
 });
 
 test('deep#246: a mint response with non-string tokens is rejected and nothing is persisted', async () => {

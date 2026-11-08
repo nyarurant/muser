@@ -177,6 +177,110 @@ test('execute refuses the call that exceeds the per-turn budget without running 
   assert.equal(a.ctx.readFiles.size, 0, 'the tool never ran');
 });
 
+test('an unattended run waits for a node slot of its own instead of sharing, and gives up plainly', async (t) => {
+  const ns = require('../src/node-slots'), orig = ns.claim;
+  t.after(() => { ns.claim = orig; });
+  const a = makeAgent(t), logs = [];
+  a.waitForNodeMs = 2000; a.nodeWaitPollMs = 10; a.nodeWaitLog = s => logs.push(s);
+  let calls = 0;
+  ns.claim = () => (++calls < 3 ? {slot: 0, nodeId: 'base', release() {}} : {slot: 4, nodeId: 'base-4', release() {}});
+  await a.waitForOwnNode('base');
+  assert.equal(a.nodeSlot.slot, 4);
+  assert.equal(a.nodeSlot.nodeId, 'base-4');
+  assert.equal(logs.length, 2, 'one line when it starts waiting, one when a slot frees');
+  ns.claim = () => ({slot: 0, nodeId: 'base', release() {}});
+  a.waitForNodeMs = 40;
+  await assert.rejects(a.waitForOwnNode('base'), /端末枠がすべて使用中|every muser device slot/);
+});
+
+test('a window with no deadline waits for a slot until one frees, and the TUI hears about it', async (t) => {
+  const ns = require('../src/node-slots'), orig = ns.claim;
+  t.after(() => { ns.claim = orig; });
+  const a = makeAgent(t), logs = [], events = [];
+  // A window never sets waitForNodeMs: it waits until a slot frees or it closes.
+  a.nodeWaitPollMs = 10; a.nodeWaitLog = s => logs.push(s);
+  a.on('node-wait', e => events.push(['wait', e]));
+  a.on('node-wait-done', e => events.push(['done', e]));
+  let calls = 0;
+  ns.claim = () => (++calls < 3 ? {slot: 0, nodeId: 'base', release() {}} : {slot: 5, nodeId: 'base-5', release() {}});
+  await a.waitForOwnNode('base');
+  assert.equal(a.nodeSlot.slot, 5);
+  assert.equal(logs.length, 2, 'one line when it starts waiting, one when a slot frees');
+  assert.deepStrictEqual(events, [['wait', {max: 16}], ['done', {slot: 5}]]);
+});
+
+test('nodeMaxSlots follows the /settings cap, default 16', async (t) => {
+  const settings = require('../src/settings'), orig = settings.numberValue;
+  t.after(() => { settings.numberValue = orig; });
+  const a = makeAgent(t);
+  assert.equal(a.nodeMaxSlots(), 16, 'no setting yet: the default cap');
+  settings.numberValue = k => (k === 'maxNodeSlots' ? 3 : orig(k));
+  assert.equal(a.nodeMaxSlots(), 3, 'a cap set in /settings is read live');
+  const ns = require('../src/node-slots'), origClaim = ns.claim;
+  t.after(() => { ns.claim = origClaim; });
+  const seen = [];
+  ns.claim = (base, opts) => { seen.push(opts); return {slot: 0, nodeId: base, release() {}}; };
+  a.waitForNodeMs = 30; a.nodeWaitPollMs = 10;
+  await assert.rejects(a.waitForOwnNode('base'), /端末枠がすべて使用中|every muser device slot/);
+  assert.ok(seen.length >= 1);
+  assert.deepStrictEqual(seen.map(o => o.max), seen.map(() => 3), 'every claim carries the settings cap');
+});
+
+test('closeGracefully unpairs this window’s node id, then closes — and only that id', async (t) => {
+  async function one({slot, registered, status = 'connected', failing = false}) {
+    const a = makeAgent(t);
+    const calls = [];
+    a.client.status = status;
+    a.client.request = async (verb, path, params, options) => {
+      calls.push([verb, path, params, options]);
+      if (failing) throw new Error('gateway down');
+      return {};
+    };
+    let closed = false;
+    const origClose = a.close.bind(a);
+    a.close = () => { closed = true; origClose(); };
+    a.nodeSlot = {slot, nodeId: slot === 0 ? 'base' : 'base-' + slot, release() {}};
+    a._nodeRegistered = registered;
+    await a.closeGracefully();
+    return {calls, closed};
+  }
+  // A slot this window registered itself: unpaired first, then closed.
+  let r = await one({slot: 3, registered: true});
+  assert.deepStrictEqual(r.calls, [['POST', '/api/nodes/unpair', {node_id: 'base-3'}, {timeout: 5000}]]);
+  assert.equal(r.closed, true);
+  // The standing id (slot 1) and the shared id (slot 0) are never unpaired.
+  r = await one({slot: 1, registered: true});
+  assert.deepStrictEqual(r.calls, []);
+  assert.equal(r.closed, true);
+  r = await one({slot: 0, registered: true});
+  assert.deepStrictEqual(r.calls, []);
+  // A slot another window registered (this one never connected its device) is not ours to remove.
+  r = await one({slot: 3, registered: false});
+  assert.deepStrictEqual(r.calls, []);
+  // A failed unpair (or a disconnected client) still closes the window; nothing throws.
+  r = await one({slot: 3, registered: true, failing: true});
+  assert.equal(r.calls.length, 1, 'the unpair was attempted');
+  assert.equal(r.closed, true);
+  r = await one({slot: 3, registered: true, status: 'closed'});
+  assert.deepStrictEqual(r.calls, []);
+  assert.equal(r.closed, true);
+});
+
+test('a long stretch without progress.report gets a nudge on the next result, and a report resets it', async (t) => {
+  const a = makeAgent(t);
+  startTurn(a);
+  fs.writeFileSync(path.join(a.cwd, 'f.txt'), 'data\n');
+  const hints = [];
+  for (let i = 0; i < 4; i++) hints.push((await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-nudge-' + i)).payload.progress_hint);
+  assert.deepEqual(hints.slice(0, 3), [undefined, undefined, undefined]);
+  assert.match(hints[3], /call progress\.report now/);
+  assert.equal((await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-nudge-4')).payload.progress_hint, undefined, 'waits a full interval again');
+  assert.equal((await a.execute('progress.report', {message: 'found it'}, 1000, 'inv-nudge-r')).ok, true);
+  for (let i = 0; i < 3; i++) assert.equal((await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-nudge-after-' + i)).payload.progress_hint, undefined, 'the report reset the count');
+  a.main.turn.progressAt = Date.now() - 31000;
+  assert.match((await a.execute('code.read', {path: 'f.txt'}, 1000, 'inv-nudge-time')).payload.progress_hint, /progress\.report/, 'time alone also nudges');
+});
+
 test('a message sent mid-turn rides the next tool result to Muse, once', async (t) => {
   const a = makeAgent(t);
   startTurn(a);
@@ -306,7 +410,13 @@ test('pruneCollectedWorkers never prunes main or running workers', () => {
     ['a4', fakeWorker('a4', {state: 'failed', collected: true})],
   ]);
   pruneCollectedWorkers(workers);
-  assert.deepEqual([...workers.keys()].sort(), ['a2', 'a3', 'a4', 'main']);
+  // Spec update (audit-cli wave 8): this pin used to keep 'a4' — a failed
+  // worker was never pruned, even after its outcome had been collected,
+  // so dead failures accumulated for the whole session. Pruning now
+  // covers every terminal state (done / failed / stopped) once collected;
+  // main, a still-running worker (a2, turn present) and an uncollected
+  // worker (a3) still stay.
+  assert.deepEqual([...workers.keys()].sort(), ['a2', 'a3', 'main']);
 });
 
 test('spawn prunes collected workers and gives the worker its own readFiles set', async (t) => {
@@ -338,10 +448,60 @@ function turnReadyAgent(t) {
 
 test('runTurn refuses to start a non-first turn when the history fetch fails', async (t) => {
   const a = turnReadyAgent(t);
+  a.focusRetryDelaysMs = []; // this test is about the refusal, not the retry waits
   a.client.history = async () => { throw new Error('gateway down'); };
   await assert.rejects(a.send('hello'), /履歴の取得に失敗したためターンを開始できませんでした/);
   assert.equal(a.main.turn, null, 'the turn slot is released');
   assert.equal(a.main.state, 'failed');
+});
+
+test('a Focus round whose history fetch fails is started again after a wait, then stops as blocked', async (t) => {
+  const a = turnReadyAgent(t);
+  a.focusRetryDelaysMs = [1, 1];
+  let calls = 0;
+  a.client.history = async () => { calls++; throw new Error('Muse の接続が終了しました。'); };
+  const progress = [];
+  a.on('progress', p => progress.push(p.message));
+  let focus = null;
+  a.on('focus', f => { focus = f; });
+  await assert.rejects(a.sendFocused('task', {turnEnd: false}), /履歴の取得に失敗したためターンを開始できませんでした/);
+  assert.equal(calls, 3, 'the first try and two retries');
+  assert.equal(progress.filter(m => /やり直します/.test(m)).length, 2, 'each retry is announced');
+  assert.equal(a.main.turn, null);
+  assert.equal(a.focusRun, null);
+  if (focus) assert.equal(focus.status, 'blocked');
+});
+
+test('a Focus round goes on once a retried turn gets through', async (t) => {
+  const a = makeAgent(t);
+  a.focusRetryDelaysMs = [1, 1, 1];
+  let calls = 0;
+  a.runTurn = async () => {
+    if (++calls < 3) throw Object.assign(new Error('history down'), {turnRetryable: true});
+    return {text: 'done', focusDecision: {continue: false}, sources: []};
+  };
+  const reply = await a.sendFocused('task', {turnEnd: false});
+  assert.equal(reply.text, 'done');
+  assert.equal(calls, 3);
+});
+
+test('a Focus round is not retried for an error that may have reached Muse, nor after Esc', async (t) => {
+  const a = makeAgent(t);
+  a.focusRetryDelaysMs = [1];
+  let calls = 0;
+  a.runTurn = async () => { calls++; throw new Error('send failed'); };
+  await assert.rejects(a.sendFocused('task', {turnEnd: false}), /send failed/);
+  assert.equal(calls, 1, 'an error without turnRetryable is not retried');
+
+  const b = makeAgent(t);
+  b.focusRetryDelaysMs = [60000];
+  let bCalls = 0;
+  b.runTurn = async () => { bCalls++; throw Object.assign(new Error('history down'), {turnRetryable: true}); };
+  b.on('progress', p => { if (/やり直します/.test(p.message)) b.interrupt(); });
+  const started = Date.now();
+  await assert.rejects(b.sendFocused('task', {turnEnd: false}), e => e.name === 'AbortError');
+  assert.equal(bCalls, 1, 'Esc during the wait starts no retry');
+  assert.ok(Date.now() - started < 5000, 'the wait ends at once on Esc');
 });
 
 test('runTurn cancels the reply wait and closes the subscription when device.send throws', async (t) => {
@@ -400,4 +560,23 @@ test('a pending handoff rides the first turn after an account switch, once, and 
   await sent2;
   assert.ok(!bodies[1].includes('HANDOFF-MARKER'), 'not sent twice');
   await a.interrupt(); await turn2;
+});
+
+// ---------- sessionOrigin (the `muser exec` mark) ----------
+
+test('sessionOrigin: a session the Agent creates carries the mark; an interactive Agent leaves none', (t) => {
+  const execAgent = makeAgent(t, {session: undefined, sessionOrigin: 'exec'});
+  assert.equal(execAgent.session.origin, 'exec', 'the funnel point: sessions.create via the Agent constructor');
+  const plainAgent = makeAgent(t, {session: undefined});
+  assert.ok(!('origin' in plainAgent.session), 'no sessionOrigin, no mark');
+});
+
+test('sessionOrigin: a handed-in session is used as-is — its mark (or absence) never changes', (t) => {
+  const cwd = tmpdir(t);
+  const resumedExec = makeAgent(t, {sessionOrigin: 'exec', session: {id: 'resumed-1', cwd, title: '', created: 0, updated: 0, turns: 2, origin: 'exec'}});
+  assert.equal(resumedExec.session.origin, 'exec', 'an exec conversation continued by exec keeps its mark');
+  const resumedPlain = makeAgent(t, {sessionOrigin: 'exec', session: {id: 'resumed-2', cwd, title: '', created: 0, updated: 0, turns: 2}});
+  assert.ok(!('origin' in resumedPlain.session), 'an interactive conversation continued with --session gains no mark');
+  const openedInTui = makeAgent(t, {session: {id: 'resumed-3', cwd, title: '', created: 0, updated: 0, turns: 2, origin: 'exec'}});
+  assert.equal(openedInTui.session.origin, 'exec', 'an exec conversation opened interactively keeps its stored mark');
 });

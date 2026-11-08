@@ -1,8 +1,11 @@
 'use strict';
 // The muser wordmark: a two-row block font with a violet -> pink gradient across it.
-// Same condition as term.js (fix2 c26 #10): under `muser serve` there is no TTY but
-// MUSER_SGR=1 turns SGR on for the GUI, and the wordmark used to stay colourless there.
-const on = (process.stdout.isTTY || process.env.MUSER_SGR === '1') && require('../settings').switchValue('color');
+// The on/off decision is term.js's own, imported not copied (wave 18): the copy here
+// claimed the same condition but lacked term's dumb-terminal term, so the gradient
+// printed raw SGR on a TERM=dumb terminal. Term's decision also carries the serve
+// case (fix2 c26 #10): under `muser serve` there is no TTY but MUSER_SGR=1 turns SGR
+// on for the GUI, and the wordmark used to stay colourless there.
+const {on} = require('./term');
 const GLYPHS = {
   m: ['█▀▄▀█', '█ ▀ █'], u: ['█ █', '█▄█'], s: ['█▀▀', '▄▄█'], e: ['█▀▀', '██▄'], r: ['█▀█', '█▀▄'],
 };

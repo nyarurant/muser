@@ -10,15 +10,34 @@ const {t} = require('./i18n');
 
 const DIR = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'), 'muser');
 
+// Under the test runner, never the real login folder. tests/setup.mjs moves
+// LOCALAPPDATA to a temp folder, but a file run as `node --test tests/x.test.js`
+// skips it: on 2026-11-08 an audit did exactly that and fix2-login's logout()
+// deleted the user's real session.enc / web.enc and Edge profile.
+if (process.env.NODE_TEST_CONTEXT) {
+  const tmp = path.resolve(os.tmpdir()).toLowerCase() + path.sep;
+  if (!path.resolve(DIR).toLowerCase().startsWith(tmp)) {
+    throw new Error('muser tests must run with --import ./tests/setup.mjs: the data folder is not a temp folder (' + DIR + ')');
+  }
+}
+
+// A slow DPAPI call is not a broken file: under load (many muser processes starting at
+// once, as a parallel hunt does) PowerShell alone can take longer than 15 s to start.
+// Such a failure is marked `slow`, retried once with a longer wait, and worded as a
+// wait-and-retry, not as "the file is broken, log in again" (found on a real run).
 function dpapi(op, input) {
+  try { return dpapiOnce(op, input, 15000); }
+  catch (e) { if (!e.slow) throw e; return dpapiOnce(op, input, 45000); }
+}
+function dpapiOnce(op, input, timeout) {
   const script = `Add-Type -AssemblyName System.Security;$i=[Console]::In.ReadToEnd().Trim();` +
     `$b=[Convert]::FromBase64String($i);` +
     `$o=[Security.Cryptography.ProtectedData]::${op}($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser);` +
     `[Console]::Out.Write([Convert]::ToBase64String($o))`;
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script],
-    {input: input.toString('base64'), encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 15000});
-  if (r.error) throw new Error(r.error.code === 'ETIMEDOUT' ? t('Windows の暗号化ストレージを使えませんでした。（タイムアウトしました）') : t('Windows の暗号化ストレージを使えませんでした。（{message}）', {message: r.error.message}));
-  if (r.signal) throw new Error(t('Windows の暗号化ストレージを使えませんでした。（プロセスがシグナル {signal} で終了しました）', {signal: r.signal}));
+    {input: input.toString('base64'), encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout});
+  if (r.error) { const err = new Error(r.error.code === 'ETIMEDOUT' ? t('Windows の暗号化ストレージを使えませんでした。（タイムアウトしました）') : t('Windows の暗号化ストレージを使えませんでした。（{message}）', {message: r.error.message})); if (r.error.code === 'ETIMEDOUT') err.slow = true; throw err; }
+  if (r.signal) throw Object.assign(new Error(t('Windows の暗号化ストレージを使えませんでした。（プロセスがシグナル {signal} で終了しました）', {signal: r.signal})), {slow: true});
   if (r.status !== 0) throw new Error(t('Windows の暗号化ストレージを使えませんでした。{detail}', {detail: r.stderr ? '（' + String(r.stderr).trim().slice(-200) + '）' : ''}));
   return Buffer.from(r.stdout.trim(), 'base64');
 }
@@ -53,6 +72,41 @@ function decodePreload(todo, lines) {
     try { const json = Buffer.from(line, 'base64').toString('utf8'); JSON.parse(json); decoded.set(t.name, json); } catch {}
   });
   return decoded;
+}
+
+// Audit-cli wave 14: a .enc file is raw DPAPI ciphertext, but some writer (an editor,
+// a copy tool, an older build) can leave the SAME ciphertext as base64 TEXT instead —
+// sometimes with a BOM and line breaks. That file is not broken: decode the text back
+// to the ciphertext bytes and it decrypts as usual. Plainly different contents (plain
+// JSON, prose, random binary) are NOT base64 text: the strict alphabet + canonical
+// re-encode check below rejects them, so they keep the old broken-file error and no
+// second DPAPI call is wasted on guessing.
+function tryDecodeBase64Text(data) {
+  let text;
+  try { text = data.toString('utf8'); } catch { return null; }
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // UTF-8 BOM
+  const cleaned = text.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  if (!cleaned || cleaned.length % 4 === 1) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) return null;
+  let decoded;
+  try { decoded = Buffer.from(cleaned, 'base64'); } catch { return null; }
+  if (!decoded.length) return null;
+  if (decoded.toString('base64').replace(/=+$/, '') !== cleaned.replace(/=+$/, '')) return null;
+  if (decoded.equals(data)) return null;
+  return decoded;
+}
+// Rewrite a recovered base64-text file in the proper raw-binary form, in place, with
+// the same temp + rename care as save(). A failed rewrite must not lose the value
+// that was just recovered, so failures are reported as `false`, never thrown.
+function healBase64TextFile(target, ciphertext) {
+  const temp = target + '.tmp-' + process.pid + '-' + Date.now();
+  try {
+    fs.mkdirSync(path.dirname(target), {recursive: true});
+    fs.writeFileSync(temp, ciphertext);
+    renameRetry(temp, target);
+    sweepTemps(target);
+    return true;
+  } catch { try { fs.unlinkSync(temp); } catch {} return false; }
 }
 
 // Decrypt several files with one PowerShell start (startup needs three).
@@ -154,10 +208,44 @@ function load(name) {
     }
     return value;
   } catch (e) {
-    throw new Error(t('暗号化ファイル {file} を読み込めませんでした。ファイルが壊れているか、別の Windows ユーザーで作成された可能性があります。`muser login` でログインし直してください。（詳細: {detail}）', {file: target, detail: e.message}));
+    if (e && e.slow) throw Object.assign(new Error(t('暗号化ファイル {file} を読めませんでした。Windows の暗号化ストレージの応答が遅れています（ほかに多くの処理が動いているときに起きます）。少し待ってからやり直してください。', {file: target})), {slow: true});
+    // Wave 14 recovery: the raw bytes did not decrypt, but the file may hold the
+    // same ciphertext as base64 text (BOM / line breaks included). If so, decrypt
+    // the decoded bytes, rewrite the file in the proper raw form, and return the
+    // value as if nothing was wrong. Plainly different contents (plain JSON etc.)
+    // are rejected by tryDecodeBase64Text, and a decoded attempt that still fails
+    // falls through to the broken-file error below with the RAW attempt's detail.
+    const decoded = tryDecodeBase64Text(data);
+    if (decoded) {
+      try {
+        const json = dpapi('Unprotect', decoded).toString('utf8'), value = JSON.parse(json);
+        if (healBase64TextFile(target, decoded)) {
+          const afterHeal = stampOf(target);
+          if (afterHeal) {
+            let same = false;
+            try { same = crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex') === crypto.createHash('sha256').update(decoded).digest('hex'); } catch {}
+            if (same) cache.set(name, {...afterHeal, json});
+          }
+        }
+        return value;
+      } catch (e2) {
+        if (e2 && e2.slow) throw Object.assign(new Error(t('暗号化ファイル {file} を読めませんでした。Windows の暗号化ストレージの応答が遅れています（ほかに多くの処理が動いているときに起きます）。少し待ってからやり直してください。', {file: target})), {slow: true});
+      }
+    }
+    // The way out is per file (audit-cli wave 8): the old text sent every failure to
+    // `muser login`, but a broken device.enc / session.enc makes login itself stop on
+    // this same error — a loop with no exit. Name the file, say to delete THAT file
+    // by hand first, and name the command that recreates it: the website login and
+    // the gateway credentials come back with login, the device pair and the
+    // remembered contact with pc-login. Any other store file just says delete it
+    // by hand and retry.
+    const base = path.basename(name);
+    const recreate = base === 'device.enc' || base === 'contact.enc' ? '`muser pc-login`' : base === 'web.enc' || base === 'session.enc' ? '`muser login`' : null;
+    if (recreate) throw new Error(t('暗号化ファイル {file} を読み込めませんでした。ファイルが壊れているか、別の Windows ユーザーで作成されたか、保存形式が想定と違うだけの可能性があります。このままでは同じエラーで止まるため、まずこのファイル {file} を手で削除してから、{command} を実行して作り直してください。（詳細: {detail}）', {file: target, command: recreate, detail: e.message}));
+    throw new Error(t('暗号化ファイル {file} を読み込めませんでした。ファイルが壊れているか、別の Windows ユーザーで作成されたか、保存形式が想定と違うだけの可能性があります。このままでは同じエラーで止まるため、まずこのファイル {file} を手で削除してから、もう一度実行してください。（詳細: {detail}）', {file: target, detail: e.message}));
   }
 }
 
 function remove(name) { cache.delete(name); try { fs.unlinkSync(file(name)); } catch {} }
 
-module.exports = {DIR, file, save, load, remove, preload, renameRetry, parsePreloadOutput, decodePreload};
+module.exports = {DIR, file, save, load, remove, preload, renameRetry, parsePreloadOutput, decodePreload, tryDecodeBase64Text};

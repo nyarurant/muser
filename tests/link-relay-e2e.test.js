@@ -219,8 +219,10 @@ test('phone pairs by QR code through the relay, then chats over the tunnel', {ti
   await stranger.handshake().catch(() => {});
   stranger.send({t: 'req', id: 1, method: 'GET', path: '/api/state'});
   const got = await stranger.next(3000); // rejects on timeout (t3 #6): silence is not a pass
-  assert.equal(got, null, 'unpaired static key must not be served');
-  assert.equal(stranger.closed, true);
+  // app-debug #1: the only frame an unpaired key gets is the terminal
+  // {t:'revoked'} notice before the 4403 close — it is never SERVED (no res).
+  assert.deepEqual(got, {t: 'revoked'}, 'unpaired static key must not be served');
+  await waitFor(() => stranger.closed, 5000); // the close follows the frame through the relay
   stranger.close();
 });
 

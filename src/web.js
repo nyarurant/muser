@@ -218,7 +218,18 @@ function createWeb(jar, {file = FILE} = {}) {
     try { return {ok: r.ok, status: r.status, text: await r.text()}; }
     catch (e) { if (isTimeout(e)) throw Object.assign(new Error('muse.ai server action timed out'), {status: r.status, timeout: true, cause: e}); throw e; }
   }
-  return {jar, fetchJson, nativeRequest, sdkRequest, pageText, serverAction};
+  // POST a JSON body to a muse.ai route the way the page does, reading the JSON answer
+  // (fetchJson only treats the answer as a session read). call() serialises the body
+  // itself: passing JSON.stringify(value) here sent a JSON *string* and the wake route
+  // answered 400 (found on a real SUSPENDED VM, 2026-11-09).
+  async function postJson(route, value) {
+    const r = await call('https://muse.ai' + route, {method: 'POST', body: value,
+      headers: {'Content-Type': 'application/json', Origin: 'https://muse.ai', 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty'}});
+    const text = await r.text().catch(() => '');
+    if (!r.ok) throw Object.assign(new Error(t('Muse に接続できませんでした (HTTP {status})。', {status: r.status})), {status: r.status});
+    try { return text ? JSON.parse(text) : null; } catch { return null; }
+  }
+  return {jar, fetchJson, postJson, nativeRequest, sdkRequest, pageText, serverAction};
 }
 
 // Same stages as MuseClient.probeLogin, for the login window.

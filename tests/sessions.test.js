@@ -96,7 +96,9 @@ test('#50: a live lock is never bypassed — touch waits, then throws, instead o
   const s = sessions.create('C:\\work');
   const t0 = Date.now();
   try {
-    assert.throws(() => sessions.touch(s, 'must not land'), /locked by another muser window/);
+    // Wave 6 wording update: the lock error is worded in Japanese now (was
+    // the English 'sessions index is locked by another muser window').
+    assert.throws(() => sessions.touch(s, 'must not land'), /会話の一覧が別の muser の窓で使用中です/);
     assert.ok(Date.now() - t0 >= 5000, 'it waited past the stale threshold instead of spinning for 2 s and running unlocked');
     assert.equal(sessions.find(s.id), undefined, 'nothing was written without the lock');
   } finally { fs.rmSync(lock, {force: true}); }
@@ -114,4 +116,52 @@ test('corrupt JSON is backed up aside, not wiped, and the store recovers', () =>
   seed('dddd-4444');
   assert.equal(sessions.find('dddd').id, 'dddd-4444');
   assert.deepEqual(leftovers(), []);
+});
+
+test('origin: create() marks only when asked, and the mark survives touch/save round-trips', () => {
+  resetStore();
+  const marked = sessions.create('C:\\work', 'exec');
+  assert.equal(marked.origin, 'exec');
+  const plain = sessions.create('C:\\work');
+  assert.ok(!('origin' in plain), 'no origin key at all for an interactive conversation');
+  assert.ok(!('origin' in sessions.create('C:\\work', '')), 'an empty origin is no mark');
+  assert.ok(!('origin' in sessions.create('C:\\work', 42)), 'a non-string origin is no mark');
+  sessions.touch(marked, 'hello from exec');
+  let stored = JSON.parse(fs.readFileSync(FILE, 'utf8')).find(x => x.id === marked.id);
+  assert.equal(stored.origin, 'exec', 'the mark is written to sessions.json');
+  assert.equal(sessions.find(marked.id).origin, 'exec', 'the mark is read back');
+  sessions.save(marked);
+  stored = JSON.parse(fs.readFileSync(FILE, 'utf8')).find(x => x.id === marked.id);
+  assert.equal(stored.origin, 'exec', 'save() keeps the mark');
+  // A stored mark also survives a later save/touch from an object that does
+  // not carry it (mergeStored: stored-only metadata wins over absence).
+  const bare = {...marked}; delete bare.origin;
+  sessions.save(bare);
+  stored = JSON.parse(fs.readFileSync(FILE, 'utf8')).find(x => x.id === marked.id);
+  assert.equal(stored.origin, 'exec', 'a stored mark is not erased by an unmarked object');
+});
+
+test('origin: an old index without the field, and one with it, both load; garbage marks heal away', () => {
+  resetStore();
+  const old = [
+    {id: 'old-1', cwd: 'C:\\work', title: 'before origin existed', turns: 2, created: 1, updated: 2},
+    {id: 'exec-1', cwd: 'C:\\agent', title: 'from exec', turns: '3', created: 1, updated: 5, origin: 'exec'},
+    {id: 'junk-1', cwd: 'C:\\work', title: 'hand-edited', turns: 1, created: 1, updated: 4, origin: 42},
+  ];
+  fs.writeFileSync(FILE, JSON.stringify(old));
+  const list = sessions.recent();
+  assert.deepEqual(list.map(s => s.id), ['exec-1', 'junk-1', 'old-1'], 'every entry still loads');
+  assert.equal(list.find(s => s.id === 'exec-1').origin, 'exec', 'a stored mark survives validEntries');
+  assert.equal(list.find(s => s.id === 'exec-1').turns, 3, 'turns healing still applies alongside origin');
+  assert.ok(!('origin' in list.find(s => s.id === 'old-1')), 'an entry without the field stays without it');
+  assert.ok(!('origin' in list.find(s => s.id === 'junk-1')), 'a non-string origin is dropped, the entry kept');
+});
+
+test('origin: a salvaged entry keeps its mark', () => {
+  resetStore();
+  const good = [{id: 'salv-exec', cwd: 'C:\\agent', title: 'exec chat', turns: 1, created: 1, updated: 2, origin: 'exec'}];
+  fs.writeFileSync(FILE, JSON.stringify(good) + ',{"id":"salv-tail","cwd":"C:\\w');
+  const list = sessions.recent();
+  assert.deepEqual(list.map(s => s.id), ['salv-exec'], 'the complete entry is recovered');
+  assert.equal(list[0].origin, 'exec', 'salvage does not drop the mark');
 });

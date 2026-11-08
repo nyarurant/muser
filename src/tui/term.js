@@ -4,11 +4,39 @@ const ESC = '\x1b[';
 // Colours off with NO_COLOR or "color" off in /settings (from the next start). `muser serve` has
 // no terminal, but the GUI reads these SGR codes as the bold / heading / code styling of a reply
 // (md.mjs rows), so serve turns them on with MUSER_SGR=1 (set in bin/muser.js before this loads).
-const on = (process.stdout.isTTY || process.env.MUSER_SGR === '1') && require('../settings').switchValue('color');
+// TERM=dumb names a terminal that cannot show SGR at all, so colours stay off there too
+// (wave 10) — raw escape codes on such a terminal are garbage, not styling. The one way
+// back is an explicit colour request: FORCE_COLOR (or CLICOLOR_FORCE), the variables
+// whose whole meaning is 'show colour anyway'. MUSER_SGR is not that request — it only
+// says a GUI reads the codes — so it does not override a dumb terminal.
+// The spellings are the one env vocabulary (config.envBool, wave 17): trimmed and
+// case-insensitive, 1/true/yes/on on and 0/false/no/off off. This line kept its own
+// short list, so FORCE_COLOR=no / off / ' 0' / 'false ' forced colour ON and a padded
+// TERM='dumb ' was not read as dumb at all (wave 18). FORCE_COLOR also carries a
+// level, so a bare number counts by its value ('2'/'3' on, like the tests set);
+// CLICOLOR_FORCE takes the envBool spellings only (it used to accept exactly '1').
+const {envBool} = require('../config');
+function forceColorValue(v) {
+  if (v === undefined) return false;
+  const b = envBool(v);
+  if (b !== null) return b;
+  const t = String(v).trim();
+  return t !== '' && Number.isFinite(Number(t)) && Number(t) > 0;
+}
+const forceColor = forceColorValue(process.env.FORCE_COLOR) || envBool(process.env.CLICOLOR_FORCE) === true;
+const termName = String(process.env.TERM || '').trim().toLowerCase();
+const dumbTerm = termName === 'dumb';
+// Exported as `on` and shared, never re-derived: logo.js and banner.mjs print raw SGR
+// of their own, and their hand copies of this condition lacked the dumb term, so a
+// TERM=dumb terminal still got the gradient wordmark and the keycap background (wave 18).
+const on = (process.stdout.isTTY || process.env.MUSER_SGR === '1') && require('../settings').switchValue('color') && (!dumbTerm || forceColor);
 const sgr = (...codes) => s => on ? ESC + codes.join(';') + 'm' + s + ESC + '0m' : s;
 // Colour depth: 24-bit only when the terminal advertises it (COLORTERM=truecolor/24bit or a
 // *-direct / *-truecolor TERM); otherwise quantise to the xterm 256 palette (38;5;n).
-const truecolor = process.env.COLORTERM === 'truecolor' || process.env.COLORTERM === '24bit' || /-(direct|truecolor)$/.test(process.env.TERM || '');
+// The names are read trimmed and lowercased like every other env value here:
+// COLORTERM=TrueColor / ' truecolor' used to degrade to the 256 palette (wave 18).
+const colorTerm = String(process.env.COLORTERM || '').trim().toLowerCase();
+const truecolor = colorTerm === 'truecolor' || colorTerm === '24bit' || /-(direct|truecolor)$/.test(termName);
 function rgbTo256(r, g, b) {
   if (r === g && g === b) { // grayscale ramp 232-255, with cube black/white at the extremes
     if (r < 8) return 16;
@@ -175,4 +203,4 @@ function frames(text) {
   }).join('\n');
 }
 
-module.exports = {frames, c, strip, width, truncate, wrap, pad, cols, ESC, rgb, rgbTo256, truecolor};
+module.exports = {frames, c, strip, width, truncate, wrap, pad, cols, ESC, rgb, rgbTo256, truecolor, on};

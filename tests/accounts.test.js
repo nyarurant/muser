@@ -22,7 +22,7 @@ const store = require('../src/secure-store');
 test('accounts: the default account is always there, on the historic flat files', () => {
   const list = accounts.list();
   assert.equal(list[0].id, 'default');
-  assert.deepEqual(accounts.filesFor('default'), {web: 'web.enc', session: 'session.enc', device: 'device.enc', browser: store.file('browser')});
+  assert.deepEqual(accounts.filesFor('default'), {web: 'web.enc', session: 'session.enc', device: 'device.enc', contact: 'contact.enc', browser: store.file('browser')});
 });
 
 test('accounts: add / resolve / remove, with per-account file layout', () => {
@@ -700,13 +700,20 @@ test('accounts: a holder whose registry lock was stolen does not write (audit #4
   assert.equal(accounts.resolve('Fencing Victim'), null, 'the stolen holder wrote nothing');
 });
 
-test('accounts: a corrupt identity file is left alone, not clobbered (audit #41)', () => {
+test('accounts: a corrupt identity file is backed aside, not clobbered, and the store heals (audit #41, updated by audit-cli wave3)', () => {
   const f = store.file('identity.json');
   fs.mkdirSync(path.dirname(f), {recursive: true});
   fs.writeFileSync(f, 'garbage{');
-  accounts.rememberMuseName('default', 'Should Not Land');
-  assert.equal(fs.readFileSync(f, 'utf8'), 'garbage{', 'the unreadable file survives for recovery');
+  accounts.rememberMuseName('default', 'Lands After Backup');
+  // audit-cli wave3: the old behaviour (leave the unreadable file in place
+  // forever) made every remember* a silent permanent no-op. The corrupt
+  // bytes now survive in a .corrupt-* backup, and remembering works again.
+  const backups = fs.readdirSync(path.dirname(f)).filter(n => n.startsWith('identity.json.corrupt-'));
+  assert.equal(backups.length, 1, 'the unreadable file survives as a backup for recovery');
+  assert.equal(fs.readFileSync(path.join(path.dirname(f), backups[0]), 'utf8'), 'garbage{');
+  assert.equal(accounts.museName('default'), 'Lands After Backup');
   fs.unlinkSync(f);
+  fs.unlinkSync(path.join(path.dirname(f), backups[0]));
   accounts.rememberMuseName('default', 'Lands Fine');
   assert.equal(accounts.museName('default'), 'Lands Fine');
   fs.unlinkSync(f);

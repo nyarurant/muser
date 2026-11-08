@@ -218,10 +218,12 @@ test('13: a timed-out install is really stopped before it resolves, and a retry 
   const slow = update.install({timeoutMs: 1200, command: 'ping -n 30 127.0.0.1 >nul'});
   const blocked = await update.install({timeoutMs: 1000, command: 'echo nope'});
   assert.equal(blocked.ok, false);
-  assert.match(blocked.output, /already running/, 'a concurrent install is blocked while one is running');
+  // Wave 6 wording update: update.install messages are worded in Japanese now
+  // (was English 'already running' / 'did not finish in 1 s').
+  assert.match(blocked.output, /更新はすでに実行中です/, 'a concurrent install is blocked while one is running');
   const r = await slow;
   assert.equal(r.ok, false);
-  assert.match(r.output, /did not finish in 1 s/);
+  assert.match(r.output, /npm が 1 秒で終わらなかったので止めました/);
   const again = await update.install({timeoutMs: 15000, command: 'echo hello-update'});
   assert.equal(again.ok, true, 'the retry was not blocked and the old process was gone: ' + again.output);
   assert.match(again.output, /hello-update/);

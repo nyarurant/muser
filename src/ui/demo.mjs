@@ -2,16 +2,18 @@
 // look and the keys. Every turn plays the same short coding session.
 import {EventEmitter} from 'node:events';
 import {createRequire} from 'node:module';
-import {run} from './view.mjs';
 const require = createRequire(import.meta.url);
+// The demo shows the screen the user actually gets: the entry follows the
+// fullscreen switch, so the default demo loads no Ink/React either.
+const screenRun = async () => (await import(require('../settings.js').switchValue('fullscreen') ? './fs/run.mjs' : './view.mjs')).run;
 const {lineDiff} = require('../tools.js');
 const sessions = require('../sessions.js');
 const i18n = require('../i18n.js');
 const {t} = i18n;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const reply1 = () => t('了解、まず `src/math.js` を見ます。\n');
-const reply2 = () => t('原因は **割り算の端数処理** でした。\n\n## 直したところ\n- `Math.floor` を `Math.round` に変更\n- 0 で割ったときは `null` を返す\n\n```js\nexport const div = (a, b) => b === 0 ? null : Math.round(a / b);\n```\n\nテストも通りました。ほかに見るところはありますか？');
+const reply1 = () => t("了解。webhook の受け口と、決済を保存するところを見ます。\n");
+const reply2 = () => t("原因は **Stripe の再送** でした。応答が遅れると、Stripe は同じ webhook をもう一度送ります。今のコードは同じイベントでも毎回 `markPaid` と領収書のメールを実行するので、注文が二重に「支払い済み」になり、メールも 2 通届いていました。\n\n## 直したところ\n- `handleWebhook` の最初でイベントの id を記録し、記録済みなら何もしない\n- `webhook_events` 表の `event_id` を主キーにして、同時に 2 通届いても 1 通だけ通す\n- 同じイベントを 2 回送っても処理が 1 回になる試験を追加\n\n```ts\nconst first = await payments.recordEvent(event.id);\nif (!first) return; // already handled\n```\n\nテストも通りました（128 件）。本番のデータベースには、マイグレーション `0042_webhook_events.sql` の適用が必要です。");
 
 class DemoAgent extends EventEmitter {
   static DEVICE = 'demo CLI (muser)';
@@ -65,16 +67,38 @@ class DemoAgent extends EventEmitter {
       this.session.turns++;
       await sleep(900);
       await this.stream('m1', reply1());
-      const todos = [{content: t('原因を調べる'), status: 'in_progress'}, {content: t('直す'), status: 'pending'}, {content: t('テストを流す'), status: 'pending'}];
+      const todos = [{content: t('原因を調べる'), status: 'in_progress'}, {content: t('二重の処理を止める'), status: 'pending'}, {content: t('試験を足して流す'), status: 'pending'}];
       this.emit('todos', todos); await this.tool('todo.write', {todos: ''}, {todos});
-      await this.tool('code.read', {path: 'src/math.js'}, {lines: 42});
-      await this.tool('code.grep', {pattern: 'Math\\.floor'}, {count: 3});
+      await this.tool('code.read', {path: 'src/webhooks/stripe.ts'}, {lines: 186});
+      await this.tool('code.read', {path: 'src/payments/repository.ts'}, {lines: 94});
+      await this.tool('code.grep', {pattern: 'markPaid\\('}, {count: 4});
       todos[0].status = 'completed'; todos[1].status = 'in_progress'; this.emit('todos', [...todos]);
-      const diff = lineDiff('export const add = (a, b) => a + b;\nexport const div = (a, b) => Math.floor(a / b);\n', 'export const add = (a, b) => a + b;\nexport const div = (a, b) => b === 0 ? null : Math.round(a / b);\n');
-      const edited = await this.tool('code.edit', {path: 'src/math.js'}, {diff}, {ask: true});
+      const before = [
+        'export async function handleWebhook(event: Stripe.Event) {',
+        "  if (event.type !== 'payment_intent.succeeded') return;",
+        '  const intent = event.data.object;',
+        '  await payments.markPaid(intent.metadata.orderId, intent.amount);',
+        '  await mailer.sendReceipt(intent.metadata.orderId);',
+        '}',
+      ].join('\n') + '\n';
+      const after = [
+        'export async function handleWebhook(event: Stripe.Event) {',
+        "  if (event.type !== 'payment_intent.succeeded') return;",
+        '  // Stripe retries a webhook until it gets a 2xx: the same event can arrive twice.',
+        '  const first = await payments.recordEvent(event.id);',
+        '  if (!first) return; // already handled',
+        '  const intent = event.data.object;',
+        '  await payments.markPaid(intent.metadata.orderId, intent.amount);',
+        '  await mailer.sendReceipt(intent.metadata.orderId);',
+        '}',
+      ].join('\n') + '\n';
+      const edited = await this.tool('code.edit', {path: 'src/webhooks/stripe.ts'}, {diff: lineDiff(before, after)}, {ask: true});
       if (!edited) return await this.declined(todos, start);
+      const migration = ['CREATE TABLE webhook_events (', '  event_id    text PRIMARY KEY,', '  received_at timestamptz NOT NULL DEFAULT now()', ');'];
+      const wrote = await this.tool('code.write', {path: 'migrations/0042_webhook_events.sql'}, {diff: migration.map((l, j) => ({t: '+', n: j + 1, l})), created: true}, {ask: true});
+      if (!wrote) return await this.declined(todos, start);
       todos[1].status = 'completed'; todos[2].status = 'in_progress'; this.emit('todos', [...todos]);
-      const tested = await this.tool('system.run', {command: 'npm test'}, {exit: 0, tail: ['> demo@1.0.0 test', '> node --test', '✔ div rounds (1.2ms)', '✔ div by zero (0.4ms)', 'ℹ pass 2  ℹ fail 0']}, {ask: true, ms: 300});
+      const tested = await this.tool('system.run', {command: 'npm test'}, {exit: 0, tail: ['> shop-api@2.4.0 test', '> vitest run', ' ✓ src/webhooks/stripe.test.ts (7 tests) 412ms', '   ✓ ignores a retried event (same id)', ' ✓ src/payments/repository.test.ts (11 tests) 238ms', ' Test Files  14 passed (14)', '      Tests  128 passed (128)']}, {ask: true, ms: 300});
       if (!tested) return await this.declined(todos, start);
       todos[2].status = 'completed'; this.emit('todos', [...todos]);
       await this.stream('m2', reply2());
@@ -82,17 +106,49 @@ class DemoAgent extends EventEmitter {
       return {text: reply2()};
     } catch (e) { this.emit('turn-end', {ok: false, aborted: e.name === 'AbortError', error: e.message, ms: Date.now() - start}); throw e; }
   }
+  // The memory-measurement scenario (docs/design/memory.md, stage 0): 200 tool calls
+  // with the heavy shapes a long-used window accumulates — 50 writes of a 50 KB file,
+  // 50 diffs of 2,000 lines, 50 command outputs of 5,000 lines, 50 small reads.
+  // Emitted directly (no sleeps, no approvals, no turn around them):
+  // scripts/mem-scenario.mjs drives it headlessly through a real Controller and
+  // records what the window retains. Diffs are built in view shape directly —
+  // running lineDiff 200 times would measure the diff algorithm, not the memory.
+  async memScenario() {
+    const line = (tag, j, n) => (tag + ' ' + j + ' ').padEnd(n, 'x');
+    const emit = (command, kind, params, view, output) => {
+      const call = {id: 'mem-' + (this.memSeq = (this.memSeq || 0) + 1), command, params, kind, summary: params.path || params.command || ''};
+      this.emit('tool-start', call);
+      this.emit('tool-end', {...call, ok: true, view, output});
+    };
+    // Interleaved, like a real window: grouped in fifties, the 30 kept outputs
+    // would all be the last group's small reads and the heavy outputs would
+    // measure as zero — they were pushed out, not absent.
+    for (let i = 0; i < 50; i++) {
+      const rows = Array.from({length: 1250}, (_, j) => line('write' + i, j, 39));
+      emit('code.write', 'edit', {path: 'mem/write-' + i + '.txt', content: rows.join('\n') + '\n'},
+        {diff: rows.map((l, j) => ({t: '+', n: j + 1, l})), created: true}, '');
+      const diff = [];
+      for (let j = 0; j < 1000; j++) diff.push({t: '-', n: j + 1, l: line('old' + i, j, 29)});
+      for (let j = 0; j < 1000; j++) diff.push({t: '+', n: j + 1, l: line('new' + i, j, 29)});
+      emit('code.edit', 'edit', {path: 'mem/edit-' + i + '.txt', old_string: 'old ' + i, new_string: 'new ' + i}, {diff}, '');
+      const out = Array.from({length: 5000}, (_, j) => line('run' + i, j, 19)).join('\n');
+      emit('system.run', 'exec', {command: 'mem-run ' + i}, {exit: 0, tail: out.split('\n').slice(-4)}, out);
+      emit('code.read', 'read', {path: 'mem/read-' + i + '.txt'}, {lines: 42}, 'read ' + i);
+    }
+  }
   async interrupt() { this.stopped = true; }
   close() { this.shells.killAll(); }
 }
 
 export async function demo({version, cwd, mode}) {
-  // Like a real first run: ask for the language if none was picked yet (and keep the choice).
-  if (i18n.chosen() === null) await require('../tui/onboard.js').askLanguage();
+  // Like a real first run: ask for the language if none was picked yet — but never save
+  // the pick: a demo run must not write lang into the real ~/.muser/config.json (wave 10).
+  if (i18n.chosen() === null) await require('../tui/onboard.js').askLanguage({save: false});
   // --cd / --mode used to be silently dropped on the way here.
   const agent = new DemoAgent(cwd || process.cwd());
   if (mode) agent.mode = mode;
   // The demo's approval previews come from the script instead of real files.
+  const run = await screenRun();
   const app = run({agent, museName: t('Muse (デモ)'), version});
   return app;
 }
@@ -106,6 +162,7 @@ export class LoginDemoAgent extends DemoAgent {
   constructor(cwd) {
     super(cwd);
     this.device = {connected: false}; this.client = {status: 'demo'}; this.expired = false; this.everConnected = false;
+    this.turnRunning = false; this.expirePending = false;
     this.loginFlow = async ({log}) => {
       log(t('Edge でログインを待っています（デモ）')); await sleep(1800);
       log(t('… ログインを確認、VM 情報を取得中')); await sleep(900);
@@ -123,14 +180,27 @@ export class LoginDemoAgent extends DemoAgent {
     this.emit('device', {connected: true}); this.emit('connection', {state: 'connected', first});
   }
   expireLogin() {
+    // A lapse that lands mid-turn waits until the turn ends (wave 10): flipping to the
+    // disconnected/auth state while the scripted turn is still running would leave the
+    // rest of the turn — its success story included — playing out on a dead connection.
+    // send() applies the deferred lapse right after the turn's turn-end.
+    if (this.turnRunning) { this.expirePending = true; return; }
     this.expired = true; this.device = {connected: false};
     this.emit('device', {connected: false});
     this.emit('connection', {state: 'auth', error: t('Muse にログインしてください。')});
   }
   async send(text, opts) {
     if (this.expired) throw new Error(t('muse.ai のログインが切れています。/login でログインし直してください。'));
-    await this.ensureConnected();
-    return super.send(text, opts);
+    this.turnRunning = true;
+    try {
+      await this.ensureConnected();
+      return await super.send(text, opts);
+    } finally {
+      this.turnRunning = false;
+      // The turn has ended (super.send emits turn-end before returning/throwing):
+      // a lapse deferred by expireLogin() lands now, not mid-turn.
+      if (this.expirePending) { this.expirePending = false; this.expireLogin(); }
+    }
   }
 }
 
@@ -152,9 +222,9 @@ function demoRegister() {
 export async function demoLogin({version, cwd, mode}) {
   const {onboard, askLanguage} = require('../tui/onboard.js');
   process.stdout.write('\x1b[2J\x1b[3J\x1b[H');
-  // The first-run demo always starts with the language question; it changes the saved choice
-  // only when there is none yet.
-  await askLanguage({save: i18n.chosen() === null});
+  // The first-run demo always starts with the language question, but never saves the
+  // pick: a demo run must not write lang into the real ~/.muser/config.json (wave 10).
+  await askLanguage({save: false});
   await onboard({
     needLogin: true, needDevice: true,
     login: async progress => {
@@ -167,6 +237,7 @@ export async function demoLogin({version, cwd, mode}) {
   await sleep(1200);
   const agent = new LoginDemoAgent(cwd || process.cwd());
   if (mode) agent.mode = mode;
+  const run = await screenRun();
   const app = run({agent, museName: t('Muse (デモ)'), version, connect: async () => {
     await agent.ensureConnected();
     // Then, a while later, the login lapses: the offer to log in again appears.

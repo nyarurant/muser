@@ -12,6 +12,20 @@ const madeDirs = [];
 require('node:test').after(() => { for (const d of madeDirs) fs.rmSync(d, {recursive: true, force: true}); });
 const tmp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-exec-status-')); madeDirs.push(d); return d; };
 
+test('sessionIds: the conversations of the exec runs on record, read from the status folder', () => {
+  const ES = require('../src/exec-status');
+  const d = ES.dir();
+  fs.mkdirSync(d, {recursive: true});
+  const a = path.join(d, '20990101-000000-1.json'), b = path.join(d, '20990101-000001-2.json'), c = path.join(d, '20990101-000002-3.json');
+  fs.writeFileSync(a, JSON.stringify({version: 1, state: 'done', session: 'sess-a'}));
+  fs.writeFileSync(b, JSON.stringify({version: 1, state: 'running', session: {id: 'sess-b'}}));
+  fs.writeFileSync(c, '{not json');
+  try {
+    const ids = ES.sessionIds({ttlMs: 0});
+    assert.ok(ids.has('sess-a') && ids.has('sess-b'));
+  } finally { for (const f of [a, b, c]) fs.rmSync(f, {force: true}); }
+});
+
 test('running from the start, then done with the exit code, the reply and the session', () => {
   const f = path.join(tmp(), 'st.json');
   const s = new ExecStatus({file: f, prompt: 'do it', cwd: 'C:\w', mode: 'plan'}).start();
@@ -299,7 +313,10 @@ test('summary: a finished run with turn usage shows its formatted tokens; withou
   const {summary} = require('../src/exec-status');
   const now = Date.now();
   const withUsage = {version: 1, state: 'done', exit: 0, pid: process.pid, startedAt: new Date(now - 5000).toISOString(), updatedAt: new Date(now).toISOString(), durationMs: 5000, tools: 1, usage: {inputTokens: 130841, outputTokens: 395, formatted: '130.8k in / 395 out'}};
-  assert.match(summary(withUsage, {now}), /tokens: 130\.8k in \/ 395 out/);
+  // Wave 7 spec update: summary() re-formats the stored usage from its
+  // numbers via usageText/formatUsage, so the words are the UI language's
+  // （入 / 出） — the fixture's stored English 'formatted' is not what prints.
+  assert.match(summary(withUsage, {now}), /tokens: 130\.8k 入 \/ 395 出/);
   const without = {...withUsage}; delete without.usage;
   assert.ok(!summary(without, {now}).includes('tokens:'), 'no tokens line without usage');
 });

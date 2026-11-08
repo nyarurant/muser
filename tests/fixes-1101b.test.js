@@ -69,7 +69,10 @@ test('a session index with broken entries still lists the good ones', t => {
   const {execFileSync} = require('node:child_process');
   fs.mkdirSync(path.join(dir, 'muser'));
   fs.writeFileSync(path.join(dir, 'muser', 'sessions.json'), JSON.stringify([null, {id: 'x'}, {id: 'abc-1', cwd: 'C:/p', turns: 1, updated: 1}]));
-  const out = execFileSync(process.execPath, ['-e', "const s=require('./src/sessions');console.log(s.recent().length, s.recent('C:/p').length)"], {cwd: path.join(__dirname, '..'), env: {...process.env, LOCALAPPDATA: dir}, encoding: 'utf8', timeout: 30000});
+  // FORCE_COLOR off for the child: npm sets FORCE_COLOR=1 for scripts run in a
+  // terminal, and console.log(number) then wraps the counts in ANSI colour,
+  // which is not what this assertion is about (seen in a user's own npm test).
+  const out = execFileSync(process.execPath, ['-e', "const s=require('./src/sessions');console.log(s.recent().length, s.recent('C:/p').length)"], {cwd: path.join(__dirname, '..'), env: {...process.env, LOCALAPPDATA: dir, FORCE_COLOR: '0'}, encoding: 'utf8', timeout: 30000});
   assert.equal(out.trim(), '2 1');
 });
 

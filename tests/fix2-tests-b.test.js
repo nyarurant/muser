@@ -148,12 +148,14 @@ test('t7 #21: update.install — success, failure, invalid version, cross-window
   assert.equal(bad.ok, false, 'a non-zero exit is a failed install');
   const inv = await install({command: 'echo x', version: 'not-a-version', lockFile});
   assert.equal(inv.ok, false);
-  assert.match(inv.output, /Invalid update version/);
+  // Wave 6 wording update: update.install messages are worded in Japanese now
+  // (was English 'Invalid update version' / 'already running in another window').
+  assert.match(inv.output, /更新の版の形式が違います/);
   // Another window holding the lock (a live pid in token:pid form) blocks us.
   fs.writeFileSync(lockFile, 'cafe:' + process.pid);
   const blocked = await install({command: 'echo x', lockFile});
   assert.equal(blocked.ok, false);
-  assert.match(blocked.output, /another muser window/);
+  assert.match(blocked.output, /別の muser の窓で更新が実行中です/);
   fs.unlinkSync(lockFile);
   // A dead holder's lock is claimed instead of blocking for ever.
   const dead = spawnSync(process.execPath, ['-e', '']);
@@ -164,7 +166,7 @@ test('t7 #21: update.install — success, failure, invalid version, cross-window
   const slow = install({command: 'ping -n 6 127.0.0.1 > nul', timeoutMs: 30000, lockFile});
   const second = await install({command: 'echo x', lockFile});
   assert.equal(second.ok, false);
-  assert.match(second.output, /already running/);
+  assert.match(second.output, /更新はすでに実行中です/); // wave 6: Japanese wording (was 'already running')
   const first = await slow;
   assert.equal(first.ok, true, first.output);
 });
@@ -177,5 +179,5 @@ test('t7 #21: update.install — a command that never finishes is stopped at tim
   const dir = tmp(t);
   const r = await install({command: 'ping -n 31 127.0.0.1 > nul', timeoutMs: 500, lockFile: path.join(dir, 'update.lock')});
   assert.equal(r.ok, false);
-  assert.match(r.output, /did not finish/);
+  assert.match(r.output, /npm が 1 秒で終わらなかったので止めました/); // wave 6: Japanese wording (was 'did not finish')
 });

@@ -118,7 +118,14 @@ test('approval: enter maps the highlighted option (plain allow / always / autoEd
   assert.deepEqual(last(), {decision: {allow: true, always: true}}, 'autoEdit maps the same way');
   approval('c4', [{label: 'はい', allow: true}, {label: 'いいえ', allow: false}]);
   ctrl.key('', {downArrow: true}); ctrl.key('', {return: true});
-  assert.deepEqual(last(), {decision: {allow: false}});
+  // serverfirst-debug R1: the deny option is "decline and say why" — it
+  // opens the reason input and posts only once the reason is submitted
+  // (the old immediate {allow: false} post made the reason unreachable).
+  assert.ok(ctrl.get().reasonFor, 'deny opens the reason input');
+  assert.equal(client.posts('/api/s/sess-1/approval').length, 3, 'no decline post yet');
+  ctrl.setText('やめて', 3);
+  ctrl.key('', {return: true});
+  assert.deepEqual(last(), {decision: {allow: false, reason: 'やめて'}});
 });
 
 test('limitInput: digits edit the local echo, enter posts {value, key}, esc posts {cancel:true, key}', async () => {
@@ -177,7 +184,7 @@ test('send: a plain message posts its text and attachments, then clears the atta
   assert.deepEqual(client.posts('/api/s/sess-1/send').at(-1).body, {text: 'again'}, 'no attachments key when there are none');
 });
 
-test('ctrl+c picks its interrupt target: bang before turn; esc interrupts a turn', async () => {
+test('ctrl+c picks its interrupt target: turn before bang; esc interrupts a turn', async () => {
   const {ctrl, client} = await started();
   const last = () => client.posts('/api/s/sess-1/interrupt').at(-1).body;
   ctrl.set({busy: true});
@@ -185,8 +192,14 @@ test('ctrl+c picks its interrupt target: bang before turn; esc interrupts a turn
   assert.deepEqual(last(), {target: 'turn'});
   ctrl.set({bangRunning: {call: {command: 'system.run'}, tail: []}});
   ctrl.key('c', {ctrl: true});
-  assert.deepEqual(last(), {target: 'bang'}, 'bang wins when both are running');
-  ctrl.set({bangRunning: null});
+  // serverfirst-debug R15: the local Controller interrupts the TURN
+  // first when both are running (this expectation used to pin the
+  // remote file's inverted order).
+  assert.deepEqual(last(), {target: 'turn'}, 'the turn wins when both are running');
+  ctrl.set({busy: false});
+  ctrl.key('c', {ctrl: true});
+  assert.deepEqual(last(), {target: 'bang'}, 'bang is the target when no turn is running');
+  ctrl.set({bangRunning: null, busy: true});
   ctrl.key('', {escape: true});
   assert.deepEqual(last(), {target: 'turn'}, 'esc while busy');
 });

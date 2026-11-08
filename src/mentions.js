@@ -57,6 +57,18 @@ function trimmedRefs(ref) {
   return out;
 }
 function statOrNull(p) { try { return fs.statSync(p); } catch { return null; } }
+// A UNC path (\\server\share\... or //server/share/...; path.resolve turns the
+// second spelling — and the \\?\UNC\... spelling — into the first) is never
+// probed: realOf()/stat below are synchronous, so resolving one makes Windows
+// open an SMB connection to a host named by the message text — an unreachable
+// host froze the send for ~21 s (measured), and a reachable one could be an
+// attacker's server offered the user's NTLM credentials. The same rule as
+// pasted paths in clipboard.js. A UNC ref is therefore reported missing
+// exactly as written, without touching the network. That deliberately gives
+// up the legitimate use of @mentioning a file on a reachable share: safety
+// wins over reachability here, because the probe cannot be told apart from
+// the attack and cannot be bounded while it is synchronous.
+function isUnc(p) { return p.startsWith('\\\\') || p.startsWith('//'); }
 
 // Blank out code spans and fenced blocks so their contents are not mentions. Written as a
 // scanner instead of two regexes (audit #240): the old pairing let a STRAY backtick swallow
@@ -67,7 +79,12 @@ function statOrNull(p) { try { return fs.statSync(p); } catch { return null; } }
 // unmatched run stays literal text.
 function stripCode(text) {
   const s = String(text);
-  let out = '', i = 0;
+  // Output is assembled as literal segments joined once at the end, not by
+  // per-character string concatenation: [segStart, i) is the pending literal
+  // segment, flushed only where a code span replaces it with a single space.
+  const parts = [];
+  let i = 0, segStart = 0;
+  const flush = end => { if (end > segStart) parts.push(s.slice(segStart, end)); };
   // Inline-span searches that found no closing run: failEol[len] is where the
   // failed search stopped (the end of its line). A later opener of the same
   // length on that same line searches a subset of the same text, so it must
@@ -78,20 +95,20 @@ function stripCode(text) {
     // Tilde fences hide their contents exactly like backtick fences (third
     // audit M16: a ~~~ example's @decorator was picked up as a mention).
     const fence = s[i] === '`' ? '`' : s[i] === '~' ? '~' : null;
-    if (!fence) { out += s[i++]; continue; }
+    if (!fence) { i++; continue; }
     let j = i; while (j < s.length && s[j] === fence) j++;
     const run = j - i;
     if (run >= 3) {
       const close = s.indexOf(fence.repeat(3), j);
-      if (close === -1) { out += s.slice(i, j); i = j; continue; } // unclosed fence: literal
+      if (close === -1) { i = j; continue; } // unclosed fence: literal
       let k = close; while (k < s.length && s[k] === fence) k++;
-      out += ' '; i = k; continue;
+      flush(i); parts.push(' '); i = k; segStart = i; continue;
     }
-    if (fence === '~') { out += s.slice(i, j); i = j; continue; } // 1-2 tildes are prose (strikethrough), not a span
+    if (fence === '~') { i = j; continue; } // 1-2 tildes are prose (strikethrough), not a span
     // Inline span: the opener must hug its content (no space after it), and a closing run
     // of the same length must follow on this line, its content hugging it too.
-    if (i + run >= s.length || /\s/.test(s[j])) { out += s.slice(i, j); i = j; continue; }
-    if (failEol[run] > i) { out += s.slice(i, j); i = j; continue; } // known: no closing run of this length on this line
+    if (i + run >= s.length || /\s/.test(s[j])) { i = j; continue; }
+    if (failEol[run] > i) { i = j; continue; } // known: no closing run of this length on this line
     let close = -1, p = j;
     for (; p < s.length && s[p] !== '\n'; p++) {
       if (s[p] !== '`') continue;
@@ -99,10 +116,11 @@ function stripCode(text) {
       if (q - p === run && !/\s/.test(s[p - 1])) { close = p; break; }
       p = q - 1;
     }
-    if (close === -1) { failEol[run] = p; out += s.slice(i, j); i = j; continue; } // stray backtick: literal
-    out += ' '; i = close + run;
+    if (close === -1) { failEol[run] = p; i = j; continue; } // stray backtick: literal
+    flush(i); parts.push(' '); i = close + run; segStart = i;
   }
-  return out;
+  flush(i);
+  return parts.join('');
 }
 
 function mentions(text) {
@@ -111,13 +129,28 @@ function mentions(text) {
   // (with the closing backtick in its name) and reported missing.
   const plain = stripCode(text);
   MENTION.lastIndex = 0;
+  // An @ inside a URL is part of the link, not a file the user attached:
+  // 'https://example.com/@user/profile' used to resolve to a local
+  // user/profile file when one happened to exist, and otherwise just added
+  // a bogus 'missing' entry (c13 #2). The @'s own word carries the scheme.
+  // That check used to slice the whole prefix for every match to recover the
+  // word before the @, which is quadratic on @-heavy text (40k mentions over
+  // 960 KB took ~95 s and froze submit()). Matches arrive in order, so one
+  // forward scan decides the same thing in linear time: scanPos only moves
+  // forward across matches, and wordHasScheme tracks whether the word ending
+  // just before the current @ (the run of non-whitespace behind it) contains
+  // '://'. A '://' triple is three consecutive non-whitespace characters, so
+  // it can never straddle a word boundary.
+  let scanPos = 0, wordHasScheme = false;
   while ((m = MENTION.exec(plain))) {
-    // An @ inside a URL is part of the link, not a file the user attached:
-    // 'https://example.com/@user/profile' used to resolve to a local
-    // user/profile file when one happened to exist, and otherwise just added
-    // a bogus 'missing' entry (c13 #2). The @'s own word carries the scheme.
-    const word = /[^\s]*$/.exec(plain.slice(0, m.index + m[1].length))[0];
-    if (word.includes('://')) continue;
+    const at = m.index + m[1].length;
+    while (scanPos < at) {
+      const c = plain[scanPos];
+      if (/\s/.test(c)) wordHasScheme = false;
+      else if (c === '/' && scanPos >= 2 && plain[scanPos - 1] === '/' && plain[scanPos - 2] === ':') wordHasScheme = true;
+      scanPos++;
+    }
+    if (wordHasScheme) continue;
     out.push(trimRef(m[2]));
   }
   return [...new Set(out)];
@@ -134,13 +167,20 @@ function expand(text, cwd, readFiles) {
   for (const rawRef of mentions(text)) {
     if (OBVIOUSLY_MISSING.test(rawRef)) { missing.push(rawRef); continue; }
     let ref = rawRef;
-    let p = require('./tools').realOf(path.resolve(cwd, ref)); // the file system's spelling, as the edit tools key reads
+    const written = path.resolve(cwd, ref);
+    // UNC refs are missing without any probe (see isUnc): this check runs
+    // before realOf/stat — and before the sensitive check — so no network
+    // access and no credential offer can happen for them at all. The check
+    // covers the ref as written and as resolved (a // spelling, a \\?\UNC\
+    // spelling, or a relative ref under a UNC cwd all resolve to \\).
+    if (isUnc(rawRef) || isUnc(written)) { missing.push(rawRef); continue; }
+    let p = require('./tools').realOf(written); // the file system's spelling, as the edit tools key reads
     // Secrets never ride along, however they were named: a pasted `@../../.ssh/id_rsa`
     // (or a symlink inside the project pointing at one) used to inline the key into the
     // message, past the guard every read tool enforces (audit #237). The check runs on
     // the path as written and on where it really leads, before anything is read or
     // listed — a sensitive folder's names are not listed either.
-    let sensitive = require('./tools').isSensitivePath(path.resolve(cwd, ref)) || require('./tools').isSensitivePath(p);
+    let sensitive = require('./tools').isSensitivePath(written) || require('./tools').isSensitivePath(p);
     let st = sensitive ? null : statOrNull(p);
     // Deep H6: the full ref did not exist — it may be a real file with Japanese
     // prose glued to it. Try progressively shorter refs (longest first); the
@@ -148,7 +188,9 @@ function expand(text, cwd, readFiles) {
     // does, the ref is reported missing exactly as written.
     if (!sensitive && !st) {
       for (const cand of trimmedRefs(rawRef)) {
-        const candWritten = path.resolve(cwd, cand), candReal = require('./tools').realOf(candWritten);
+        const candWritten = path.resolve(cwd, cand);
+        if (isUnc(cand) || isUnc(candWritten)) continue; // a trimmed candidate is never probed on the network either
+        const candReal = require('./tools').realOf(candWritten);
         if (require('./tools').isSensitivePath(candWritten) || require('./tools').isSensitivePath(candReal)) { ref = cand; p = candReal; sensitive = true; break; }
         const candSt = statOrNull(candReal);
         if (candSt) { ref = cand; p = candReal; st = candSt; break; }
@@ -329,9 +371,47 @@ function walkFiles(dir) {
 // folder. Until it is there, complete() returns [] and loading(cwd) is true; onReady (a re-render)
 // is called when it arrives. A stale list keeps being used while a fresh one is built.
 let cache = null, pending = null;
+// The mtime of one folder, or null when it is gone / not a folder. One stat per
+// folder: the cheap staleness probe below, never a rescan.
+function dirMtime(p) { try { const st = fs.statSync(p); return st.isDirectory() ? st.mtimeMs : null; } catch { return null; } }
+// Snapshot the mtimes of the root and every folder the list names, taken when
+// the list is built. Creating, deleting or renaming an entry updates its
+// folder's mtime, so a later mismatch proves an outside change (an editor, a
+// checkout, another tool) without re-reading any folder's contents.
+function captureDirStamps(cwd, dirs) {
+  const stamps = new Map();
+  stamps.set('', dirMtime(cwd));
+  for (const d of dirs) { const rel = d.replace(/\/$/, ''); if (rel) stamps.set(rel, dirMtime(path.join(cwd, rel))); }
+  return stamps;
+}
+// The folder a fragment is being completed inside: 'src/a' completes in src/,
+// 'src/' in src/ itself, a bare name in the root ('').
+function fragmentDir(fragment) {
+  const q = String(fragment || '').replace(/\\/g, '/');
+  if (q.endsWith('/')) return q.replace(/\/$/, '');
+  const i = q.lastIndexOf('/');
+  return i === -1 ? '' : q.slice(0, i);
+}
+// Has any folder the cached list rests on changed since the list was built?
+// Compares the root, the folder the current fragment targets, and every other
+// folder in the snapshot (stats only — no directory is read). A target folder
+// the snapshot does not know counts as changed once and is then remembered, so
+// a still-empty new folder does not retrigger a refresh on every keystroke.
+function stampsChanged(cwd, fragment) {
+  if (!cache || cache.cwd !== cwd || !cache.dirStamps) return false;
+  const target = fragmentDir(fragment);
+  if (target && !cache.dirStamps.has(target)) {
+    const cur = dirMtime(path.join(cwd, target));
+    if (cur !== null) { cache.dirStamps.set(target, cur); return true; }
+  }
+  for (const [rel, was] of cache.dirStamps) {
+    if (dirMtime(rel ? path.join(cwd, rel) : cwd) !== was) return true;
+  }
+  return false;
+}
 function refresh(cwd, onReady) {
   if (pending?.cwd === cwd) { if (onReady) pending.waiters.add(onReady); return pending.promise; }
-  const waiters = new Set(onReady ? [onReady] : []), entry = {cwd, waiters};
+  const waiters = new Set(onReady ? [onReady] : []), entry = {cwd, waiters, rootAtStart: dirMtime(cwd), prevStamps: cache?.cwd === cwd ? cache.dirStamps : null};
   entry.promise = listFilesAsync(cwd).then(found => {
     // No slice: cutting the candidate list at 20,000 made every file past it
     // permanently invisible to @ completion, however often the list refreshed
@@ -340,7 +420,19 @@ function refresh(cwd, onReady) {
     const files = found, dirs = new Set();
     for (const f of files) { const parts = f.split('/'); for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join('/') + '/'); }
     // A listing for a folder left meanwhile (resume into another one) must not replace the new one's.
-    if (pending === entry || !cache || cache.cwd === cwd) cache = {cwd, at: Date.now(), list: [...dirs, ...files]};
+    if (pending === entry || !cache || cache.cwd === cwd) {
+      const stamps = captureDirStamps(cwd, dirs);
+      // A folder that changed while this listing was being built (or since the
+      // previous list, for folders the new snapshot no longer / newly names)
+      // may not be reflected in it: keep the list, but mark it stale so the
+      // next reuse rebuilds once more instead of trusting the snapshot.
+      let moved = stamps.get('') !== entry.rootAtStart;
+      if (!moved && entry.prevStamps) {
+        if (stamps.size !== entry.prevStamps.size) moved = true;
+        else for (const [rel, was] of entry.prevStamps) if (stamps.get(rel) !== was) { moved = true; break; }
+      }
+      cache = {cwd, at: moved ? 0 : Date.now(), list: [...dirs, ...files], dirStamps: stamps};
+    }
   }).finally(() => {
     if (pending === entry) pending = null; // only its own: a newer folder's listing may be running
     for (const w of waiters) { try { w(); } catch {} }
@@ -348,8 +440,14 @@ function refresh(cwd, onReady) {
   pending = entry;
   return entry.promise;
 }
-function candidates(cwd, onReady) {
-  if (!(cache?.cwd === cwd && Date.now() - cache.at < 30000)) refresh(cwd, onReady);
+function candidates(cwd, onReady, fragment) {
+  // Reuse is not blind trust for 30 s: muser's own edits call invalidate(), but
+  // a file created, deleted or renamed outside muser left the cached list
+  // untouched and its ghost (or absence) was served for the whole cache life.
+  // A cheap folder-mtime probe on reuse spots that; the stale list keeps being
+  // served while refresh() rebuilds it in the background, exactly like the
+  // 30 s expiry path — never a synchronous rescan per keystroke.
+  if (!(cache?.cwd === cwd && Date.now() - cache.at < 30000) || stampsChanged(cwd, fragment)) refresh(cwd, onReady);
   return cache?.cwd === cwd ? cache.list : [];
 }
 // Drop the cached list's freshness (the next candidates() call rebuilds it): files a tool or a
@@ -361,7 +459,7 @@ function ready(cwd) { candidates(cwd); return pending?.cwd === cwd ? pending.pro
 // Memoised per (cwd, fragment, limit); invalidated whenever the candidate list refreshes.
 const completeCache = new Map();
 function complete(fragment, cwd, limit = 6, onReady) {
-  const list = candidates(cwd, onReady);
+  const list = candidates(cwd, onReady, fragment);
   if (!cache || cache.cwd !== cwd) return [];
   const key = cwd + '\0' + fragment + '\0' + limit;
   const hit = completeCache.get(key);

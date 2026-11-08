@@ -34,6 +34,19 @@ const CONTROL_HEARTBEAT_MS = 30000, CONTROL_TIMEOUT_MS = 90000;
 // (audit #100): resetting on 'open', before authentication has had a chance
 // to fail, made a flapping relay reconnect about once a second forever.
 const CONTROL_STABLE_MS = 10000;
+// Relay control handshake + authentication deadlines (wave18): without a
+// handshakeTimeout the ws client sits in CONNECTING forever when a relay
+// accepts the TCP connection but never answers the upgrade — and the
+// connectControl() guard then refuses every later attempt, so no reconnect
+// is ever tried. 15000 ms matches the muse-client WebSocket. The auth
+// deadline bounds the whole attempt, from connect until authentication
+// completes: the relay sends no acknowledgement, so the completion the PC
+// can observe is answering its {challenge}. A relay that opens the socket
+// but never sends a challenge used to live forever unauthenticated — its
+// pongs keep the heartbeat satisfied and relayConnected stays true.
+// Expiring either deadline terminates the socket, which runs the normal
+// close -> reconnect path.
+const CONTROL_HANDSHAKE_TIMEOUT_MS = 15000, CONTROL_AUTH_TIMEOUT_MS = 15000;
 // Domain separation for the relay Ed25519 key (audit #103): the relay
 // verifies two different signatures with the same key — control-socket
 // auth over a random 32-byte challenge, and data-socket auth over a cid
@@ -108,7 +121,7 @@ function challengeBytes(challenge) {
 }
 
 class Link {
-  constructor({serve, relayUrl = null, lanPort = DEFAULT_LAN_PORT, keys = null, store = null, proxy = null, discoveryPort = DISCOVERY_PORT, maxChannels = MAX_CHANNELS, backoffMinMs = BACKOFF_MIN_MS, backoffMaxMs = BACKOFF_MAX_MS, controlHeartbeatMs = CONTROL_HEARTBEAT_MS, controlTimeoutMs = CONTROL_TIMEOUT_MS, maxPendingDataSockets = MAX_PENDING_DATA_SOCKETS, maxDataOpensPerWindow = MAX_DATA_OPENS_PER_WINDOW, dataOpenWindowMs = DATA_OPEN_WINDOW_MS} = {}) {
+  constructor({serve, relayUrl = null, lanPort = DEFAULT_LAN_PORT, keys = null, store = null, proxy = null, discoveryPort = DISCOVERY_PORT, maxChannels = MAX_CHANNELS, backoffMinMs = BACKOFF_MIN_MS, backoffMaxMs = BACKOFF_MAX_MS, controlHeartbeatMs = CONTROL_HEARTBEAT_MS, controlTimeoutMs = CONTROL_TIMEOUT_MS, controlHandshakeTimeoutMs = CONTROL_HANDSHAKE_TIMEOUT_MS, controlAuthTimeoutMs = CONTROL_AUTH_TIMEOUT_MS, maxPendingDataSockets = MAX_PENDING_DATA_SOCKETS, maxDataOpensPerWindow = MAX_DATA_OPENS_PER_WINDOW, dataOpenWindowMs = DATA_OPEN_WINDOW_MS} = {}) {
     if (!serve || !serve.port || !serve.token) throw new Error('link: {serve: {port, token}} is required');
     this.serve = serve;
     this.relayUrl = relayUrl;
@@ -119,6 +132,8 @@ class Link {
     this.backoffMaxMs = backoffMaxMs;
     this.controlHeartbeatMs = controlHeartbeatMs;
     this.controlTimeoutMs = controlTimeoutMs;
+    this.controlHandshakeTimeoutMs = controlHandshakeTimeoutMs;
+    this.controlAuthTimeoutMs = controlAuthTimeoutMs;
     this.maxPendingDataSockets = maxPendingDataSockets;
     this.maxDataOpensPerWindow = maxDataOpensPerWindow;
     this.dataOpenWindowMs = dataOpenWindowMs;
@@ -137,6 +152,7 @@ class Link {
     this.backoffMs = backoffMinMs;
     this.reconnectTimer = null;
     this.controlHeartbeat = null;
+    this.controlAuthTimer = null;
     this.stopped = true;
   }
 
@@ -194,10 +210,27 @@ class Link {
     // (audit #100): a late reconnect would replace the healthy socket.
     if (this.control && (this.control.readyState === WebSocket.OPEN || this.control.readyState === WebSocket.CONNECTING)) return;
     let ws;
-    try { ws = new WebSocket(relayJoin(this.relayUrl, '/pc')); } catch { this.scheduleReconnect(); return; }
+    try { ws = new WebSocket(relayJoin(this.relayUrl, '/pc'), {handshakeTimeout: this.controlHandshakeTimeoutMs}); } catch { this.scheduleReconnect(); return; }
     this.control = ws;
     let openedAt = 0, lastSeenAt = 0, retried = false;
     const stopHeartbeat = () => { if (this.controlHeartbeat) { clearInterval(this.controlHeartbeat); this.controlHeartbeat = null; } };
+    // Authentication deadline (wave18, see the constants): armed at connect
+    // time so it also covers a handshake the ws handshakeTimeout somehow
+    // does not reap, and cleared only when the challenge has actually been
+    // answered (below). On expiry the socket is terminated — not closed
+    // with a handshake a dead peer would never answer — so 'close' fires
+    // and retry() takes the normal reconnect path. The heartbeat cannot
+    // save an unauthenticated socket: this timer ignores pongs entirely.
+    let authTimer = null;
+    const stopAuthTimer = () => { if (!authTimer) return; clearTimeout(authTimer); if (this.controlAuthTimer === authTimer) this.controlAuthTimer = null; authTimer = null; };
+    if (this.controlAuthTimeoutMs > 0) {
+      authTimer = setTimeout(() => {
+        if (this.control !== ws || this.stopped) return;
+        try { ws.terminate(); } catch {}
+      }, this.controlAuthTimeoutMs);
+      authTimer.unref?.();
+      this.controlAuthTimer = authTimer;
+    }
     ws.on('open', () => {
       if (this.control !== ws) return;
       this.controlOpen = true;
@@ -229,7 +262,7 @@ class Link {
       if (!msg || typeof msg !== 'object') return;
       if (msg.challenge !== undefined) {
         const sig = signRelay(this.keys.relay, Buffer.concat([RELAY_CONTROL_AUTH_CONTEXT, challengeBytes(msg.challenge)]));
-        try { ws.send(JSON.stringify({pcId: this.pcId, pub: this.keys.relay.publicKey.toString('base64url'), sig: sig.toString('base64url')})); } catch {}
+        try { ws.send(JSON.stringify({pcId: this.pcId, pub: this.keys.relay.publicKey.toString('base64url'), sig: sig.toString('base64url')})); stopAuthTimer(); } catch {}
         return;
       }
       if (typeof msg.open === 'string' && msg.open) this.openDataSocket(msg.open);
@@ -241,6 +274,7 @@ class Link {
       // healthy control socket that superseded it (audit #100).
       if (this.control !== ws) return;
       stopHeartbeat();
+      stopAuthTimer();
       this.control = null;
       this.controlOpen = false;
       // Backoff resets only for a connection that actually lived (audit
@@ -341,6 +375,7 @@ class Link {
   async stop() {
     this.stopped = true;
     if (this.controlHeartbeat) { clearInterval(this.controlHeartbeat); this.controlHeartbeat = null; }
+    if (this.controlAuthTimer) { clearTimeout(this.controlAuthTimer); this.controlAuthTimer = null; }
     if (this.discovery) { try { this.discovery.close(); } catch {} this.discovery = null; }
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     for (const ws of [...this.dataSockets]) { try { ws.close(); } catch {} }

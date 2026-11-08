@@ -29,6 +29,35 @@ function tokensOf(command) {
   return c.split(/\s+/);
 }
 
+// A program's bare name for SCREEN matching (wave7-1): path and extension
+// dropped, drive-relative spelling (C:git.exe) unwound, lowercased — so
+// `git.exe`, `.\\git.exe` and `C:git.exe` are `git` to the content / secret /
+// config screens, and `rg.exe` is `rg`. This is only how screens recognise a
+// program; the alwaysKey identity keeps the spelling exactly as wave5 left
+// it (a git.bat on PATH is still not git.exe there).
+function programBase(token) {
+  let s = String(token || '').toLowerCase().split(/[\\/]/).pop() || '';
+  s = s.replace(/^[a-z]:/, '').replace(/\.(exe|cmd|bat|ps1)$/, '');
+  return s;
+}
+
+// Tokens for SCREEN use only (wave7-5). tokensOf fails closed for the
+// read-only allowlist, but its null was read by the screens as "no danger"
+// (fail-open): a quote or a `#` anywhere — `git grep "pat" -Oless`,
+// `git log --ext-diff #x` — switched every screen off while a remembered
+// key still covered the command. For screening, fall back to a lenient
+// split of the raw text that treats quotes, `#` and the other shell
+// delimiters as mere separators, so the flags and paths the shell would
+// act on are still scanned. Lenient tokens never ALLOW anything: they are
+// consumed only by screens that can downgrade a command to ask.
+function screenTokens(command) {
+  const strict = tokensOf(command);
+  if (strict) return strict;
+  const c = String(command || '').trim();
+  if (!c) return [];
+  return c.split(/[\s"'`#\[\]();|&<>$\{\}]+/).filter(Boolean);
+}
+
 // Validate the argument tokens of one command against a flag spec.
 // spec: {boolLong, valueLong, boolShort, valueShort, positional, numericDash}
 // Long flags: --name or --name=value (valueLong may also take the next token).
@@ -94,7 +123,7 @@ const GIT_SPECS = {
     positional: true,
   },
   log: {
-    boolLong: ['oneline', 'graph', 'all', 'decorate', 'stat', 'patch', 'summary', 'name-only', 'name-status', 'abbrev-commit', 'no-merges', 'merges', 'first-parent', 'follow', 'fixed-strings', 'extended-regexp', 'basic-regexp', 'perl-regexp', 'invert-grep', 'color', 'no-color', 'source', 'full-history', 'simplify-by-decoration', 'parents', 'children', 'left-right', 'cherry', 'cherry-pick', 'walk-reflogs', 'reflog', 'no-patch', 'raw', 'numstat', 'shortstat', 'check', 'exit-code'],
+    boolLong: ['oneline', 'graph', 'all', 'decorate', 'stat', 'patch', 'cc', 'summary', 'name-only', 'name-status', 'abbrev-commit', 'no-merges', 'merges', 'first-parent', 'follow', 'fixed-strings', 'extended-regexp', 'basic-regexp', 'perl-regexp', 'invert-grep', 'color', 'no-color', 'source', 'full-history', 'simplify-by-decoration', 'parents', 'children', 'left-right', 'cherry', 'cherry-pick', 'walk-reflogs', 'reflog', 'no-patch', 'raw', 'numstat', 'shortstat', 'check', 'exit-code'],
     valueLong: ['max-count', 'skip', 'since', 'until', 'after', 'before', 'author', 'committer', 'grep', 'format', 'pretty', 'date', 'decorate-refs', 'decorate-refs-exclude', 'abbrev', 'encoding', 'diff-filter', 'max-parents', 'min-parents', 'regexp-ignore-case'],
     boolShort: ['p', 'i', 'E', 'F', 'P', 'g', 'c', 'h'],
     valueShort: ['n', 'L', 'S', 'G'],
@@ -253,6 +282,57 @@ const RUNS_ANYTHING = new Set(['powershell', 'pwsh', 'cmd', 'bash', 'sh', 'wsl',
 // <image>`, `yarn dlx <pkg>`). An alwaysKey for one of these must name that third
 // word too, or remembering one script remembers them all (audit #210).
 const DISPATCH_VERBS = new Set(['run', 'exec', 'x', 'dlx']);
+// Programs that really ship as .cmd/.bat/.ps1 shims on Windows (the npm
+// family): for these, and only these, the extension is not part of the
+// alwaysKey — npm.cmd IS npm. Every other program keeps its extension in
+// the key: git has no .bat/.ps1 shim, so a git.bat found on PATH or planted
+// in a repo is a different file from git.exe and must not inherit its
+// remembered key (wave5-C).
+const SHIM_PROGRAMS = new Set(['npm', 'npx', 'yarn', 'pnpm', 'pnpx']);
+// Privilege / launcher wrappers: whatever word follows one of these is a
+// command in its own right, not this program's subcommand (wave7-2).
+const WRAPPER_PROGRAMS = new Set(['sudo', 'doas', 'time', 'env']);
+// Long flags that hand work to another program or name an output file:
+// --ext-diff / --textconv run a helper, --output writes a file, rg's --pre /
+// --pre-glob run a preprocessor per file, --open-files-in-pager / --pager /
+// --paginate hand the output to a pager program, --hostname-bin names a
+// helper binary. A command carrying one is never covered by a remembered
+// key (wave5-C): the benign form that was remembered did not carry it, and
+// the flag changes what the command DOES, not just what it prints. The set
+// is deliberately narrow — ordinary value flags (--format, --depth, …) are
+// not here.
+const EXEC_OR_WRITE_LONG = new Set(['ext-diff', 'external-diff', 'textconv', 'output', 'output-file', 'pre', 'pre-glob', 'open-files-in-pager', 'pager', 'paginate', 'hostname-bin']);
+function commandRunsOrWritesViaFlag(command) {
+  const tokens = screenTokens(command);
+  if (!tokens.length) return false;
+  const headBase = programBase(tokens[0]);
+  const isGit = headBase === 'git';
+  const isGitGrep = isGit && gitSubcommand(command) === 'grep';
+  // Git's parse-options accepts an unambiguous ABBREVIATION of a long flag
+  // (wave7-3): `git grep --open=more` and `--textc` really run the pager /
+  // textconv helper, so for git commands a dangerous flag's prefix counts
+  // too. An exact known flag is not an abbreviation — git grep's `--text`
+  // is --text itself, not a shortened --textconv — so exact spec names are
+  // exempt (the dangerous ones are caught by the exact check first).
+  const gitKnownLong = new Set();
+  if (isGit) for (const spec of Object.values(GIT_SPECS)) for (const n of [...(spec.boolLong || []), ...(spec.valueLong || [])]) gitKnownLong.add(n);
+  const isGitAbbrevOfExecFlag = (name) => isGit && name.length >= 2 && !gitKnownLong.has(name) && [...EXEC_OR_WRITE_LONG].some(d => d.length > name.length && d.startsWith(name));
+  for (let i = 1; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok === '--') break; // what follows is positional, not this command's flags
+    if (tok.startsWith('--')) {
+      const eq = tok.indexOf('=');
+      const name = (eq >= 0 ? tok.slice(2, eq) : tok.slice(2)).toLowerCase();
+      if (EXEC_OR_WRITE_LONG.has(name)) return true;
+      if (isGitAbbrevOfExecFlag(name)) return true;
+      continue;
+    }
+    // git grep's -O is --open-files-in-pager in short form, alone (-O),
+    // clustered (-nO) or with its value attached (-Oless).
+    if (isGitGrep && /^-[A-Za-z]*O/.test(tok)) return true;
+  }
+  return false;
+}
 
 // The "don't ask again" key, or null when this call must not be remembered.
 function alwaysKey(kind, params, command) {
@@ -261,16 +341,28 @@ function alwaysKey(kind, params, command) {
   if (kind === 'exec') {
     const text = String(params?.command || command || '').trim();
     if (!text || SHELL_SYNTAX.test(text)) return null;
+    // A flag that runs a helper or writes a file (see EXEC_OR_WRITE_LONG)
+    // is never remembered: approving `git log` must not pre-approve
+    // `git log --ext-diff`, and approving the flagged form itself must not
+    // store a key a later flagged form could match (wave5-C).
+    if (commandRunsOrWritesViaFlag(text)) return null;
     const parts = text.split(/\s+/);
-    const first = parts[0].toLowerCase().replace(/\.(exe|cmd|bat|ps1)$/, '');
-    if (RUNS_ANYTHING.has(first)) return null;
-    // The same guard for a path-form interpreter (deep audit c22 #5):
-    // `C:\\…\\powershell.exe Get-Date`, `.\\powershell.exe …` or the
-    // drive-relative `C:powershell.exe …` names the same program that runs
-    // anything, so it is never remembered either. The key itself keeps the
-    // spelling as typed for every other program.
-    const firstBase = first.split(/[\\/]/).pop().replace(/^[a-z]:/, '');
-    if (firstBase !== first && RUNS_ANYTHING.has(firstBase)) return null;
+    // A program that runs anything is never remembered, under any spelling
+    // (deep audit c22 #5): plain, with an extension (`powershell.exe`), as
+    // a path (`.\\powershell.exe …`) or drive-relative (`C:powershell.exe …`).
+    // This detection strips the extension for every program; the KEY below
+    // does not — see SHIM_PROGRAMS.
+    const rawFirst = parts[0].toLowerCase();
+    const firstBase = rawFirst.split(/[\\/]/).pop().replace(/^[a-z]:/, '').replace(/\.(exe|cmd|bat|ps1)$/, '');
+    if (RUNS_ANYTHING.has(firstBase)) return null;
+    // Wrappers and env assignments in front (wave7-2/-6): the second word
+    // is then not a subcommand of the first, it is a whole other command —
+    // a two-word key for `sudo git` covered `sudo git push` and
+    // `sudo npm install` alike, and `FOO=bar git` collapsed the same way.
+    // Such a command is never remembered at all.
+    if (WRAPPER_PROGRAMS.has(firstBase)) return null;
+    if (/^[a-z_][a-z0-9_]*=/.test(rawFirst)) return null;
+    const first = SHIM_PROGRAMS.has(firstBase) ? rawFirst.replace(/\.(exe|cmd|bat|ps1)$/, '') : rawFirst;
     // The program and a plain subcommand word (`npm ls`, `git status`), so remembering one never
     // remembers `npm exec` / `git push`. With a flag or path in its place (`git -C x push`), the
     // subcommand cannot be told, and the call is not remembered at all.
@@ -298,7 +390,7 @@ function realPathOf(p) {
 function isInsideDir(dir, p) {
   const path = require('node:path');
   const rel = path.relative(String(dir), String(p));
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  return !(rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel));
 }
 
 // Repository config can make a read-only git command run a program: core.fsmonitor on `git status`
@@ -359,7 +451,7 @@ function gitConfigRuns(configText) {
 }
 function repoGitConfig(command, cwd) {
   // Same -C / --git-dir / --work-tree as the command, so it is the same repository.
-  const tokens = tokensOf(command) || [], pre = [];
+  const tokens = screenTokens(command), pre = [];
   for (let i = 1; i < tokens.length; i++) {
     const t = tokens[i];
     if (t === '-C' || t === '--git-dir' || t === '--work-tree' || t === '--namespace') { pre.push(t, tokens[++i]); continue; }
@@ -412,7 +504,7 @@ function globCouldMatchSensitive(pattern) {
   return false;
 }
 function readsSecrets(command, cwd) {
-  const tokens = tokensOf(command) || [], head = (tokens[0] || '').toLowerCase();
+  const tokens = screenTokens(command), head = programBase(tokens[0]);
   if (head === 'rg' && tokens.some(t => RG_UNHIDE.test(t))) return true;
   if (head === 'git' && tokens.includes('--no-index')) return true;
   const {isSensitivePath, realOf} = require('./tools');
@@ -562,7 +654,7 @@ const RG_SPEC_FOR_PARSE = {valueLong: ['glob', 'iglob', 'type', 'type-not', 'max
 // search over a root that holds a sensitive file, and a patch output
 // (git diff / show, git log -p) with no pathspec restricting it, both can.
 function dumpsArbitraryContents(command, cwd) {
-  const tokens = tokensOf(command) || [], head = (tokens[0] || '').toLowerCase();
+  const tokens = screenTokens(command), head = programBase(tokens[0]);
   const path = require('node:path'), fs = require('node:fs');
   const root = path.resolve(cwd);
   const existingPath = (tok) => { const p = path.resolve(root, tok); try { return fs.statSync(p) ? p : null; } catch { return null; } };
@@ -603,10 +695,27 @@ function dumpsArbitraryContents(command, cwd) {
     if (plainPaths.length) return plainPaths.some(p => pathRisk(p.tok));
     return dirContainsSensitive(repoRoot); // no pathspec: the whole tree
   }
-  const isPatchLog = sub === 'log' && args.some(t => t === '-p' || t === '-u' || t === '--patch' || /^--patch=/.test(t) || (/^-[a-z]+$/i.test(t) && t.includes('p')));
+  // -c / --cc print a combined diff for merges (wave7-4): patch output just
+  // like -p, and the name scan below must ask git for combined names too,
+  // or an evil merge's file never appears in a plain --name-only listing.
+  const isCombinedLog = sub === 'log' && args.some(t => t === '--cc' || (/^-[a-z0-9]+$/i.test(t) && t.includes('c')));
+  const isPatchLog = sub === 'log' && (isCombinedLog || args.some(t => t === '-p' || t === '-u' || t === '--patch' || /^--patch=/.test(t) || (/^-[a-z0-9]+$/i.test(t) && t.includes('p'))));
   if (sub === 'diff' || sub === 'show' || isPatchLog) {
     const spec = GIT_SPECS[sub] || GIT_SPECS.log;
     const {positionals, flags} = collectPositionals(args, spec);
+    // Rev-set widening flags are not positionals, so they never reach revs:
+    // a name scan rebuilt from revs alone silently rescans only HEAD and
+    // misses commits the user's command would print (e.g. `git log -p --all`
+    // reaching a secret file that lives only on a side branch). Carry the
+    // allowed widening flags into the scan so it vets the same commit set.
+    // Narrowing/filter flags are deliberately not carried: scanning the
+    // wider set without them stays conservative.
+    const revWidening = [];
+    if (sub === 'log') {
+      if (flags.has('all')) revWidening.push('--all');
+      if (flags.has('reflog') || flags.has('walk-reflogs') || flags.has('g')) revWidening.push('--walk-reflogs');
+      if (flags.has('full-history')) revWidening.push('--full-history');
+    }
     const restrictions = [], revs = [];
     for (const p of positionals) {
       if (p.afterDash) { restrictions.push(p.tok); continue; }
@@ -671,7 +780,7 @@ function dumpsArbitraryContents(command, cwd) {
       const cap = 200;
       const userMax = userMaxCount();
       const limit = userMax !== null && userMax <= cap ? userMax : cap + 1;
-      const res = runGit(['log', '--name-only', '--pretty=format:commit-%H', `--max-count=${limit}`, ...revsForScan]);
+      const res = runGit(['log', '--name-only', '--pretty=format:commit-%H', `--max-count=${limit}`, ...(isCombinedLog ? ['-c'] : []), ...revWidening, ...revsForScan]);
       if (!res || res.unavailable || res.failed) return failureDowngrades(res, plainForm);
       let commits = 0; const names = [];
       for (const line of res.stdout.split(/\r?\n/)) {
@@ -698,7 +807,7 @@ function dumpsArbitraryContents(command, cwd) {
       if (res.stderr.trim()) return true;
       return namesSensitive(splitNames(res.stdout));
     }
-    return logScanDowngrades(revs, false); // git log -p / -u / --patch
+    return logScanDowngrades(revs, false); // git log -p / -u / --patch / -c / --cc
   }
   return false;
 }
@@ -818,8 +927,8 @@ function mcpArgsReferenceProtected(params) {
 
 // The git subcommand after any global options, or ''.
 function gitSubcommand(command) {
-  const tokens = tokensOf(command) || [];
-  if ((tokens[0] || '').toLowerCase() !== 'git') return '';
+  const tokens = screenTokens(command);
+  if (programBase(tokens[0]) !== 'git') return '';
   let i = 1;
   while (i < tokens.length) {
     const t = tokens[i];
@@ -839,6 +948,13 @@ function gitKeyCannotCover(command) {
   if (sub === 'config') return true;
   if ((sub === 'remote' || sub === 'branch') && !readOnlyCommand(command)) return true;
   return false;
+}
+
+// Is this a git command, by bare program name (wave7-1)? The config screen
+// in decide used to gate on /^git\b/, which path spellings (`.\\git.exe`,
+// `C:git.exe`) never matched, so a planted core.pager ran unasked there.
+function isGitScreenCommand(command) {
+  return programBase(screenTokens(command)[0]) === 'git';
 }
 
 // gitConfig(command, cwd) -> the repo's config text (null when it cannot be read); injectable for tests.
@@ -862,7 +978,7 @@ function decide({mode, kind, command, params, outside, always = new Set(), cwd =
   if (ro && readsSecrets(params.command, cwd)) { ro = false; downgraded = true; }
   if (ro && cmdPercent) { ro = false; downgraded = true; }
   if (ro && dumpsArbitraryContents(params.command, cwd)) { ro = false; downgraded = true; }
-  if (ro && /^git\b/i.test(String(params.command).trim())) {
+  if (ro && isGitScreenCommand(params.command)) {
     const config = gitConfig(params.command, cwd);
     if (config === null || gitConfigRuns(config)) { ro = false; downgraded = true; }
   }
@@ -875,7 +991,25 @@ function decide({mode, kind, command, params, outside, always = new Set(), cwd =
   // judged on real paths, so a junction into another project is not "here".
   const key = alwaysKey(kind, params);
   const here = kind !== 'exec' || isInsideDir(realPathOf(root), realPathOf(cwd));
-  if (key && here && always.has(key) && !cmdPercent && !(kind === 'exec' && gitKeyCannotCover(execText))) return 'allow';
+  if (key && here && always.has(key) && !cmdPercent && !(kind === 'exec' && gitKeyCannotCover(execText))) {
+    // Wave5-C: the downgrade screens above guard only the read-only path,
+    // so a remembered key used to wave the same dangers through on a
+    // non-read-only form: `findstr … id_rsa` under a remembered findstr,
+    // or a git command in a repo whose config runs a helper. Before a key
+    // allows anything, the same screens run here, plus the exec/write-flag
+    // screen — a legacy key (saved before alwaysKey learned that screen)
+    // must not cover `git log --ext-diff` either.
+    if (kind === 'exec') {
+      if (readsSecrets(params.command, cwd)) return 'ask';
+      if (dumpsArbitraryContents(params.command, cwd)) return 'ask';
+      if (commandRunsOrWritesViaFlag(params.command)) return 'ask';
+      if (isGitScreenCommand(params.command)) {
+        const config = gitConfig(params.command, cwd);
+        if (config === null || gitConfigRuns(config)) return 'ask';
+      }
+    }
+    return 'allow';
+  }
   if (kind === 'edit' && mode === 'auto-edit') return 'allow';
   return 'ask';
 }

@@ -221,7 +221,7 @@ test('slash candidates: / alone reaches every command; /r narrows to its matches
   const agent = new FakeAgent(process.cwd());
   const ctrl = new Controller({agent, museName: 'm', version: 't', onExit() {}});
   assert.equal(ctrl.slashList('/').length, COMMANDS.length, 'no cap: every command is a candidate');
-  assert.deepEqual(ctrl.slashList('/r'), ['/resume', '/reload']);
+  assert.deepEqual(ctrl.slashList('/r'), ['/resume', '/reload', '/race']);
   ctrl.setText('/', 1);
   for (let i = 0; i < COMMANDS.length - 1; i++) ctrl.key('', {downArrow: true});
   ctrl.key('', {return: true});
@@ -1218,6 +1218,22 @@ test('resume todos come from the newest turn that recorded any, not only the las
   } finally { transcript.forResume = orig; }
 });
 
+test('resume shows an automatic continuation body kept as user text as a short label (app-ui)', async () => {
+  const {Controller} = await import('../src/ui/controller.mjs');
+  const transcript = require('../src/transcript');
+  const ctrl = new Controller({agent: new FakeAgent(process.cwd()), museName: 'm', version: 't', onExit() {}});
+  const orig = transcript.forResume;
+  transcript.forResume = async () => ({turns: [{user: 'fix it', reply: 'one'}, {user: '[muser: automatic continuation]\nThe previous leg of this task stopped…', reply: 'two'}], from: 'local'});
+  try {
+    await ctrl.showResumed({id: 'fake-synth', title: 'chat', turns: 0});
+    const users = ctrl.get().entries.filter(e => e.type === 'user').map(e => e.text);
+    assert.equal(users.length, 2);
+    assert.equal(users[0], 'fix it');
+    assert.ok(!users[1].includes('[muser:'), 'the instruction is not shown as the user\'s words');
+    assert.match(users[1], /自動で続行|continued automatically/);
+  } finally { transcript.forResume = orig; }
+});
+
 test('/account add typed at the name prompt runs after the outer flow closes (audit #163)', async () => {
   const dir = fs2.mkdtempSync(require('node:path').join(os.tmpdir(), 'muser-acct-163-'));
   const ctrl = await accountCtrl(accountAgent(dir));
@@ -1593,4 +1609,72 @@ test('ctrl+shift+v and right-click insert clipboard text through paste() (saniti
     assert.equal(ctrl.get().text, 'hello world\nnext', 'a right-click pastes the same way');
     assert.equal(textReads, 2);
   } finally { clip.clipboardImages = origImages; clip.clipboardText = origText; }
+});
+
+test('/resume pages through the other folders with ← / →, this folder first', async () => {
+  const sessions = require('../src/sessions');
+  const path = require('node:path');
+  const dir = fs2.mkdtempSync(path.join(os.tmpdir(), 'muser-resume-pages-'));
+  const agent = accountAgent(dir);
+  const otherA = path.join(dir, 'proj-a'), otherB = path.join(dir, 'proj-b');
+  const here = sessions.create(dir); sessions.touch(here, 'here chat');
+  const a1 = sessions.create(otherA); sessions.touch(a1, 'a chat');
+  const b1 = sessions.create(otherB); sessions.touch(b1, 'b chat');
+  const ctrl = await accountCtrl(agent);
+  ctrl.slash('/resume');
+  const menu = () => ctrl.get().menu, labels = () => menu().options.map(o => o.label);
+  assert.match(menu().title, /このフォルダー/);
+  assert.ok(labels().includes('here chat') && !labels().includes('b chat') && !labels().includes('a chat'), 'this folder first, only its chats');
+  // Walk right until back at this folder: every other folder is a page with only its chats.
+  const seen = [];
+  for (let i = 0; i < 200; i++) {
+    ctrl.key('', {rightArrow: true});
+    if (/このフォルダー/.test(menu().title)) break;
+    seen.push({title: menu().title, labels: labels(), hint: menu().hint});
+  }
+  assert.match(menu().title, /このフォルダー/, 'it wraps around to this folder');
+  const pageB = seen.find(p => p.title.includes(otherB)), pageA = seen.find(p => p.title.includes(otherA));
+  assert.ok(pageB && pageA, 'both other folders have a page');
+  assert.deepEqual(pageB.labels, ['b chat']);
+  assert.deepEqual(pageA.labels, ['a chat']);
+  assert.ok(seen.indexOf(pageB) < seen.indexOf(pageA), 'the folder with the newer chat comes first');
+  assert.match(pageB.hint, /この窓のフォルダーで続きます/);
+  ctrl.key('', {leftArrow: true});
+  assert.equal(menu().title, seen[seen.length - 1].title, '← from this folder goes to the last page');
+  ctrl.key('', {escape: true});
+});
+
+test('/resume in a folder without chats opens the newest other folder instead of saying there are none', async () => {
+  const sessions = require('../src/sessions');
+  const path = require('node:path');
+  const dir = fs2.mkdtempSync(path.join(os.tmpdir(), 'muser-resume-empty-'));
+  const agent = accountAgent(path.join(dir, 'empty-here'));
+  const elsewhere = sessions.create(path.join(dir, 'proj')); sessions.touch(elsewhere, 'elsewhere chat');
+  const ctrl = await accountCtrl(agent);
+  ctrl.slash('/resume');
+  assert.ok(ctrl.get().menu, 'a menu opens');
+  assert.ok(ctrl.get().menu.options.some(o => o.label === 'elsewhere chat'));
+  ctrl.key('', {escape: true});
+});
+
+// The GUI and the app draw a reply from its Markdown, not from the terminal rows: each md
+// piece carries the source lines it was rendered from, and a message's pieces joined in
+// order give back its Markdown exactly — a fence and a table that span pieces included.
+test('md pieces carry their Markdown source; joined, they are the whole message', async () => {
+  const {Controller} = await import('../src/ui/controller.mjs');
+  const agent = new FakeAgent(process.cwd());
+  const ctrl = new Controller({agent, museName: 'm', version: 't', onExit() {}});
+  const full = '# Title\n\nSome **bold** text.\n\n```js\nconst a = 1;\nconst b = 2;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n> quote\n> more';
+  // stream it in uneven chunks so the fence, the table and the quote each span pieces
+  let shown = '';
+  for (const n of [9, 13, 7, 15, 4, 11, 6, 14, 9, 3, 30, 200]) {
+    shown = full.slice(0, Math.min(full.length, shown.length + n));
+    agent.emit('text', {id: 'm', text: shown});
+  }
+  agent.emit('message-done', {id: 'm'});
+  const pieces = ctrl.get().entries.filter(e => e.type === 'md');
+  assert.ok(pieces.length > 3, 'the reply arrived in several pieces');
+  assert.ok(pieces.every(p => typeof p.src === 'string'), 'every piece names its source');
+  assert.equal(pieces[0].first, true);
+  assert.equal(pieces.map(p => p.src).join('\n'), full);
 });

@@ -320,6 +320,25 @@ test('#192 pc-login: a non-numeric account pick is re-asked instead of killing t
   assert.equal(picks, 2);
 });
 
+test('master-debug #14: a persistent 429 on send does not re-ask the contact', async () => {
+  const {web} = loginWeb();
+  let sends = 0;
+  const orig = web.nativeRequest;
+  web.nativeRequest = async (scope, route, body) => { if (route.endsWith('/send_otp')) { sends++; throw Object.assign(new Error('rate limited'), {status: 429}); } return orig(scope, route, body); };
+  const {ui, asked} = loginUi(['a@b.c', 'other@b.c', 'third@b.c']);
+  await assert.rejects(pcLogin(web, ui, {file: nextFile()}), e => e.status === 429);
+  assert.equal(sends, 3, 'retryBusy retried the same contact, then the error surfaced');
+  assert.equal(asked.filter(x => x !== 'code').length, 1, 'the contact was asked only once');
+});
+
+test('master-debug #14: a 429 on confirm is not retried as a wrong code', async () => {
+  const {web, counts} = loginWeb({confirm: () => { throw Object.assign(new Error('rate limited'), {status: 429}); }});
+  const {ui, asked} = loginUi(['a@b.c', '111111', '222222', '333333']);
+  await assert.rejects(pcLogin(web, ui, {file: nextFile()}), e => e.status === 429);
+  assert.equal(counts.confirm_otp, 1, 'the rate limit did not burn the code re-entries');
+  assert.equal(asked.filter(x => x === 'code').length, 1);
+});
+
 test('#192 pc-login: a wrong 2FA code is retried within the same login', async () => {
   const tf = {two_factor_required: true, two_factor_methods: [{method_id: 'm1', method_type: 'SMS', display_name: 'SMS'}], two_factor_state: 'ts'};
   let tfCalls = 0;

@@ -5,17 +5,18 @@
 // nothing about HTTP: GuiServer (src/gui-server.js) routes to it, and bin/muser.js
 // supplies the factory that builds a conversation (onboard + prepare + Controller).
 //
-// Limits follow the node slots (src/node-slots.js): at most 6 conversations open at
-// once. Opening past the cap closes the least recently used conversation that is not
-// busy; the default conversation (the one serve started with, which the unprefixed
-// GUI API points at) is never auto-closed — it is the anchor the existing GUI holds.
-// A non-default conversation left idle (not busy, not used) is closed by the sweep,
-// which hands its node slot back; the session itself stays in sessions.json and can
+// Limits follow the node slots (src/node-slots.js): at most MAX_OPEN conversations open at
+// once — the same cap as the node slots (/settings 'maxNodeSlots', default 16), so every open
+// conversation has a node slot of its own to register. Opening past the cap closes the least
+// recently used conversation that is not busy; the default conversation (the one serve started
+// with, which the unprefixed GUI API points at) is never auto-closed — it is the anchor the
+// existing GUI holds. A non-default conversation left idle (not busy, not used) is closed by
+// the sweep, which hands its node slot back; the session itself stays in sessions.json and can
 // be re-opened at any time.
 const fs = require('node:fs');
 const {EventEmitter} = require('node:events');
 
-const MAX_OPEN = 6;
+const MAX_OPEN = 16;
 const IDLE_MS = 30 * 60 * 1000;
 const SWEEP_MS = 60 * 1000;
 
@@ -30,6 +31,50 @@ class HostError extends Error {
 // the startup --session/-c flags); 'new' means "explicitly new, do NOT
 // resume anything". A stored session object means re-open that session.
 const NEW_SESSION = 'new';
+
+// serverfirst (out-CL §1): the attach values a client may ask for when it
+// opens a conversation (src/server/discovery.js attachSession forwards
+// --max-agents / --max-agents-total / --no-focus this way). They are
+// validated here, next to openNew's mode check (c27 #3's rule: an unchecked
+// value must not reach the factory verbatim), and passed to the factory as
+// {maxAgents, maxAgentsTotal, focusEnabled, noFocus} — only the keys the
+// caller actually supplied, so factories that predate them see the exact
+// old argument shape. focusEnabled is the derived form (an explicit
+// focusEnabled wins; otherwise it is !noFocus when noFocus was given);
+// noFocus itself also rides along, in the spelling bin/muser.js uses.
+function attachOptsOf({maxAgents, maxAgentsTotal, focusEnabled, noFocus} = {}) {
+  const out = {};
+  for (const [name, value] of [['maxAgents', maxAgents], ['maxAgentsTotal', maxAgentsTotal]]) {
+    if (value === undefined || value === null) continue;
+    if (!Number.isSafeInteger(value) || value < 0) throw new HostError(400, name + ' must be a non-negative integer');
+    out[name] = value;
+  }
+  for (const [name, value] of [['focusEnabled', focusEnabled], ['noFocus', noFocus]]) {
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'boolean') throw new HostError(400, name + ' must be a boolean');
+    out[name] = value;
+  }
+  if (out.focusEnabled === undefined && out.noFocus !== undefined) out.focusEnabled = !out.noFocus;
+  // serverfirst-debug G8: a contradictory pair (an explicit focusEnabled
+  // AND a noFocus that disagrees with it) used to ride along verbatim and
+  // resolve only by accident of the factory's apply order. The explicit
+  // focusEnabled wins — the rule this function's header already states —
+  // and noFocus is rewritten to agree, so every consumer sees one story.
+  if (out.focusEnabled !== undefined && out.noFocus !== undefined && out.noFocus === out.focusEnabled) out.noFocus = !out.focusEnabled;
+  return out;
+}
+
+// serverfirst-debug G9: did this open ask for attach values the entry was
+// NOT built with? (entry.attachOpts is what the factory actually got.)
+// The values can only shape a conversation the factory builds, so for an
+// already-open one they are dropped — the caller is told (the route
+// answers attachApplied: false) instead of the old silent no-op behind a
+// success response.
+function attachDropped(attach, entry) {
+  if (!attach || !Object.keys(attach).length) return false;
+  const built = entry?.attachOpts || {};
+  return Object.keys(attach).some(k => attach[k] !== built[k]);
+}
 
 function busyOf(entry) {
   const s = entry.controller?.s ?? entry.controller?.get?.();
@@ -70,7 +115,9 @@ function activeOf(entry) {
 }
 
 class SessionsHost extends EventEmitter {
-  // {create}: async ({cwd, account, mode, session}) => {agent, controller, museName}
+  // {create}: async ({cwd, account, mode, session, ...attachOpts}) => {agent, controller, museName}
+  // — attachOpts carries only the attach values the opener supplied
+  // (maxAgents / maxAgentsTotal / focusEnabled / noFocus, see attachOptsOf).
   // — session is a stored session object when re-opening one, NEW_SESSION
   // ('new') for a brand-new one (Third H3: never undefined — undefined means
   // "not specified" to the factory and used to inherit startup resume flags).
@@ -149,6 +196,7 @@ class SessionsHost extends EventEmitter {
     // every unprefixed route; opens and bare registrations keep #59.
     if (isDefault || wasDefault) this.defaultId = id;
     entry._prevBusy = busyOf(entry); entry._prevApproval = approvalOf(entry);
+    entry._prevTitle = entry.agent?.session?.title ?? null;
     if (typeof controller?.subscribe === 'function') {
       entry._unsubscribe = controller.subscribe(() => this.onEntryChange(entry));
     }
@@ -167,6 +215,18 @@ class SessionsHost extends EventEmitter {
       entry._prevApproval = approval;
       this.emitEvent({type: approval ? 'approval-pending' : 'approval-cleared', sessionId: entry.id, at: Date.now()});
     }
+    // gui-serve: the title lives on the agent's session, not in the Controller
+    // state, so busy/approval changes never announced it — a GUI holding the
+    // /api/server list kept a stale (or empty) title for a conversation it did
+    // not open itself. The title is set by sessions.touch at a turn's start,
+    // and the turn's own Controller changes reach this hook right after, so a
+    // change seen here is announced through the same server-event channel;
+    // the new title rides along so a listener need not re-read the list.
+    const title = entry.agent?.session?.title ?? null;
+    if (title !== entry._prevTitle) {
+      entry._prevTitle = title;
+      this.emitEvent({type: 'session-title', sessionId: entry.id, title, at: Date.now()});
+    }
   }
 
   infoOf(entry) {
@@ -174,6 +234,7 @@ class SessionsHost extends EventEmitter {
     return {
       id: entry.id,
       cwd: a?.cwd ?? null,
+      title: a?.session?.title ?? null,
       turns: a?.session?.turns ?? 0,
       mode: entry.controller?.s?.mode ?? a?.mode ?? null,
       busy: busyOf(entry),
@@ -235,7 +296,7 @@ class SessionsHost extends EventEmitter {
     return promise;
   }
 
-  async openNew({cwd, account, mode} = {}) {
+  async openNew({cwd, account, mode, maxAgents, maxAgentsTotal, focusEnabled, noFocus} = {}) {
     if (typeof cwd !== 'string' || !cwd) throw new HostError(400, 'cwd is required');
     let dir = false; try { dir = fs.statSync(cwd).isDirectory(); } catch {}
     if (!dir) throw new HostError(400, 'cwd is not an existing folder: ' + cwd);
@@ -247,6 +308,7 @@ class SessionsHost extends EventEmitter {
     // (undefined/null still means "the factory decides", as before).
     if (mode !== undefined && mode !== null && !require('../policy').MODES.includes(mode))
       throw new HostError(400, 'mode must be one of: ' + require('../policy').MODES.join(', '));
+    const attach = attachOptsOf({maxAgents, maxAgentsTotal, focusEnabled, noFocus});
     if (!this.create) throw new HostError(501, 'session hosting is not enabled');
     if (this._shuttingDown) throw new HostError(503, 'session host is shutting down');
     this.assertCapRoom();
@@ -258,26 +320,32 @@ class SessionsHost extends EventEmitter {
         // prepare() reads undefined as "not specified" and falls back to the
         // server process's startup resume flags, so a "new" conversation used
         // to silently continue the startup session (and replace the default).
-        const built = await this.create({cwd, account, mode, session: NEW_SESSION});
+        const built = await this.create({cwd, account, mode, session: NEW_SESSION, ...attach});
         this._checkOpenLive(built);
         counted = false; this._pendingOpens--;
-        return this._finishOpen(built);
+        const entry = this._finishOpen(built);
+        if (Object.keys(attach).length) entry.attachOpts = attach;
+        return entry;
       } finally { if (counted) { counted = false; this._pendingOpens--; } }
     })();
     return this._trackOpen(opening);
   }
 
-  async openExisting(ref) {
+  async openExisting(ref, attachOpts = {}) {
     if (!ref || typeof ref !== 'string') throw new HostError(400, 'session id is required');
+    // serverfirst: same attach values as openNew (discovery sends them on
+    // the /open route too). An already-open conversation is returned as-is —
+    // the values can only shape a conversation the factory actually builds.
+    const attach = attachOptsOf(attachOpts);
     const existing = this.entries.get(ref);
-    if (existing) { this.touch(ref); return existing; }
-    if (this._opening.has(ref)) return this._opening.get(ref);
+    if (existing) { this.touch(ref); if (attachDropped(attach, existing)) existing.attachDropped = true; return existing; }
+    if (this._opening.has(ref)) return this._opening.get(ref).then(entry => { if (attachDropped(attach, entry)) entry.attachDropped = true; return entry; });
     let session;
     try { session = this.findSession(ref); } catch (e) { throw new HostError(400, e.message); }
     if (!session) throw new HostError(404, 'session not found: ' + ref);
     const already = this.entries.get(session.id);
-    if (already) { this.touch(session.id); return already; }
-    if (this._opening.has(session.id)) return this._opening.get(session.id);
+    if (already) { this.touch(session.id); if (attachDropped(attach, already)) already.attachDropped = true; return already; }
+    if (this._opening.has(session.id)) return this._opening.get(session.id).then(entry => { if (attachDropped(attach, entry)) entry.attachDropped = true; return entry; });
     if (!this.create) throw new HostError(501, 'session hosting is not enabled');
     if (this._shuttingDown) throw new HostError(503, 'session host is shutting down');
     this.assertCapRoom();
@@ -285,10 +353,12 @@ class SessionsHost extends EventEmitter {
     let counted = true;
     const opening = (async () => {
       try {
-        const built = await this.create({cwd: session.cwd, account: session.account, mode: undefined, session});
+        const built = await this.create({cwd: session.cwd, account: session.account, mode: undefined, session, ...attach});
         this._checkOpenLive(built, [ref, session.id]);
         counted = false; this._pendingOpens--;
-        return this._finishOpen(built);
+        const entry = this._finishOpen(built);
+        if (Object.keys(attach).length) entry.attachOpts = attach;
+        return entry;
       } finally {
         if (counted) { counted = false; this._pendingOpens--; }
         this._opening.delete(ref); this._opening.delete(session.id);
@@ -313,9 +383,16 @@ class SessionsHost extends EventEmitter {
     this.closeSync(id, reason);
     return entry;
   }
+  // Close one conversation now. The agent is closed gracefully when it knows how (its device
+  // link goes down first, then its node id is unpaired before its client goes down); the
+  // unpair runs in the background and the promise is returned, so closeAll can wait for it
+  // before the server process exits. Agents without closeGracefully (test fakes) are closed
+  // the plain way.
+  // The entry is gone from the table either way, so a new conversation opening right after
+  // may briefly see the old slot still held and take the next free one instead.
   closeSync(id, reason = 'closed') {
     const entry = this.entries.get(id);
-    if (!entry) return;
+    if (!entry) return null;
     const wasDefault = this.defaultId === id;
     this.entries.delete(id);
     if (wasDefault) {
@@ -325,8 +402,14 @@ class SessionsHost extends EventEmitter {
       if (this.entries.size) this.promoteDefault();
     }
     if (entry._unsubscribe) { try { entry._unsubscribe(); } catch {} entry._unsubscribe = null; }
-    try { entry.agent?.close?.(); } catch {}
+    let closing = null;
+    try {
+      const graceful = entry.agent?.closeGracefully?.();
+      if (graceful && typeof graceful.catch === 'function') { closing = graceful; graceful.catch(() => {}); }
+      else entry.agent?.close?.();
+    } catch { try { entry.agent?.close?.(); } catch {} }
     this.emitEvent({type: 'session-closed', sessionId: id, reason, at: Date.now()});
+    return closing;
   }
 
   // Idle sweep: non-default, inactive conversations unused for idleMs are closed.
@@ -352,14 +435,19 @@ class SessionsHost extends EventEmitter {
     // and rejects, instead of registering on a host nobody sweeps again.
     this._shuttingDown = true;
     if (this.sweepTimer) { clearInterval(this.sweepTimer); this.sweepTimer = null; }
+    const closings = [];
     for (const id of [...this.entries.keys()]) {
       const entry = this.entries.get(id);
       try { if (entry?.agent?.busy && entry.agent.cancelAll) await entry.agent.cancelAll().catch(() => {}); } catch {}
-      this.closeSync(id, 'shutdown');
+      const p = this.closeSync(id, 'shutdown');
+      if (p) closings.push(p);
     }
     if (this._inflight.size) await Promise.allSettled([...this._inflight]);
-    for (const id of [...this.entries.keys()]) this.closeSync(id, 'shutdown');
+    for (const id of [...this.entries.keys()]) { const p = this.closeSync(id, 'shutdown'); if (p) closings.push(p); }
+    // Wait out the graceful closes (each unpair is bounded) before the server process exits,
+    // or the unpair would die with the socket and the node would linger until the next prune.
+    if (closings.length) await Promise.allSettled(closings);
   }
 }
 
-module.exports = {SessionsHost, HostError, MAX_OPEN, IDLE_MS, NEW_SESSION, busyOf, approvalOf, activeOf};
+module.exports = {SessionsHost, HostError, MAX_OPEN, IDLE_MS, NEW_SESSION, busyOf, approvalOf, activeOf, attachOptsOf};

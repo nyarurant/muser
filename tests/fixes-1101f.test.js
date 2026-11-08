@@ -181,17 +181,17 @@ test('bin: help output and an unknown demo word with a suggestion', async () => 
   assert.match(demo.err, /もしかして: muser demo login/);
 });
 
-test('bin: --help hides pc-login, keeps login, and lists the env vars in one place', async () => {
+test('bin: --help lists pc-login with its doctor note, keeps login, and lists the env vars in one place (wave 15)', async () => {
   const run = args => new Promise(res => execFile(process.execPath, [path.join(__dirname, '..', 'bin', 'muser.js'), ...args], {env: {...process.env, MUSER_LANG: 'ja'}}, (e, out, err) => res({code: e?.code ?? 0, out, err})));
   const help = await run(['--help']);
   assert.equal(help.code, 0);
-  assert.ok(!help.out.includes('pc-login'), 'pc-login still runs but is not listed in --help');
+  assert.match(help.out, /muser pc-login\s+この PC を端末として登録し直す/);
   assert.match(help.out, /muser login\s+muse\.ai にログインし直す/);
   assert.match(help.out, /環境変数:/);
   assert.match(help.out, /MUSER_NO_BELL/);
   assert.match(help.out, /MUSER_MAX_AGENTS/);
   const bin = fs.readFileSync(path.join(__dirname, '..', 'bin', 'muser.js'), 'utf8');
-  assert.ok(bin.includes("cmd === 'pc-login'"), 'the hidden alias still dispatches');
+  assert.ok(bin.includes("cmd === 'pc-login'"), 'the pc-login command still dispatches');
 });
 
 test('READMEs: background is a trailing &, and the slash list matches COMMANDS', async () => {

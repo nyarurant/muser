@@ -230,7 +230,9 @@ function formatWindow(w, now = Date.now()) {
   if (w.session) bits.push(t('会話 {id}', {id: String(w.session.id).slice(0, 8)}) + (w.session.title ? ' 「' + cleanText(w.session.title) + '」' : ''));
   const ft = focusText(w.focus); if (ft) bits.push(ft);
   const working = (w.agents || []).filter(a => a.state === 'working').length;
-  if (working) bits.push(t('エージェント {n} 体が作業中', {n: working}));
+  // One working agent takes the singular key so English reads "1 agent
+  // working", not "1 agents working" (wave 12).
+  if (working) bits.push(working === 1 ? t('エージェント 1 体が作業中') : t('エージェント {n} 体が作業中', {n: working}));
   if (w.queue) bits.push(t('キュー {n} 件', {n: w.queue}));
   if (bits.length) lines.push('    ' + bits.join(' · '));
   if (w.approval) lines.push('    ' + t('承認待ち: {call}', {call: callText(w.approval)}));

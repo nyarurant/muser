@@ -37,6 +37,24 @@ test('the preamble tells Muse how to write files, to review its diff, and to kee
   assert.match(p, /only with code\.write \/ code\.edit \/ code\.apply_patch, not with PowerShell/);
   assert.match(p, /read your whole diff/);
   assert.match(p, /Change what was asked and nothing more/);
+  assert.match(p, /guess about the cause as a hypothesis/);
+  assert.match(p, /even when they asked for them explicitly/);
+  assert.match(p, /A bug report or a complaint .* is a request to fix it/);
+  // 2026-11-06: keep trying other safe ways after a failure, ask only when none is left.
+  assert.match(p, /A failed step does not end the task/);
+  assert.match(p, /do not stop or kill a process you did not start, even one that looks like a leftover/);
+  assert.match(p, /only after you judge that every reasonable way has failed/);
+});
+
+test('Focus tells Muse to try the other safe ways before it stops or asks', () => {
+  const {INSTRUCTION, DEFINITIONS, Focus} = require('../src/focus');
+  assert.match(INSTRUCTION, /after trying the other reasonable ways/);
+  assert.match(INSTRUCTION, /not to pick between safe ways you can take yourself/);
+  assert.match(DEFINITIONS['focus.ask_user'].description, /Not for choosing between safe ways you can take yourself/);
+  assert.match(new Focus('goal').prompt(), /try the other reasonable safe ways first/);
+  assert.match(INSTRUCTION, /never mention Focus or its machinery there/);
+  assert.match(INSTRUCTION, /its start command can never be a command criterion/);
+  assert.match(new Focus('goal').prompt(), /not Focus terms/);
 });
 
 // 2026-11-01: output was decoded chunk by chunk, so a Japanese character split between two chunks

@@ -260,6 +260,9 @@ test('discover: servers disabled in Claude Code or Codex are not imported', t =>
 // Audits #232/#233 (child process, temp home): save() prunes vault entries whose
 // server/key is gone, and a $secret reference the vault lacks is reported — and
 // refuses the connect — instead of reaching the server as an empty string.
+// Wave 6 wording update: the refusal is now said in Japanese words without the
+// internal store filename, so the pin below matches the new sentence, not the
+// old English 'Secret(s) not found in the secure store (…enc)' text.
 test('save prunes orphaned vault secrets; a missing vault entry refuses the connect (child process)', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-mcp-home-'));
   const local = fs.mkdtempSync(path.join(os.tmpdir(), 'muser-mcp-local-'));
@@ -286,7 +289,7 @@ test('save prunes orphaned vault secrets; a missing vault entry refuses the conn
     assert.deepEqual(mcp.missingSecrets('ghost'), ['ghost:env:API_KEY']);
     (async () => {
       const hub = new mcp.McpHub();
-      await assert.rejects(hub.connect('ghost', loaded.mcpServers.ghost), /not found in the secure store/);
+      await assert.rejects(hub.connect('ghost', loaded.mcpServers.ghost), /秘密情報が安全な保管場所に見つかりませんでした/);
       assert.equal(hub.servers.get('ghost').status, 'error');
       await hub.close();
       console.log('CHILD OK');

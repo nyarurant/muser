@@ -36,14 +36,16 @@ test('#26 parse: an empty value is missing, so a later real key wins', () => {
 test('#26 parse: capitalised Unavailable is missing, in any casing', () => {
   assert.equal(parse('x\n[usage] context_tokens=Unavailable input_tokens=500 response_tokens=3').usage.inputTokens, 500);
   assert.equal(parse('x\n[usage] context_tokens=UNAVAILABLE input_tokens=501 response_tokens=3').usage.inputTokens, 501);
-  assert.equal(parse('x\n[usage] context_tokens=Unavailable response_tokens=Unavailable').usage.formatted, '0 in / 0 out', 'all-unavailable still reads as 0');
+  // Wave 7 spec update: formatUsage words the counts in the UI language
+  // （入 / 出 in Japanese), not fixed English 'in / out'.
+  assert.equal(parse('x\n[usage] context_tokens=Unavailable response_tokens=Unavailable').usage.formatted, '0 入 / 0 出', 'all-unavailable still reads as 0');
 });
 
 test('#26 parse: comma-grouped numbers parse whole, not at the comma', () => {
   const r = parse('x\n[usage] context_tokens=1,000 response_tokens=2,500');
   assert.equal(r.usage.inputTokens, 1000);
   assert.equal(r.usage.outputTokens, 2500);
-  assert.equal(r.usage.formatted, '1k in / 2.5k out');
+  assert.equal(r.usage.formatted, '1k 入 / 2.5k 出'); // wave 7: 入 / 出 wording, see above
   assert.equal(parse('x\n[usage] context_tokens="1,000" response_tokens=5').usage.inputTokens, 1000, 'quoted comma numbers too');
   assert.equal(parse('x\n[usage] context_tokens=0,000 input_tokens=700 response_tokens=1').usage.inputTokens, 700, 'a comma zero is still zero and must not shadow');
 });
@@ -313,13 +315,22 @@ test('#33 crash: secrets in the error stack, the error message and a trail paylo
 
 test('#33 crash: version fields are present and a benign error keeps its first line', t => {
   crashDir(t);
+  // Wave 5 changed the TERM spec (reason for the updated assertion below):
+  // the report records TERM as its KIND only ('xterm'), never the raw value
+  // ('xterm-256color'), because TERM is operator-controlled text — see
+  // termKind in src/crash.js. Pin a raw value here so the kind mapping is
+  // what the assertion actually checks.
+  const savedTerm = process.env.TERM;
+  process.env.TERM = 'xterm-256color';
+  t.after(() => { if (savedTerm === undefined) delete process.env.TERM; else process.env.TERM = savedTerm; });
   const file = crash.write({version: '9.9.9', error: new TypeError('kaboom happened'), trail: [], state: {}});
   const r = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.equal(r.muser, '9.9.9');
   assert.equal(r.node, process.version, 'the node version field');
   assert.equal(r.windows, os.release(), 'the windows (OS release) field');
   assert.equal(typeof r.terminal, 'object');
-  assert.equal(r.terminal.TERM, process.env.TERM || '', 'the terminal TERM field');
+  assert.equal(r.terminal.TERM, 'xterm', 'the terminal TERM field holds the kind only (wave 5: TERM is recorded as kind only, never its raw value)');
+  assert.ok(!fs.readFileSync(file, 'utf8').includes('xterm-256color'), 'the raw TERM value appears nowhere in the report');
   assert.equal(typeof r.terminal.windowsTerminal, 'boolean');
   assert.equal(typeof r.terminal.vscode, 'boolean');
   assert.equal(r.error, 'TypeError: kaboom happened', 'error type plus first line, no stack');

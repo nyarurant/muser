@@ -151,20 +151,38 @@ function listFrom(reg) {
 }
 function list() { return listFrom(readRegistry()); }
 function get(id) { return list().find(a => a.id === id) || null; }
-// By id, by exact label, or by an unambiguous prefix of either.
-function resolve(ref) {
+// By id, by exact label, or by an unambiguous prefix of either — with the
+// outcome told apart (wave 13 F4): "no account matches" and "several
+// accounts match" used to come back as the same null, so `account use S`
+// with sub/subtwo both matching answered "not found" and left the user
+// guessing. resolveDetailed() returns {status, account, candidates} with
+// status 'found' | 'not-found' | 'ambiguous'; resolve() keeps its old
+// account-or-null shape for its many callers and mirrors the distinction
+// on resolve.ambiguous / resolve.candidates (the sessions.find pattern),
+// so a caller that cares can list the candidates instead of lying.
+function resolveDetailed(ref) {
   const all = list(), r = String(ref || '').trim().toLowerCase();
-  if (!r) return null;
+  if (!r) return {status: 'not-found', account: null, candidates: []};
   // An exact match is held to the same standard as a prefix one (fourth audit M20): when two
   // accounts carry the exact label asked for (a hand-edited or merged registry — add() blocks
   // it in normal use), the first one used to win silently and work went to whichever Muse
   // happened to be listed first. Ambiguous is ambiguous: no match.
   const exacts = all.filter(a => a.id === r || a.label.toLowerCase() === r);
-  if (exacts.length === 1) return exacts[0];
-  if (exacts.length > 1) return null;
+  if (exacts.length === 1) return {status: 'found', account: exacts[0], candidates: exacts};
+  if (exacts.length > 1) return {status: 'ambiguous', account: null, candidates: exacts};
   const hits = all.filter(a => a.id.startsWith(r) || a.label.toLowerCase().startsWith(r));
-  return hits.length === 1 ? hits[0] : null;
+  if (hits.length === 1) return {status: 'found', account: hits[0], candidates: hits};
+  if (hits.length > 1) return {status: 'ambiguous', account: null, candidates: hits};
+  return {status: 'not-found', account: null, candidates: []};
 }
+function resolve(ref) {
+  const d = resolveDetailed(ref);
+  resolve.ambiguous = d.status === 'ambiguous';
+  resolve.candidates = d.status === 'ambiguous' ? d.candidates : [];
+  return d.account;
+}
+resolve.ambiguous = false;
+resolve.candidates = [];
 function activeId() {
   // One read, one snapshot (fourth audit M9): this used to read the registry twice — once
   // here, once inside get() — so a switch landing between the two reads was answered from a
@@ -225,9 +243,9 @@ function rename(id, label) {
 }
 // The store names / folders one account's secrets and browser profile live in.
 function filesFor(id) {
-  if (id === DEFAULT_ID) return {web: 'web.enc', session: 'session.enc', device: 'device.enc', browser: store.file('browser')};
+  if (id === DEFAULT_ID) return {web: 'web.enc', session: 'session.enc', device: 'device.enc', contact: 'contact.enc', browser: store.file('browser')};
   const base = 'accounts/' + id;
-  return {web: base + '/web.enc', session: base + '/session.enc', device: base + '/device.enc', browser: store.file(base + '/browser')};
+  return {web: base + '/web.enc', session: base + '/session.enc', device: base + '/device.enc', contact: base + '/contact.enc', browser: store.file(base + '/browser')};
 }
 function hasLogin(id) { try { return fs.existsSync(store.file(filesFor(id).web)); } catch { return false; } }
 function hasDevice(id) { try { return fs.existsSync(store.file(filesFor(id).device)); } catch { return false; } }
@@ -250,8 +268,9 @@ function remove(id) {
     // store.remove swallows every unlink error, so each secret file's deletion is verified
     // here and retried once directly; whatever still exists is reported by path instead of
     // silently staying behind for a same-name re-add to inherit (c25 #3).
-    const secretPaths = [files.web, files.session, files.device].map(name => store.file(name));
-    for (const name of [files.web, files.session, files.device]) store.remove(name);
+    const secretNames = [files.web, files.session, files.device, files.contact];
+    const secretPaths = secretNames.map(name => store.file(name));
+    for (const name of secretNames) store.remove(name);
     for (const p of secretPaths) {
       if (fs.existsSync(p)) { try { fs.unlinkSync(p); } catch {} }
       if (fs.existsSync(p)) leftoverFiles.push(p);
@@ -278,7 +297,8 @@ function nameFile() { return store.file('identity.json'); }
 function museName(id = DEFAULT_ID) {
   try {
     const v = JSON.parse(fs.readFileSync(nameFile(), 'utf8'));
-    return v?.byAccount?.[id] || (id === DEFAULT_ID ? v?.name : null) || 'Muse';
+    const n = v?.byAccount?.[id] || (id === DEFAULT_ID ? v?.name : null);
+    return typeof n === 'string' && n ? n : 'Muse';
   } catch { return 'Muse'; }
 }
 // identity.json updates go through the registry lock and an atomic rename (audit #41):
@@ -311,9 +331,20 @@ function updateIdentity(fn) {
     }
     if (raw !== null) {
       exists = true;
-      try { v = JSON.parse(raw); } catch { return; }
+      try { v = JSON.parse(raw); } catch {
+        // A file that does not parse used to make every remember* a silent
+        // permanent no-op: the names and /usage records were never saved
+        // again and nothing said why. Keep the bytes (backed aside, never
+        // clobbered) and start fresh, so the store heals instead of wedging.
+        try { fs.renameSync(nameFile(), nameFile() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {}
+        v = {};
+      }
     }
     if (!v || typeof v !== 'object' || Array.isArray(v)) { if (exists) return; v = {}; }
+    // A hand-edited byAccount/usageCmd of the wrong type must not be spread
+    // into the file (a string byAccount became {"0":"n","1":"o",...}).
+    if (!v.byAccount || typeof v.byAccount !== 'object' || Array.isArray(v.byAccount)) v.byAccount = {};
+    if (!v.usageCmd || typeof v.usageCmd !== 'object' || Array.isArray(v.usageCmd)) v.usageCmd = {};
     if (fn(v) === false) return;
     // Fencing, like changeRegistry (audit #40): a holder paused past the steal threshold
     // until its lock was taken must not write over the thief's identity update when it wakes
@@ -440,4 +471,4 @@ function choose(candidates, {currentId = null, fresh = false, margin = 20, at} =
   return {id: best.id, reason: !alive.length ? 'all-exhausted' : hadCurrent ? 'failover' : 'least-used'};
 }
 
-module.exports = {DEFAULT_ID, list, get, resolve, add, rename, remove, activeId, setActive, filesFor, hasLogin, hasDevice, threshold, exhausted, choose, slug, validId, museName, rememberMuseName, usageCmd, rememberUsageCmdSent, rememberUsageSeen};
+module.exports = {DEFAULT_ID, list, get, resolve, resolveDetailed, add, rename, remove, activeId, setActive, filesFor, hasLogin, hasDevice, threshold, exhausted, choose, slug, validId, museName, rememberMuseName, usageCmd, rememberUsageCmdSent, rememberUsageSeen};

@@ -125,4 +125,20 @@ function attachment(file, temporary = false) {
 // What the chat API takes (same shape as the muse.ai web client).
 function toItems(list) { return list.map(a => ({type: 'image', mime_type: a.type, data_base64: a.data, filename: a.name})); }
 
-module.exports = {clipboardImages, clipboardText, clipboardTextDetailed, pastedImagePaths, attachment, toItems, isImage, TEXT_TIMEOUT_MS};
+// Text onto the Windows clipboard (the fullscreen screen's selection). clip.exe is used, fed
+// UTF-16LE so Japanese survives — WITHOUT a byte-order mark, which clip.exe keeps as a first
+// character of the copied text. Lines end in CRLF, the clipboard's own convention. It starts
+// far faster than PowerShell's Set-Clipboard. Resolves true when clip.exe took the text.
+function copyText(text) {
+  return new Promise(resolve => {
+    let child;
+    try { child = require('node:child_process').spawn('clip.exe', [], {stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true}); }
+    catch { return resolve(false); }
+    child.on('error', () => resolve(false));
+    child.on('close', code => resolve(code === 0));
+    child.stdin.on('error', () => {});
+    child.stdin.end(Buffer.from(String(text).replace(/\r?\n/g, '\r\n'), 'utf16le'));
+  });
+}
+
+module.exports = {clipboardImages, clipboardText, clipboardTextDetailed, pastedImagePaths, attachment, toItems, isImage, TEXT_TIMEOUT_MS, copyText};

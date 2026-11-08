@@ -193,7 +193,10 @@ test('record: real tokens from a live [usage] line accumulate separately from th
   // thousand times smaller than the real line under it); turns and tools stay.
   assert.match(usage.formatSummary(), /^今日: ターン 2 \/ ツール 0 回$/m);
   assert.equal(s.today.approxTokens > 0, true, 'the estimate is still kept in the data');
-  assert.match(usage.formatSummary(), /今日の実績: 131\.8k in \/ 400 out（Muse の実測値）/);
+  // Wave 7 spec update: the real line's counts go through formatUsage, so
+  // the in/out words follow the UI language （入 / 出） — they were fixed
+  // English ('131.8k in / 400 out') in this Japanese summary before.
+  assert.match(usage.formatSummary(), /今日の実績: 131\.8k 入 \/ 400 出（Muse の実測値）/);
 });
 
 test('formatSummary: no real line when no turn carried usage', () => {
@@ -212,10 +215,11 @@ test('windows: real tokens land in the last hour and the all-time total; /usage 
   assert.equal(s.allTime.realInTokens, 3000);
   assert.equal(s.allTime.realOutTokens, 75);
   const text = usage.formatSummary();
-  assert.match(text, /直近1時間の実績: 3k in \/ 75 out（Muse の実測値）/);
-  assert.match(text, /今日の実績: 3k in \/ 75 out（Muse の実測値）/);
-  assert.match(text, /直近7日の実績: 3k in \/ 75 out（Muse の実測値）/);
-  assert.match(text, /累計の実績: 3k in \/ 75 out（Muse の実測値）/);
+  // Wave 7 spec update: same 入 / 出 wording as the record test above.
+  assert.match(text, /直近1時間の実績: 3k 入 \/ 75 出（Muse の実測値）/);
+  assert.match(text, /今日の実績: 3k 入 \/ 75 出（Muse の実測値）/);
+  assert.match(text, /直近7日の実績: 3k 入 \/ 75 出（Muse の実測値）/);
+  assert.match(text, /累計の実績: 3k 入 \/ 75 出（Muse の実測値）/);
 });
 
 test('windows: an old minute bucket leaves the last hour but stays in the total; record prunes the oldest', () => {

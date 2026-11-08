@@ -69,7 +69,11 @@ test('fix2 forResume: merging many long turns with a shared prefix stays fast (e
 test('fix2 latest: a registry response without a valid version is a failed check, not "up to date"', async t => {
   const saved = global.fetch;
   t.after(() => { global.fetch = saved; });
-  for (const body of [{}, [], {version: ''}, {version: 'not-a-version'}, null]) { global.fetch = async () => ({ok: true, json: async () => body}); await assert.rejects(() => update.latest(), /no version in response/, 'body: ' + JSON.stringify(body)); }
+  // Wave 7 spec update: latest() throws a worded error now — the Japanese
+  // '返事に版の情報がありませんでした' — instead of the raw English
+  // 'npm registry: no version in response' this used to match, because
+  // /update prints e.message straight to the user.
+  for (const body of [{}, [], {version: ''}, {version: 'not-a-version'}, null]) { global.fetch = async () => ({ok: true, json: async () => body}); await assert.rejects(() => update.latest(), /返事に版の情報がありませんでした/, 'body: ' + JSON.stringify(body)); }
   global.fetch = async () => ({ok: true, json: async () => ({version: '0.3.9'})});
   assert.equal(await update.latest(), '0.3.9');
 });
@@ -78,10 +82,13 @@ test('fix2 install: a pinned version is verified after install; a mismatch or ba
   assert.equal(ok.ok, true, ok.output);
   const bad = await update.install({version: '9.9.9', command: 'echo installing', verifyCommand: 'echo muser-cli@9.9.8'});
   assert.equal(bad.ok, false);
-  assert.match(bad.output, /not the v9\.9\.9/);
+  // Wave 6 wording update: update.install / verify messages are worded in
+  // Japanese now (was English 'Installed version is v… not the v…' /
+  // 'Invalid update version' / 'already running in another muser window').
+  assert.match(bad.output, /入った版は v9\.9\.8 で、案内した v9\.9\.9 と違います/);
   const invalid = await update.install({version: '1.2.3; echo pwned', command: 'echo should-not-run'});
   assert.equal(invalid.ok, false);
-  assert.match(invalid.output, /Invalid update version/);
+  assert.match(invalid.output, /更新の版の形式が違います/);
 });
 test('fix2 install: the registry is pinned in the child environment and the cwd is the home folder', async () => {
   const reg = await update.install({command: 'echo %npm_config_registry%'});
@@ -98,7 +105,7 @@ test('fix2 install: a live other-window lock blocks, a dead holder lock is claim
   fs.writeFileSync(lockFile, 'sometoken:' + process.pid);
   const blocked = await update.install({command: 'echo should-not-run', lockFile});
   assert.equal(blocked.ok, false);
-  assert.match(blocked.output, /another muser window/);
+  assert.match(blocked.output, /別の muser の窓で更新が実行中です/); // wave 6: Japanese wording (see above)
   fs.writeFileSync(lockFile, 'sometoken:999999');
   const ran = await update.install({command: 'echo lock-claimed', lockFile});
   assert.equal(ran.ok, true, ran.output);

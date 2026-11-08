@@ -132,7 +132,9 @@ test('turn-usage: a [usage] line with no token keys is reply content, not 0 / 0 
   assert.equal(tu.strip('answer\n[usage] is explained in the docs'), 'answer\n[usage] is explained in the docs');
   const allUnavail = tu.parse('x\n[usage] context_tokens=unavailable response_tokens=unavailable');
   assert.ok(allUnavail, 'keys present but unavailable still counts as a usage line');
-  assert.equal(allUnavail.usage.formatted, '0 in / 0 out');
+  // Wave 7 spec update: formatted usage follows the UI language —
+  // '0 入 / 0 出' in Japanese, not the old fixed '0 in / 0 out'.
+  assert.equal(allUnavail.usage.formatted, '0 入 / 0 出');
   const found = tu.usageFromTranscript({messages: [
     {role: 'assistant', content: [{text: 'real\n\n[usage] context_tokens=2000 response_tokens=50'}]},
     {role: 'assistant', content: [{text: 'later reply\n[usage] is a feature of the gateway'}]},

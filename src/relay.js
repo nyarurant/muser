@@ -53,7 +53,10 @@ function request(pipe, msg, timeoutMs, maxBytes = MAX_LINE_BYTES) {
 
 class Relay {
   // takes(params): would this window run the call (it has the turn it belongs to)?
-  // run(command, params, timeoutMs, id): run it here and return the device result.
+  // run(command, params, timeoutMs, id, signal): run it here and return the device result.
+  // The signal aborts when the window that handed the call over disconnects mid-invoke
+  // (its request timed out or its process went away), so a run that honours it can stop
+  // instead of completing for nobody. A run that ignores the signal is unaffected.
   // idleTimeoutMs / maxLineBytes default to the module constants; tests may shrink them.
   // account(): this window's Muse account id (src/accounts.js). A call is only ever handed to a
   // window on the same account: another account's window would run it for a Muse whose chat
@@ -75,6 +78,7 @@ class Relay {
     this.server = net.createServer(sock => {
       this._sockets.add(sock);
       let buf = '';
+      let invokeController = null; // the in-flight invoke's controller on this socket, if any
       let idle = null;
       const armIdle = () => {
         if (idle) clearTimeout(idle);
@@ -83,7 +87,10 @@ class Relay {
       armIdle();
       sock.setEncoding('utf8');
       sock.on('error', () => {});
-      sock.on('close', () => { if (idle) clearTimeout(idle); this._sockets.delete(sock); });
+      // The caller hanging up is the cancel for an invoke in flight on this socket:
+      // request() destroys its socket when it gives up, and Relay.stop() destroys
+      // them all, so a close here aborts that invoke's controller (see below).
+      sock.on('close', () => { if (idle) clearTimeout(idle); this._sockets.delete(sock); if (invokeController) { const c = invokeController; invokeController = null; try { c.abort(); } catch {} } });
       // One connection carries exactly one request (see request()). Once a complete
       // line has been taken, further data on this socket is never parsed or run: a
       // second line used to be silently dropped when it shared the first chunk, but
@@ -112,10 +119,24 @@ class Relay {
           const hasAccount = !!msg && typeof msg === 'object' && Object.prototype.hasOwnProperty.call(msg, 'account');
           const other = hasAccount && (msg.account || 'default') !== mine;
           if (msg.type === 'takes') reply = {takes: !other && !!this.takes(msg.params)};
-          else if (msg.type === 'invoke') reply = {result: other ? {ok: false, error: 'This call came from another Muse account than this muser window is on.'} : await this.run(msg.command, msg.params, msg.timeoutMs, msg.id)};
+          else if (msg.type === 'invoke') {
+            if (other) reply = {result: {ok: false, error: 'This call came from another Muse account than this muser window is on.'}};
+            else {
+              // One AbortController per invoke, handed to run as its 5th argument.
+              // No new wire message is needed — the socket close IS the cancel —
+              // and the reply shape is unchanged. A run with the old 4-argument
+              // signature simply ignores the signal and runs as before.
+              const controller = new AbortController();
+              invokeController = controller;
+              try { reply = {result: await this.run(msg.command, msg.params, msg.timeoutMs, msg.id, controller.signal)}; }
+              finally { if (invokeController === controller) invokeController = null; }
+            }
+          }
           else reply = {error: 'unknown'};
         } catch (e) { reply = {result: {ok: false, error: e.message}}; }
-        sock.end(JSON.stringify(reply) + '\n');
+        // The caller may already be gone — that is what aborted the run — so a
+        // reply for it is dropped quietly instead of written to a dead socket.
+        if (!sock.destroyed) { try { sock.end(JSON.stringify(reply) + '\n'); } catch {} }
       });
     });
     this.server.on('error', () => {});

@@ -75,20 +75,65 @@ function locked(fn) { return require('./config').withLock(file(), fn); }
 // a convenience and must never break a session), but it no longer reports success for a
 // save that never landed (audit #219): callers can see false for an unreadable file, a
 // failed write, or an entry fn() rejected.
+// Wave 14: the false contract covers the THROWING failures too. The inner catch only
+// guards fn()'s read-modify-write; config.withLock throws before fn() ever runs — a
+// live window's lock held past the budget, or its mkdir failing with EEXIST when the
+// permissions folder's parent is a plain file — and those throws escaped saveMode /
+// addAllow / clearAllow raw, past every caller that checks for false (the controller
+// rolled nothing back; only the screen's generic catch showed the raw lock text).
+// A save that throws is a save that did not land: false, like the rest.
 function update(cwd, fn) {
-  return locked(() => {
-    try {
-      const data = readAll(), k = key(cwd), lk = legacyKey(cwd);
-      if (data.unreadable) return false; // never write over a file that could not be read
-      if (data.bad) { try { fs.renameSync(file(), file() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} delete data.bad; }
-      // An entry remembered under the pre-fix lexical key is carried over to
-      // the canonical key on the folder's next change, not silently orphaned.
-      const entry = data.folders[k] || data.folders[lk] || {mode: null, allow: []};
-      fn(entry); entry.updatedAt = new Date().toISOString();
-      data.folders[k] = entry; if (lk !== k) delete data.folders[lk]; writeAll(data);
-      return true;
-    } catch { return false; } // remembering is a convenience; it never breaks a session
-  });
+  try {
+    return locked(() => {
+      try {
+        const data = readAll(), k = key(cwd), lk = legacyKey(cwd);
+        if (data.unreadable) return false; // never write over a file that could not be read
+        if (data.bad) { try { fs.renameSync(file(), file() + '.corrupt-' + new Date().toISOString().replace(/[:.]/g, '-')); } catch {} delete data.bad; }
+        // An entry remembered under the pre-fix lexical key is carried over to
+        // the canonical key on the folder's next change, not silently orphaned.
+        const entry = data.folders[k] || data.folders[lk] || {mode: null, allow: []};
+        fn(entry); entry.updatedAt = new Date().toISOString();
+        data.folders[k] = entry; if (lk !== k) delete data.folders[lk]; writeAll(data);
+        return true;
+      } catch { return false; } // remembering is a convenience; it never breaks a session
+    });
+  } catch { return false; }
+}
+
+// A change marker for the shared file: the byte size plus a SHA-256 hash
+// of its exact contents (a content hash), or null when there is no
+// readable file. A running window checks this on every approval judgment
+// (src/agent.js refreshPermissions): when another window saved, revoked
+// or re-moded anything, the stamp moves and the window re-reads the file
+// instead of judging from its startup snapshot forever. The token is
+// content-based, not timestamp-based, because on Windows mtime/ctime
+// share a ~0.5-1ms quantum: a same-size rewrite landing in the same tick
+// produced an identical timestamp stamp and the change was silently
+// missed. Identical bytes rewritten still yield the same token, which
+// is fine — nothing changed.
+function stamp() {
+  try { const raw = fs.readFileSync(file()); return raw.length + ':' + crypto.createHash('sha256').update(raw).digest('hex'); }
+  catch { return null; }
+}
+
+// The file's health, for a running window deciding how much to trust a
+// changed file (src/agent.js refreshPermissions): 'missing' when there is
+// no file, 'corrupt' when the file is there but its JSON cannot be parsed
+// into the store shape readAll() expects, 'ok' otherwise. The tolerance is
+// readAll()'s own, not a stricter one: a valid store whose entries are
+// malformed is 'ok' (readAll normalises those entries), and an empty or
+// whitespace-only file is 'ok' too (readAll reads it as nothing remembered,
+// its `bad` flag stays off). Any other read failure (the path is a folder,
+// a permission error) leaves no JSON to parse, so it counts as 'corrupt'.
+function fileState() {
+  let raw;
+  try { raw = fs.readFileSync(file(), 'utf8'); }
+  catch (e) { return e?.code === 'ENOENT' ? 'missing' : 'corrupt'; }
+  try {
+    const j = require('./config').parseJson(raw);
+    if (j && j.folders && typeof j.folders === 'object' && !Array.isArray(j.folders)) return 'ok';
+  } catch {}
+  return raw.trim() ? 'corrupt' : 'ok';
 }
 
 function load(cwd) {
@@ -101,4 +146,4 @@ function saveMode(cwd, mode) { return MODES.includes(mode) ? update(cwd, e => { 
 function addAllow(cwd, k) { return k ? update(cwd, e => { if (!e.allow.includes(k)) e.allow.push(k); }) : false; }
 function clearAllow(cwd) { return update(cwd, e => { e.allow = []; }); }
 
-module.exports = {load, saveMode, addAllow, clearAllow, file, key};
+module.exports = {load, saveMode, addAllow, clearAllow, file, key, stamp, fileState};

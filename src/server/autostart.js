@@ -13,10 +13,41 @@ const TASK_NAME = 'muser-server';
 
 function vbsPath(home = os.homedir()) { return path.join(home, '.muser', 'autostart.vbs'); }
 
-function vbsContent(nodePath, binFile) {
+function vbsContent(nodePath, binFile, home = os.homedir()) {
   const q = s => '"' + String(s).replace(/"/g, '""') + '"';
   return 'Set sh = CreateObject("WScript.Shell")\r\n' +
+    // #12: without a working folder the logon launch runs in
+    // C:\WINDOWS\system32 (the logon working folder), and the server's
+    // default conversation inherits it. Start in the home folder instead.
+    'sh.CurrentDirectory = ' + q(home) + '\r\n' +
+    // The hidden window still gives node a console, so serve took it for a terminal and
+    // asked its first-run questions (the language picker on a home with no lang saved)
+    // in a window nobody can see: the logon launch hung before opening HTTP. The
+    // variable tells serve it runs in the background (no terminal prompts; any
+    // preparation goes over /api/setup, as for a GUI-launched serve).
+    'sh.Environment("PROCESS")("MUSER_BACKGROUND") = "1"\r\n' +
     'sh.Run ' + q(q(nodePath) + ' ' + q(binFile) + ' serve') + ', 0, False\r\n';
+}
+
+// An autostart.vbs written before #12 launches `muser serve` with no
+// working folder. Rewrite an existing launcher that differs from the
+// current one — on `autostart on` (via setAutostart) and on server
+// startup. A missing launcher means autostart is off and is left alone.
+function readVbs(vbs) {
+  try { return fs.readFileSync(vbs, 'utf16le').replace(/^\ufeff/, ''); } catch { return null; }
+}
+
+function refreshAutostartVbs({binFile, nodePath = process.execPath, home = os.homedir(), platform = process.platform} = {}) {
+  if (platform !== 'win32') return {rewritten: false, vbs: vbsPath(home), reason: 'non-windows'};
+  if (!binFile) throw new Error('binFile is required');
+  const vbs = vbsPath(home);
+  const current = readVbs(vbs);
+  if (current === null) return {rewritten: false, vbs, reason: 'no launcher'};
+  const wanted = vbsContent(nodePath, binFile, home);
+  if (current === wanted) return {rewritten: false, vbs};
+  fs.mkdirSync(path.dirname(vbs), {recursive: true});
+  fs.writeFileSync(vbs, '\ufeff' + wanted, 'utf16le');
+  return {rewritten: true, vbs};
 }
 
 function defaultRun(file, args) {
@@ -38,7 +69,7 @@ async function setAutostart(on, {binFile, nodePath = process.execPath, home = os
     // Japanese user name, a Japanese install folder) and the logon launch
     // pointed at a path that does not exist. UTF-16LE with a BOM is the
     // encoding WSH detects as Unicode, so the paths survive as written.
-    fs.writeFileSync(vbs, '\ufeff' + vbsContent(nodePath, binFile), 'utf16le');
+    fs.writeFileSync(vbs, '\ufeff' + vbsContent(nodePath, binFile, home), 'utf16le');
     try {
       await run('schtasks', ['/Create', '/TN', TASK_NAME, '/SC', 'ONLOGON', '/TR', 'wscript.exe "' + vbs + '"', '/F']);
       // Registered via the task now: drop any Run-key registration an earlier
@@ -72,4 +103,4 @@ async function setAutostart(on, {binFile, nodePath = process.execPath, home = os
   return {on: false, task: TASK_NAME};
 }
 
-module.exports = {TASK_NAME, vbsPath, vbsContent, setAutostart};
+module.exports = {TASK_NAME, vbsPath, vbsContent, setAutostart, refreshAutostartVbs};

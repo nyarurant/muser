@@ -16,19 +16,23 @@ function readConfig() { try { return require('./config').readJson(configFile()) 
 function osLang() { return /^ja\b/i.test(Intl.DateTimeFormat().resolvedOptions().locale || '') ? 'ja' : 'en'; }
 // A regional tag names its language: en-US / ja-JP / en_GB mean en / ja / en. Only the exact
 // 'en' / 'ja' used to be accepted, so MUSER_LANG=en-US was silently ignored (audit #225).
-function norm(l) { const p = String(l || '').toLowerCase().split(/[-_]/)[0]; return LANGS.includes(p) ? p : null; }
+function norm(l) { const p = String(l || '').trim().toLowerCase().split(/[-_]/)[0]; return LANGS.includes(p) ? p : null; }
 // The language the user picked (config.json), or null before the first run asked.
 function chosen() { return norm(readConfig().lang); }
 function lang() {
   if (current) return current;
   return (current = norm(process.env.MUSER_LANG) || chosen() || osLang());
 }
+// Returns whether the choice is saved (or saving was not asked for). Wave 14: a failed
+// save used to be swallowed whole — the window switched, nothing said so, and the next
+// start quietly went back. Callers that tell the user (/lang) read the result and say
+// the switch is for this window only when it is false.
 function setLang(l, {save = true} = {}) {
   const n = norm(l);
-  if (!n) return;
+  if (!n) return false;
   current = n; l = n;
-  if (!save) return;
-  try { require('./config').update(cfg => { cfg.lang = l; }); } catch {}
+  if (!save) return true;
+  try { require('./config').update(cfg => { cfg.lang = l; }); return true; } catch { return false; }
 }
 // {name} placeholders (e.g. {title}) are filled after the lookup.
 function t(text, vars) {

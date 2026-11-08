@@ -82,7 +82,7 @@ class WindowStatus {
   constructor({ctrl, agent, file = fileFor()}) {
     this.ctrl = ctrl; this.agent = agent; this.file = file;
     this.startedAt = Date.now(); this.toolLog = []; this.progress = []; this.lastTurn = null;
-    this.runningKey = null; this.runningSince = null; this.approvalKey = null; this.approvalSince = null; this.timer = null; this.heartbeat = null; this.stopped = false; this.lastWrite = 0;
+    this.runningKey = null; this.runningSince = null; this.approvalKey = null; this.approvalSince = null; this.timer = null; this.heartbeat = null; this.stopped = false; this.lastWrite = 0; this.answeredRequests = new Set();
   }
   write() {
     if (this.stopped) return false;
@@ -98,12 +98,60 @@ class WindowStatus {
       const asking = s.approval?.call || null;
       if (asking !== this.approvalKey) { this.approvalKey = asking; this.approvalSince = asking ? Date.now() : null; }
       const data = snapshot({s, agent: this.agent, startedAt: this.startedAt, runningSince: this.runningSince, approvalSince: this.approvalSince, toolLog: this.toolLog, progress: this.progress, lastTurn: this.lastTurn});
+      // The recent-events ring rides along when the session installed one
+      // (src/ui/event-ring.js via boot.mjs): shape-only entries, so the
+      // file's "shapes, never content" rule above still holds, and
+      // `muser export --window` can pick the ring up from here too.
+      if (this.eventSource) { try { data.events = this.eventSource.list(); } catch {} }
       temp = this.file + '.tmp-' + process.pid + '-' + Date.now();
       fs.mkdirSync(path.dirname(this.file), {recursive: true});
       fs.writeFileSync(temp, JSON.stringify(data));
       renameRetry(temp, this.file);
       return true;
     } catch { if (temp) { try { fs.unlinkSync(temp); } catch {} } return false; } // never breaks the window
+  }
+  // `muser export --window` asks through this folder (src/export-window.js):
+  // a request-<pid>-<id>.json appears — one file per collection, the id
+  // unique to it (wave 18) — and the answer is the CURRENT snapshot plus
+  // the events ring, written to the matching response-<pid>-<id>.json.
+  // Every pending request in the folder is answered in one pass, each to
+  // its own response file, and only the request file that was answered is
+  // removed. The pre-wave-18 name (request-<pid>.json, answered at
+  // response-<pid>.json) is still served, so an older collector keeps
+  // working against a newer window. Polled once a second and every
+  // failure is swallowed: an export must never disturb the window it
+  // reports on.
+  answerRequests() {
+    if (this.stopped) return;
+    const folder = path.dirname(this.file);
+    let names = [];
+    try { names = fs.readdirSync(folder); } catch { return; }
+    const legacyName = 'request-' + process.pid + '.json';
+    const prefix = 'request-' + process.pid + '-';
+    for (const name of names) {
+      const legacy = name === legacyName;
+      if (!legacy && !(name.startsWith(prefix) && name.endsWith('.json'))) continue;
+      const reqFile = path.join(folder, name);
+      let req = null;
+      try { req = JSON.parse(fs.readFileSync(reqFile, 'utf8')); } catch { continue; }
+      if (!req || req.pid !== process.pid || !req.id) continue;
+      // A new-scheme file carries its collection's id in its name; a
+      // content id that disagrees with the name is not a request whose
+      // collector waits on the response this name routes to.
+      if (!legacy && name.slice(prefix.length, -'.json'.length) !== req.id) continue;
+      if (this.answeredRequests.has(req.id)) { try { fs.unlinkSync(reqFile); } catch {} continue; }
+      this.answeredRequests.add(req.id);
+      if (this.answeredRequests.size > 100) this.answeredRequests.delete(this.answeredRequests.values().next().value);
+      try {
+        const s = this.ctrl.get();
+        const data = snapshot({s, agent: this.agent, startedAt: this.startedAt, runningSince: this.runningSince, approvalSince: this.approvalSince, toolLog: this.toolLog, progress: this.progress, lastTurn: this.lastTurn});
+        const resFile = path.join(folder, legacy ? 'response-' + process.pid + '.json' : 'response-' + process.pid + '-' + req.id + '.json');
+        const temp = resFile + '.tmp-' + process.pid + '-' + req.id;
+        fs.writeFileSync(temp, JSON.stringify({id: req.id, pid: process.pid, at: new Date().toISOString(), state: data, events: this.eventSource ? this.eventSource.list() : []}));
+        renameRetry(temp, resFile);
+      } catch {}
+      try { fs.unlinkSync(reqFile); } catch {}
+    }
   }
   // A change on screen: written now if the last write is a second old, else once that second is up.
   schedule() {
@@ -126,6 +174,7 @@ class WindowStatus {
     this.unsubscribe = this.ctrl.subscribe(() => this.schedule());
     this.write();
     this.heartbeat = setInterval(() => this.write(), HEARTBEAT_MS); this.heartbeat.unref?.();
+    this.requestTimer = setInterval(() => this.answerRequests(), 1000); this.requestTimer.unref?.();
     this.onExit = () => this.stop();
     process.on('exit', this.onExit);
     return this;
@@ -134,7 +183,7 @@ class WindowStatus {
   stop() {
     if (this.stopped) return;
     this.stopped = true;
-    clearTimeout(this.timer); clearInterval(this.heartbeat);
+    clearTimeout(this.timer); clearInterval(this.heartbeat); clearInterval(this.requestTimer);
     try { this.unsubscribe?.(); } catch {}
     const a = this.agent;
     a.off?.('tool-end', this.onTool); a.off?.('progress', this.onProgress); a.off?.('turn-end', this.onTurnEnd);
@@ -147,7 +196,12 @@ class WindowStatus {
 function live(v, {isAlive = alive, now = Date.now(), staleMs = STALE_MS} = {}) {
   if (!v || typeof v !== 'object' || v.kind !== 'window' || !Number.isInteger(v.pid)) return false;
   const updated = Date.parse(v.updatedAt);
-  return isAlive(v.pid) && Number.isFinite(updated) && now - updated <= staleMs;
+  // A heartbeat from the future is not proof of life either (the exec verdict's
+  // rule, wave 15): a clock set forward while the window wrote and corrected
+  // afterwards would keep a dead window "live" until real time caught up with
+  // the stamp. A stamp within the stale window ahead of now is ordinary clock
+  // skew between writer and reader and still counts.
+  return isAlive(v.pid) && Number.isFinite(updated) && updated - now <= staleMs && now - updated <= staleMs;
 }
 // Every open window's state, oldest window first. Files of windows that are gone are skipped.
 function readAll({folder = dir(), ...opts} = {}) {

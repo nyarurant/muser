@@ -3,6 +3,7 @@
 // GuiServer next to gui.json): how a second `muser serve` finds the resident server
 // and attaches to it instead of starting a rival, and how `muser server status/stop`
 // talk to it. Everything here is plain HTTP with the file's Bearer token.
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -62,20 +63,56 @@ async function readBodyCapped(res, maxBytes) {
   return text;
 }
 
+// wave18 (a): a /send used to carry no idempotency key at all, so when the
+// client-side abort below fired (120 s default for a body) a send the server
+// had ALREADY accepted looked exactly like one that never left — and the
+// user's re-send ran the turn twice (measured: exec=1 at the abort, exec=2
+// after the re-send). Every /send now carries a fresh client-generated
+// request id, in the body (`requestId`, the questionId/approvalId naming
+// style) and in the `x-muser-request-id` header, so a future server-side
+// dedupe has a stable key to refuse the duplicate with. Dedupe itself is
+// the server side's half of this finding (audit-server): until the server
+// honours the id, the client can only label the send, not make it safe.
+// A caller-supplied requestId is respected (and mirrored to the header),
+// so a deliberate retry of the SAME send can reuse its id.
+function isSendPath(p) { return typeof p === 'string' && p.split('?')[0].endsWith('/send'); }
+function newRequestId() { try { return crypto.randomUUID(); } catch { return crypto.randomBytes(16).toString('hex'); } }
+
 async function request(info, method, p, body, timeoutMs, maxBytes = MAX_RESPONSE_BYTES) {
   if (timeoutMs === undefined) timeoutMs = body !== undefined ? 120000 : 30000;
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
   try {
+    let wireBody = body, requestId = null;
+    if (body !== undefined && String(method).toUpperCase() === 'POST' && isSendPath(p) && body && typeof body === 'object' && !Array.isArray(body)) {
+      requestId = typeof body.requestId === 'string' && body.requestId !== '' ? body.requestId : newRequestId();
+      wireBody = {...body, requestId};
+    }
     const res = await fetch('http://127.0.0.1:' + info.port + p, {
       method,
-      headers: {authorization: 'Bearer ' + info.token, ...(body !== undefined ? {'content-type': 'application/json'} : {})},
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      headers: {authorization: 'Bearer ' + info.token, ...(body !== undefined ? {'content-type': 'application/json'} : {}), ...(requestId ? {'x-muser-request-id': requestId} : {})},
+      body: wireBody !== undefined ? JSON.stringify(wireBody) : undefined,
       signal: ctrl.signal,
     });
     const text = await readBodyCapped(res, maxBytes);
     let json = null; try { json = text ? JSON.parse(text) : null; } catch {}
     return {status: res.status, json};
+  } catch (e) {
+    // wave18 (b): OUR timeout aborting a body-carrying POST does not mean
+    // "not sent" — the request may have reached the server and been accepted
+    // (that is exactly what the measured duplication showed). Mark it
+    // unconfirmed (the src/export.js `err.unconfirmed` precedent, with
+    // outcome 'unknown' as in src/link/channel-server.js) so callers can
+    // leave the re-send decision to the user instead of treating it as a
+    // plain disconnect. Bodyless / idempotent requests keep the plain
+    // abort error: retrying those is safe, and probeServer relies on it.
+    if (timedOut && body !== undefined && String(method).toUpperCase() === 'POST' && e?.code !== 'RESPONSE_TOO_LARGE') {
+      const err = new Error('request timed out — the server may already have accepted it, so delivery is unconfirmed');
+      err.code = 'UNCONFIRMED'; err.unconfirmed = true; err.outcome = 'unknown'; err.cause = e;
+      throw err;
+    }
+    throw e;
   } finally { clearTimeout(timer); }
 }
 
@@ -123,14 +160,18 @@ async function attachSession(info, {cwd, account, mode, sessionId, maxAgents, ma
   // bin/muser.js passes the flag in its own shape ({noFocus: o.noFocus}): forward it
   // as given AND as focusEnabled, so the server side can take either spelling.
   if (noFocus !== undefined) { extra.noFocus = noFocus; if (extra.focusEnabled === undefined) extra.focusEnabled = !noFocus; }
+  // serverfirst-debug B4: the thrown error carries .status, so callers
+  // can tell a 501 (host not built yet — worth retrying briefly) from
+  // any other refusal without pattern-matching the message text.
+  const fail = r => { const e = new Error(r.json?.error || ('server answered ' + r.status)); e.status = r.status; throw e; };
   if (sessionId) {
     const r = await request(info, 'POST', '/api/sessions/' + encodeURIComponent(sessionId) + '/open', extra);
-    if (r.status !== 200) throw new Error(r.json?.error || ('server answered ' + r.status));
+    if (r.status !== 200) fail(r);
     return r.json;
   }
   const r = await request(info, 'POST', '/api/sessions', {cwd, account, mode, ...extra});
-  if (r.status !== 201) throw new Error(r.json?.error || ('server answered ' + r.status));
+  if (r.status !== 201) fail(r);
   return r.json;
 }
 
-module.exports = {serverFile, readServer, guiFile, readGui, pidAlive, probeServer, attachSession, request, MAX_RESPONSE_BYTES, PROBE_MAX_RESPONSE_BYTES};
+module.exports = {serverFile, readServer, guiFile, readGui, pidAlive, probeServer, attachSession, request, newRequestId, MAX_RESPONSE_BYTES, PROBE_MAX_RESPONSE_BYTES};

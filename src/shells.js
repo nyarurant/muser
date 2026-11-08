@@ -34,6 +34,7 @@ function killTreeAsync(pid) {
     if (!pid) return resolve(false);
     let child;
     try { child = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {windowsHide: true}); } catch { return resolve(false); }
+    guardStdio(child);
     child.on('error', () => resolve(false));
     child.on('close', code => resolve(code === 0));
   });
@@ -43,6 +44,22 @@ function killTreeAsync(pid) {
 // the host process down. Listener failures are contained at the emit site —
 // the shell machinery itself keeps working.
 function safeEmit(emitter, event, arg) { try { emitter.emit(event, arg); } catch {} }
+
+// A spawned child's stdio streams are sockets of their own and raise their own
+// 'error', separate from the child's 'error'. When the cwd is longer than
+// ~260 chars the process never starts and its stdout socket raises ENOTCONN;
+// with no listener that is an unhandled 'error' event and the whole host
+// process dies on it (wave8). guardStdio gives every stream a listener:
+// stdout/stderr errors go to the caller's own error path so a failed launch
+// surfaces as words, and stdin errors are swallowed — nothing writes to a
+// child's stdin here, so a stdin error is never a verdict on the run.
+function guardStdio(child, onError) {
+  const swallow = () => {};
+  for (const name of ['stdout', 'stderr']) {
+    try { const st = child?.[name]; if (st && typeof st.on === 'function') st.on('error', typeof onError === 'function' ? onError : swallow); } catch {}
+  }
+  try { const st = child?.stdin; if (st && typeof st.on === 'function') st.on('error', swallow); } catch {}
+}
 
 // Where the buffer front may be cut without splitting a character or an escape sequence:
 // cutting at an arbitrary code unit left a lone surrogate (rendered as U+FFFD) or the tail of
@@ -90,7 +107,16 @@ class Shells extends EventEmitter {
   // the background the same way. The child keeps running; its output so far seeds the buffer.
   adopt(command, {cwd, shell} = {}, child, initialOut = '') {
     const running = [...this.list.values()].filter(s => s.running).length;
-    if (running >= MAX_SHELLS) return null;
+    if (running >= MAX_SHELLS) {
+      // Used to return a bare null: runOnce then killed the timed-out
+      // foreground run with nothing anywhere saying why it was not moved to
+      // the background (wave8). Return the reason instead — a failure record,
+      // not a shell (no id, nothing tracked) — and keep it on the instance so
+      // a caller holding only the Shells can read why the last adopt failed.
+      const reason = '満杯のため背景化できなかった (too many background shells: ' + MAX_SHELLS + ' running; stop one with shell.kill first)';
+      this.lastAdoptError = reason;
+      return {id: null, adoptFailed: true, reason, error: reason};
+    }
     const s = this.track(child, {command, cwd, shell, out: initialOut});
     // The seed was already handed to the caller (system.run returns it as stdout/stderr), so
     // the shared 'main' cursor starts past it instead of re-delivering it on the first
@@ -128,7 +154,13 @@ class Shells extends EventEmitter {
     // done() is idempotent: a spawn failure emits both 'error' and 'close', and the completion
     // notification / auto-resume must fire once, with the first verdict kept.
     let finished = false;
-    const done = code => { if (finished) return; finished = true; Object.assign(s, {running: false, exit: code, ended: Date.now()}); emitChange(); safeEmit(this, 'finished', {...this.snapshot(s), status: s.stopped ? 'stopped' : code === 0 ? 'completed' : 'failed'}); this.evictFinished(); };
+    const done = code => { if (finished) return; finished = true; Object.assign(s, {running: false, exit: code, ended: Date.now(), stopping: false}); emitChange(); safeEmit(this, 'finished', {...this.snapshot(s), status: s.stopped ? 'stopped' : code === 0 ? 'completed' : 'failed'}); this.evictFinished(); };
+    // A stdio socket error (the long-cwd ENOTCONN above) is a failed launch,
+    // reported in the buffer and through done() like a child 'error' — never
+    // left unhandled to take the host down. Guarded once: stdout and stderr
+    // can both raise it for the same failure.
+    let stdioFailed = false;
+    guardStdio(child, e => { if (stdioFailed) return; stdioFailed = true; add('[error] ' + (e?.message || e) + '\n'); done(-1); });
     child.on('close', done);
     child.on('error', e => { add('[error] ' + e.message + '\n'); done(-1); });
     this.list.set(id, s);
@@ -168,11 +200,32 @@ class Shells extends EventEmitter {
     return {id: s.id, running: s.running, exit_code: s.exit, output: shown, ...(text.length > maxChars || start > requested ? {truncated: true} : {}), next_offset: shownEnd};
   }
   // `stopped` is set only when the kill actually landed: marking it before taskkill ran made
-  // a shell whose pid was already gone report 'stopped', and killAll never marked it at all,
-  // so shells stopped that way reported 'failed' instead.
+  // a shell whose pid was already gone report 'stopped' instead of 'failed'.
   kill(id) { const s = this.get(id); const killed = s.running ? killTree(s.pid) : false; if (killed) s.stopped = true; return {id: s.id, killed}; }
-  killAll() { for (const s of this.list.values()) if (s.running) void killTreeAsync(s.pid).then(killed => { if (killed) s.stopped = true; }); }
-  snapshot(s) { return {id: s.id, title: s.title, command: s.command, shell: s.shell, running: s.running, exit: s.exit, started: s.started, ended: s.ended, tail: frames(s.out.slice(-8000)).trimEnd().split('\n').slice(-3)}; }
+  // Returns a promise for the whole stop, so a caller that can wait (the
+  // close path) waits for it: the old fire-and-forget form left every shell
+  // reading 'running' for ~2 s after close() had already returned (wave8).
+  // The state also moves at once — each live shell is marked `stopping`
+  // synchronously — while `stopped` keeps its #139 meaning (set only when a
+  // kill actually lands) and `running` flips when the child's own close
+  // lands, which the returned promise waits for, bounded at ~3 s per shell.
+  // Synchronous callers that cannot await still get the kills under way and
+  // the immediate `stopping` state.
+  killAll() {
+    const jobs = [];
+    for (const s of this.list.values()) {
+      if (!s.running) continue;
+      s.stopping = true;
+      jobs.push(killTreeAsync(s.pid).then(async killed => {
+        if (!killed) { if (s.running) s.stopping = false; return {id: s.id, killed}; }
+        s.stopped = true;
+        for (let i = 0; i < 120 && s.running; i++) await new Promise(r => setTimeout(r, 25));
+        return {id: s.id, killed};
+      }));
+    }
+    return Promise.all(jobs);
+  }
+  snapshot(s) { return {id: s.id, title: s.title, command: s.command, shell: s.shell, running: s.running, ...(s.stopping ? {stopping: true} : {}), exit: s.exit, started: s.started, ended: s.ended, tail: frames(s.out.slice(-8000)).trimEnd().split('\n').slice(-3)}; }
   all() { return [...this.list.values()].map(s => this.snapshot(s)); }
 }
 
@@ -194,7 +247,7 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
   // waiting out the whole timeout with no output (2026-11-01: 120 s of nothing).
   try { child.stdin.end(); } catch {}
   return new Promise(resolve => {
-    let stdout = '', stderr = '', combined = '', killed = '', done = false, timer = null, forceTimer = null;
+    let stdout = '', stderr = '', combined = '', killed = '', done = false, timer = null, forceTimer = null, adoptFailure = '';
     const onAbort = () => kill('cancelled');
     // `combined` keeps stdout and stderr interleaved in arrival order: an adopted shell seeded
     // with stdout + stderr concatenated lost the chronology of the two streams.
@@ -222,8 +275,18 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
       // adopt() for it (system.run does, except for sleep-led commands): detach our readers, let
       // the shells tracker take the child over, and resolve as backgrounded.
       if (why === 'timeout' && adopt) {
-        const s = adopt(child, combined);
-        if (s) { child.stdout.removeListener('data', onStdout); child.stderr.removeListener('data', onStderr); return finish({code: null, stdout, stderr, backgrounded: s.id}); }
+        let s = null, adoptThrew = null;
+        try { s = adopt(child, combined); } catch (e) { adoptThrew = e; }
+        if (s && s.id) { child.stdout.removeListener('data', onStdout); child.stderr.removeListener('data', onStderr); return finish({code: null, stdout, stderr, backgrounded: s.id}); }
+        // Adoption refused (the background is full) or threw: the run is
+        // killed below, but the reason must survive in the result — it used
+        // to die here, leaving a bare killed:'timeout' (wave8). The note goes
+        // into stderr as well as its own field, because the tool layer
+        // forwards stderr but not extra result fields.
+        const reason = adoptThrew ? String(adoptThrew?.message || adoptThrew) : s ? String(s.reason || s.error || s.adoptError || '') : '';
+        adoptFailure = reason.includes('背景化できなかった') ? reason : '満杯のため背景化できなかった' + (reason ? ': ' + reason : ' (the background is full)');
+        const note = '\n[muser: ' + adoptFailure + ']\n';
+        stderr += note; combined += note; notify(note);
       }
       if (!killed) killed = why;
       void killTreeAsync(child.pid).catch(() => {});
@@ -231,7 +294,7 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
       // that was still starting its tree. If the tree is STILL alive at the force resolve, the
       // result says so and names the pid: the run used to resolve with nothing that could find
       // or stop the survivor — no pid, no shell id, nothing in shell.list — an untracked orphan.
-      if (!forceTimer) forceTimer = setTimeout(() => { void killTreeAsync(child.pid).catch(() => {}); const alive = typeof child.exitCode !== 'number'; finish({code: alive ? -1 : child.exitCode, stdout, stderr, killed, pid: child.pid, ...(alive ? {orphaned: true} : {})}); }, 2000);
+      if (!forceTimer) forceTimer = setTimeout(() => { void killTreeAsync(child.pid).catch(() => {}); const alive = typeof child.exitCode !== 'number'; finish({code: alive ? -1 : child.exitCode, stdout, stderr, killed, pid: child.pid, ...(alive ? {orphaned: true} : {}), ...(adoptFailure ? {adopt_failed: adoptFailure} : {})}); }, 2000);
     };
     timer = setTimeout(() => kill('timeout'), timeout);
     if (signal) {
@@ -242,8 +305,12 @@ function runOnce(command, {shell, cwd, timeout = DEFAULT_TIMEOUT, signal, onOutp
     child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
     child.stdout.on('data', onStdout);
     child.stderr.on('data', onStderr);
-    child.on('close', code => finish({code, stdout, stderr, killed}));
-    child.on('error', e => finish({code: -1, stdout, stderr: stderr || e.message, killed}));
+    // The stdio sockets get an error path of their own (see guardStdio): a
+    // launch that fails at the socket — the >260-char cwd ENOTCONN — resolves
+    // here as a verbal error result instead of crashing the host process.
+    guardStdio(child, e => finish({code: -1, stdout, stderr: stderr || e.message, killed, ...(adoptFailure ? {adopt_failed: adoptFailure} : {})}));
+    child.on('close', code => finish({code, stdout, stderr, killed, ...(adoptFailure ? {adopt_failed: adoptFailure} : {})}));
+    child.on('error', e => finish({code: -1, stdout, stderr: stderr || e.message, killed, ...(adoptFailure ? {adopt_failed: adoptFailure} : {})}));
   });
 }
 

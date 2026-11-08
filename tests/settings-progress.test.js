@@ -167,7 +167,7 @@ test('/settings lists every setting with its value; switches flip, are saved, an
   ctrl.slash('/settings');
   const menu = () => ctrl.get().menu;
   const row = value => menu().options.find(o => o.value === value);
-  assert.deepEqual(menu().options.map(o => o.value), ['agents', 'focus', 'focusRounds', 'focusMinutes', 'bangAutoSend', 'bgAutoResume', 'maxToolCallsPerTurn', 'dailyTurnLimit', 'quotaFallback', 'mode', 'defaultMode', 'lang', 'motion', 'codeWrap', 'footerDevice', 'footerSlot', 'footerName', 'footerUsage', 'footerCwd', 'footerSession', 'footerVersion', 'footerClock', 'color', 'kitty', 'bell', 'updateCheck', 'skills', 'mcp']);
+  assert.deepEqual(menu().options.map(o => o.value), ['agents', 'focus', 'focusRounds', 'focusMinutes', 'focusLogLevel', 'worklog', 'worklogDays', 'expectMode', 'lore', 'bangAutoSend', 'bgAutoResume', 'maxToolCallsPerTurn', 'maxNodeSlots', 'dailyTurnLimit', 'quotaFallback', 'mode', 'defaultMode', 'lang', 'motion', 'codeWrap', 'footerDevice', 'footerSlot', 'footerName', 'footerUsage', 'footerCwd', 'footerSession', 'footerVersion', 'footerClock', 'color', 'kitty', 'fullscreen', 'bell', 'updateCheck', 'skills', 'mcp']);
   // Every row carries its genre, each genre one contiguous block, in order.
   assert.ok(menu().options.every(o => typeof o.group === 'string' && o.group), 'every row carries its genre');
   assert.deepEqual([...new Set(menu().options.map(o => o.group))], ['作業の進め方', '上限と使用量', '承認', '表示', '通知と更新', '連携'], 'the genres, in display order');
@@ -184,6 +184,8 @@ test('/settings lists every setting with its value; switches flip, are saved, an
   assert.equal(row('agents').desc, '同時 4 ／ タスク合計 無制限');
   assert.equal(row('bell').desc, 'オン');
   assert.equal(row('maxToolCallsPerTurn').desc, '250 回');
+  assert.equal(row('maxNodeSlots').desc, '16 個', 'the device slot cap, 16 by default');
+  assert.equal(row('maxNodeSlots').group, '上限と使用量');
   assert.match(row('color').desc, /次回起動から/);
 
   choose(ctrl, 'bell');

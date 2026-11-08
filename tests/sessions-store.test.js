@@ -29,7 +29,10 @@ test('resume keeps the local turns Muse did not return, and pages back through h
   assert.deepEqual(sessions.transcript(id).map(x => x.user), ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'], 'the file lost nothing');
 });
 
-test('sessions dropped from the 200-entry index take their transcripts with them', () => {
+// 2026-11-07 (user's choice): the 200-entry cap is gone — every session stays in the
+// index and no transcript is deleted. This replaces the old test that pinned the drop:
+// a day of `muser exec` runs pushed the user's own chats out and deleted their files.
+test('sessions past the old 200-entry cap stay in the index, with their transcripts', () => {
   const made = [];
   for (let i = 0; i < 203; i++) {
     const s = sessions.create('C:/x'); made.push(s);
@@ -37,9 +40,9 @@ test('sessions dropped from the 200-entry index take their transcripts with them
     sessions.touch(s, 'task ' + i);
   }
   const kept = new Set(sessions.recent().map(s => s.id));
-  assert.equal(kept.size, 200);
-  for (const s of made.slice(0, 3)) assert.equal(fs.existsSync(sessions.transcriptFile(s.id)), false, 'dropped: transcript removed');
-  for (const s of made.slice(-3)) assert.equal(fs.existsSync(sessions.transcriptFile(s.id)), true, 'kept: transcript stays');
+  for (const s of made) assert.ok(kept.has(s.id), 'every session stays listed');
+  for (const s of made.slice(0, 3)) assert.equal(fs.existsSync(sessions.transcriptFile(s.id)), true, 'oldest: transcript kept');
+  for (const s of made.slice(-3)) assert.equal(fs.existsSync(sessions.transcriptFile(s.id)), true, 'newest: transcript kept');
 });
 
 test('a stale lock left by a crashed window does not block saving', () => {
@@ -61,7 +64,9 @@ test('a lock held by a live pid is never stolen, however old it is', () => {
   fs.writeFileSync(lock, content);
   const old = new Date(Date.now() - 60000); fs.utimesSync(lock, old, old);
   const s = sessions.create('C:/live');
-  assert.throws(() => sessions.touch(s, 'must not land'), /locked by another muser window/, 'a live holder blocks until the acquire deadline instead of being robbed');
+  // Wave 6 wording update: the lock error is worded in Japanese now (was
+  // the English 'sessions index is locked by another muser window').
+  assert.throws(() => sessions.touch(s, 'must not land'), /会話の一覧が別の muser の窓で使用中です/, 'a live holder blocks until the acquire deadline instead of being robbed');
   assert.equal(fs.readFileSync(lock, 'utf8'), content, 'the live lock file is untouched');
   assert.equal(sessions.find(s.id), undefined, 'the blocked write never landed');
   fs.unlinkSync(lock);
@@ -109,5 +114,6 @@ test("parallel-agent sessions do not push the user's own sessions out of the ind
   assert.ok(sessions.find(mine.id), 'still listed after 260 agent sessions');
   assert.ok(fs.existsSync(sessions.transcriptFile(mine.id)), 'and its transcript is kept');
   const all = JSON.parse(fs.readFileSync(sessions.FILE, 'utf8'));
-  assert.equal(all.filter(s => s.parent).length, 50);
+  // The old 50-entry agent cap is gone too (2026-11-07): the agent sessions stay as well.
+  assert.equal(all.filter(s => s.parent).length, 260);
 });

@@ -6,11 +6,13 @@
 // (what muser shows) and never in the history API. Its shape, copied from
 // muse.ai's own parser:
 //   \n\n[usage] context_tokens=130841 response_tokens=395 source=provider cost=unavailable
-// This module is dependency-free so the CJS agent, the ESM view and the
-// usage tally can all use the same parsing and formatting.
+// Its only dependency is src/i18n (for the in/out words in formatUsage), so
+// the CJS agent, the ESM view and the usage tally can all use the same
+// parsing and formatting.
 // A trailing newline (or CRLF, or a blank last line) after the usage line is still the
 // usage line: the gateway's raw text may end with one, and without it the line was neither
 // parsed nor stripped, so the raw [usage] line reached the screen.
+const {t} = require('./i18n');
 const USAGE_LINE = /\n?\[usage\][^\n]+(?:\r?\n)*$/i;
 const PAIR = /(\w+)=("[^"]*"|[^\s]*)/g;
 const INPUT_KEYS = ['context_tokens_estimate', 'context_tokens', 'input_tokens', 'prompt_tokens'];
@@ -49,7 +51,25 @@ function formatTokens(n) {
   }
   return one(Math.round(v / 1e8) / 10) + 'B';
 }
-function formatUsage(usage) { return formatTokens(usage?.inputTokens || 0) + ' in / ' + formatTokens(usage?.outputTokens || 0) + ' out'; }
+// The in/out words go through t(): they were fixed English, so the turn-end
+// line read '130.8k in / 395 out' in the Japanese UI too (wave 7).
+function formatUsage(usage) { return t('{input} 入 / {output} 出', {input: formatTokens(usage?.inputTokens || 0), output: formatTokens(usage?.outputTokens || 0)}); }
+
+// Wave 16: whether the text before a point ends inside a fenced code block
+// (``` or ~~~), tracked the way splitAttachments in src/core/chat-model.js
+// tracks ``` fences. A fence closes only on the same marker character, at
+// least as long as the one that opened it; an unclosed fence runs to the
+// end of the text, so a trailing line after it is still inside the block.
+function insideFence(before) {
+  let fence = null;
+  for (const line of before.split('\n')) {
+    const m = /^\s*(`{3,}|~{3,})/.exec(line);
+    if (!m) continue;
+    if (!fence) fence = m[1];
+    else if (m[1][0] === fence[0] && m[1].length >= fence.length) fence = null;
+  }
+  return fence !== null;
+}
 
 // parse(text) -> {body, usage} | null. body is the reply with the usage line
 // cut off; usage is {inputTokens, outputTokens, source?, cost?, formatted}.
@@ -59,6 +79,13 @@ function parse(text) {
   if (typeof text !== 'string') return null;
   const m = text.match(USAGE_LINE);
   if (!m) return null;
+  // Wave 16: a [usage] line inside a fenced code block is content, not usage
+  // — an example the assistant showed in a ``` or ~~~ block used to be parsed
+  // as real usage (its fabricated numbers entered the daily tally) and cut
+  // from the stored reply. A bare UNFENCED quoted example remains
+  // indistinguishable from a real line and still counts; that limit is not
+  // guessed at here.
+  if (insideFence(text.slice(0, m.index))) return null;
   const pairs = {};
   for (const [, k, v] of m[0].matchAll(PAIR)) pairs[k] = unquote(v);
   // A [usage] line with no token key at all is reply content (a sentence about usage, a
@@ -73,8 +100,9 @@ function parse(text) {
 }
 // strip(text): the reply with a trailing [usage] line removed, or the text
 // unchanged when it has none. Non-strings pass through untouched. It goes
-// through parse() so a [usage] line that is reply content (no token keys)
-// is kept, exactly as parse() treats it.
+// through parse() so a [usage] line that is reply content (no token keys,
+// or inside a fenced code block — Wave 16) is kept, exactly as parse()
+// treats it.
 function strip(text) { if (typeof text !== 'string') return text; const p = parse(text); return p ? p.body : text; }
 
 // The text of one transcript message: a string content, or text parts joined.

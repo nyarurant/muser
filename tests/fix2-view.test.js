@@ -299,13 +299,18 @@ test('R3: a menu hint is fully visible at width 40', async () => {
 });
 
 // ---- r3 R6: a truncated menu label keeps a gap before the description ----
-test('R6: a full-width menu label still leaves a gap before its description', async () => {
+// Wave 6 update (intentional spec change, src/ui/view.mjs menu row): the label
+// is now cut in the MIDDLE like the fullscreen draw, so its ending survives
+// and the description no longer follows the '…' directly — the expectation
+// below is the inverted form of the old /… {2,}DESC/ pin.
+test('R6: a middle-truncated menu label keeps its ending and a gap before its description', async () => {
   const ctx = await setup();
   const label = 'とても長いラベルのメニュー項目ですこれは切れます';
   const out = await live(ctx, {menu: {title: 't', options: [{label, desc: 'DESC'}], index: 0}}, 80);
   const line = out.split('\n').find(l => l.includes('DESC'));
   assert.ok(line, 'desc line exists');
-  assert.match(line, /… {2,}DESC/);
+  assert.ok(line.includes('とても長いラ…すこれは切れます'), 'head and ending of the label both survive the middle cut: ' + line);
+  assert.match(line, /すこれは切れます .*DESC/, 'the description still follows the label, after a gap');
 });
 
 // ---- B4/I3: at narrow widths menu labels get the full row and descriptions go below ----
@@ -386,20 +391,31 @@ test('B14: at completion paths keep their file names at width 40', async () => {
 });
 
 // ---- r1 R1-2: a diff pair differing at the line end shows the difference ----
-test('R1-2: a long diff line shows its changed tail', async () => {
+// Wave 6 update (intentional spec change, src/ui/view.mjs Diff): a too-wide
+// changed line is now cut keeping its HEAD, following the fullscreen side —
+// it used to keep the tail. The expectation below is the inverted form of
+// the old 'changed tail is visible' pin.
+test('R1-2: a long diff line shows its head, cut with an ellipsis', async () => {
   const {h, Entry, ctrl, show} = await setup();
   const base = 'const aVeryLongVariableName = computeSomething(argumentOne, argumentTwo, argumentThree';
   const diff = [{t: '-', n: 2, l: base + ')'}, {t: '+', n: 2, l: base + ', argumentFour)'}];
   const out = await show(h(Entry, {e: {type: 'tool', call: {command: 'code.edit', ok: true, summary: 'a.js', view: {diff}}}, ctrl, W: 80}), 81);
-  assert.ok(out.includes('argumentFour'), 'the added tail is visible');
+  assert.ok(out.includes('argumentOne, argu…'), 'the head of the line is visible and the cut is marked');
+  assert.ok(!out.includes('argumentFour'), 'wave 6: the changed tail is no longer the part that is kept');
 });
 
 // ---- r1 R1-5: a tool summary path keeps its file name ----
-test('R1-5: a long tool summary keeps the file name', async () => {
+// Wave 6 update (intentional spec change, src/ui/view.mjs ToolCard): the
+// summary is now cut at its END, following the fullscreen side — keeping the
+// tail hid the command's verb / the path's head. The expectation below is
+// the inverted form of the old 'file name survives' pin.
+test('R1-5: a long tool summary keeps its head, cut at the end', async () => {
   const {h, Entry, ctrl, show} = await setup();
   const summary = 'src/very/deeply/nested/folder/structure/with/a/very-long-file-name-that-matters.ts';
   const out = await show(h(Entry, {e: {type: 'tool', call: {command: 'code.edit', ok: true, summary, view: {}}}, ctrl, W: 80}), 81);
-  assert.ok(out.includes('very-long-file-name-that-matters.ts'), 'file name visible');
+  assert.ok(out.includes('src/very/deeply/nested/folder'), 'the head of the summary is visible');
+  assert.ok(out.includes('very-long-file-name-t…'), 'the end cut is marked with an ellipsis');
+  assert.ok(!out.includes('very-long-file-name-that-matters.ts'), 'wave 6: the file name at the very end is no longer kept whole');
 });
 
 // ---- r1 R1-6: files outside the folder are shown as absolute paths ----
@@ -444,12 +460,15 @@ test('R1-9: a file-only send says file-only, an empty send says no-text', async 
 });
 
 // ---- r1 R1-10: a zero usage is not stated as a measured zero ----
-test('R1-10: an end row with zero usage does not print 0 in / 0 out', async () => {
+test('R1-10: an end row with zero usage does not print 0 入 / 0 出', async () => {
   const {h, Entry, ctrl, show} = await setup();
   const out = await show(h(Entry, {e: {type: 'end', ok: true, ms: 0, usage: {inputTokens: 0, outputTokens: 0}}, ctrl, W: 80}));
-  assert.ok(!out.includes('0 in / 0 out'), 'no false zero');
+  // Wave 7 spec update: the end row re-formats usage via formatUsage, whose
+  // in/out words follow the UI language （入 / 出 in Japanese) — the old
+  // assertions pinned the fixed English '0 in / 0 out' / '1.2k in / 30 out'.
+  assert.ok(!out.includes('0 入 / 0 出'), 'no false zero');
   const out2 = await show(h(Entry, {e: {type: 'end', ok: true, ms: 0, usage: {inputTokens: 1200, outputTokens: 30}}, ctrl, W: 80}));
-  assert.ok(out2.includes('1.2k in / 30 out'), 'real usage still shown');
+  assert.ok(out2.includes('1.2k 入 / 30 出'), 'real usage still shown');
 });
 
 // ---- r1 R1-12: an empty agent result says so ----
